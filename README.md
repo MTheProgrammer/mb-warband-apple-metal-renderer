@@ -2,13 +2,15 @@
 
 An injected library for Mount & Blade: Warband (Steam, macOS) that will replace the game's OpenGL renderer with Metal. The game's files are not modified.
 
-Status: milestone 2 of 7. The library traces every graphics call the game makes and forwards it either to real OpenGL or to its own Metal backend. The Metal backend so far opens the window and clears it: the game runs, but the screen stays blank. Shaders, textures and drawing come in the next milestones.
+Status: the Metal renderer draws the game: menus, battles with shadows and post-processing, HUD and text. It has been checked in the Native module's battles only. Not done yet: a shader cache (programs are translated at every start), and a systematic comparison of images and frame rates against OpenGL.
 
 ## Build
 
-Needs the Xcode Command Line Tools and the game installed through Steam.
+Needs the Xcode Command Line Tools, git, python3 and the game installed through Steam.
 
     make
+
+The first build downloads glslang and SPIRV-Cross at pinned versions into `third_party/` and compiles them (`scripts/build_deps.sh`); cmake is not needed.
 
 This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2). If the game is not in the default Steam library, pass `GAME=/path/to/MountBlade\ Warband`.
 
@@ -34,7 +36,8 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 
 | Variable | Meaning |
 |---|---|
-| `WBM_MODE` | `trace` (default): OpenGL with tracing. `native`: the game's own OpenGL calls are left untouched and only frame times are recorded. `metal`: the Metal backend, with tracing |
+| `WBM_MODE` | `trace` (default): OpenGL with tracing. `native`: the game's own OpenGL calls are left untouched and only frame times are recorded. `metal`: the Metal renderer |
+| `WBM_TRACE` | `1` traces the calls in Metal mode too, at a cost in frame rate. Off by default there |
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
 | `WBM_OUT` | Output directory. `run.sh` sets it |
@@ -52,6 +55,10 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 - 40 are called through pointer variables exported by the game's bundled GLEW. The shim interposes `glewInit` and swaps those pointers after GLEW has filled them in.
 
 In Metal mode the window is created without an OpenGL surface and gets a `CAMetalLayer`; the game receives a placeholder context, and the 62 functions are routed to `src/metal_backend.mm`.
+
+Shaders are translated when a program is linked (`src/shader_xlate.cpp`): the engine's GLSL 1.20 is rewritten to GLSL 4.50, compiled to SPIR-V by glslang and turned into Metal Shading Language by SPIRV-Cross. `make build/xlate_test && build/xlate_test traces/latest` runs that translation over every program a trace recorded and compiles the results with Metal.
+
+Render-to-texture passes are drawn upside down, so that textures keep OpenGL's row order and the game's texture coordinates work unchanged.
 
 AppKit also calls a few of the interposed functions when it presents the GL surface. Calls that do not come from the game binary are forwarded and counted separately.
 

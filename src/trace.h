@@ -31,6 +31,7 @@ extern std::atomic<bool> g_verbose;       // current frame is logged call by cal
 extern std::atomic<uint32_t> g_frame;     // frame 0 is everything before the first swap
 extern std::atomic<uint64_t> g_frame_draws;
 extern bool g_metal;                      // WBM_MODE=metal: calls go to the Metal backend, not OpenGL
+extern bool g_fast;                       // Metal without tracing: calls skip the wrappers
 extern bool g_native;                     // WBM_MODE=native: time frames only, trace nothing
 extern bool g_glerr;                      // WBM_GLERR: glGetError after setup calls
 extern const char *g_out_dir;

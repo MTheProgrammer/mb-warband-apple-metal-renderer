@@ -36,6 +36,7 @@ std::atomic<uint64_t> g_frame_draws{0};
 bool g_glerr = false;
 bool g_native = false;
 bool g_metal = false;
+bool g_fast = false;
 const char *g_out_dir = "";
 
 namespace {
@@ -323,7 +324,7 @@ void wb_write_summary()
             size_t n = v.size();
             double total = 0;
             for (float ms : v) total += ms;
-            fprintf(f, "mode: %s\naverage: %.1f fps (%.2f ms)\n", g_native ? "native (no tracing)" : g_metal ? "metal" : "trace", 1000.0 * v.size() / total,
+            fprintf(f, "mode: %s\naverage: %.1f fps (%.2f ms)\n", g_native ? "native (no tracing)" : g_fast ? "metal (no tracing)" : g_metal ? "metal, traced" : "trace", 1000.0 * v.size() / total,
                     total / v.size());
             fprintf(f, "frame time ms: p50 %.2f  p90 %.2f  p99 %.2f  max %.2f  (%zu frames)\n", pct(0.50), pct(0.90),
                     pct(0.99), v.back(), n);
@@ -387,7 +388,11 @@ static void wb_init()
     unsetenv("DYLD_INSERT_LIBRARIES");
 
     const char *mode = getenv("WBM_MODE");
-    if (mode && !strcmp(mode, "metal")) g_metal = true;
+    if (mode && !strcmp(mode, "metal")) {
+        g_metal = true;
+        const char *trace = getenv("WBM_TRACE"); // Metal runs untraced unless asked
+        g_fast = !(trace && atoi(trace) != 0);
+    }
     else if (mode && !strcmp(mode, "native")) g_native = true;
     else if (mode && strcmp(mode, "trace")) fprintf(stderr, "wbmetal: unknown WBM_MODE '%s', using trace\n", mode);
 
@@ -423,7 +428,7 @@ static void wb_init()
         wb_flush();
     });
 
-    wb_note("wbmetal %s, pid %d", g_native ? "native mode (frame timing only, GL calls untouched)" : g_metal ? "Metal backend" : "trace shim", getpid());
+    wb_note("wbmetal %s, pid %d", g_native ? "native mode (frame timing only, GL calls untouched)" : g_fast ? "Metal backend, untraced" : g_metal ? "Metal backend, traced" : "trace shim", getpid());
     wb_note("line format: f<frame> t<thread> <function> <arguments>");
     wb_flush();
     fprintf(stderr, "wbmetal: tracing to %s\n", s_out.c_str());
