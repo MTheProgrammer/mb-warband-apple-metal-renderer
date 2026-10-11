@@ -3,6 +3,7 @@
 
 #include "trace.h"
 
+#include "backend.h"
 #include "interpose.h"
 
 #include <algorithm>
@@ -18,9 +19,10 @@
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 
-// Pointers to the real implementations. Direct functions bind at load time
-// (references from this image are not interposed); GLEW ones are filled in by
-// wb_glewInit below.
+// Where the game's calls end up after tracing: real OpenGL, or the Metal
+// backend once wb_gl_install_metal has run. For OpenGL, direct functions bind
+// at load time (references from this image are not interposed) and GLEW ones
+// are filled in by wb_glewInit below.
 #define GL_DIRECT(n) static decltype(&gl##n) real_gl##n = &gl##n;
 #define GL_GLEW(n) static decltype(__glew##n) real_gl##n;
 #include "gl_api.def"
@@ -172,12 +174,12 @@ void log_info_log(const char *what, GLuint id, const char *text)
 // ---- the 22 direct functions --------------------------------------------
 //
 // Interposing redirects these for every loaded image, not just the game: SDL
-// and system frameworks call some of them too. Those calls are forwarded and
-// only counted, so the trace describes the game alone.
+// and system frameworks call some of them too. Those calls go straight to real
+// OpenGL and are only counted, so the trace describes the game alone.
 
 void wb_glBindTexture(GLenum target, GLuint texture)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glBindTexture, __builtin_return_address(0)), real_glBindTexture(target, texture);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glBindTexture, __builtin_return_address(0)), glBindTexture(target, texture);
     wb_count(FN_glBindTexture);
     if (s_unit < 32) s_tex[s_unit][target == GL_TEXTURE_2D ? 0 : 1] = texture;
     HIST(FN_glBindTexture, target, s_unit, texture != 0, 0, "%s on unit %u, %s", E(target), s_unit, texture ? "texture" : "0");
@@ -187,7 +189,7 @@ void wb_glBindTexture(GLenum target, GLuint texture)
 
 void wb_glBlendFunc(GLenum sfactor, GLenum dfactor)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glBlendFunc, __builtin_return_address(0)), real_glBlendFunc(sfactor, dfactor);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glBlendFunc, __builtin_return_address(0)), glBlendFunc(sfactor, dfactor);
     wb_count(FN_glBlendFunc);
     HIST(FN_glBlendFunc, sfactor, dfactor, 0, 0, "%s, %s", E_blend(sfactor), E_blend(dfactor));
     VLOG(FN_glBlendFunc, "%s, %s", E_blend(sfactor), E_blend(dfactor));
@@ -196,7 +198,7 @@ void wb_glBlendFunc(GLenum sfactor, GLenum dfactor)
 
 void wb_glClear(GLbitfield mask)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glClear, __builtin_return_address(0)), real_glClear(mask);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glClear, __builtin_return_address(0)), glClear(mask);
     wb_count(FN_glClear);
     HIST(FN_glClear, mask, s_fbo != 0, 0, 0, "%s on %s", E_clear(mask), s_fbo ? "an FBO" : "the screen");
     VLOG(FN_glClear, "%s [fbo %u]", E_clear(mask), s_fbo);
@@ -205,7 +207,7 @@ void wb_glClear(GLbitfield mask)
 
 void wb_glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glClearColor, __builtin_return_address(0)), real_glClearColor(r, g, b, a);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glClearColor, __builtin_return_address(0)), glClearColor(r, g, b, a);
     wb_count(FN_glClearColor);
     HIST(FN_glClearColor, fbits(r), fbits(g), fbits(b), fbits(a), "%g, %g, %g, %g", r, g, b, a);
     VLOG(FN_glClearColor, "%g, %g, %g, %g", r, g, b, a);
@@ -214,7 +216,7 @@ void wb_glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a)
 
 void wb_glCullFace(GLenum mode)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glCullFace, __builtin_return_address(0)), real_glCullFace(mode);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glCullFace, __builtin_return_address(0)), glCullFace(mode);
     wb_count(FN_glCullFace);
     HIST(FN_glCullFace, mode, 0, 0, 0, "%s", E(mode));
     VLOG(FN_glCullFace, "%s", E(mode));
@@ -223,7 +225,7 @@ void wb_glCullFace(GLenum mode)
 
 void wb_glDeleteTextures(GLsizei n, const GLuint *textures)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDeleteTextures, __builtin_return_address(0)), real_glDeleteTextures(n, textures);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDeleteTextures, __builtin_return_address(0)), glDeleteTextures(n, textures);
     wb_count(FN_glDeleteTextures);
     wb_log(FN_glDeleteTextures, "%d: %s", n, ids(n, textures));
     real_glDeleteTextures(n, textures);
@@ -232,7 +234,7 @@ void wb_glDeleteTextures(GLsizei n, const GLuint *textures)
 
 void wb_glDepthFunc(GLenum func)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDepthFunc, __builtin_return_address(0)), real_glDepthFunc(func);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDepthFunc, __builtin_return_address(0)), glDepthFunc(func);
     wb_count(FN_glDepthFunc);
     HIST(FN_glDepthFunc, func, 0, 0, 0, "%s", E(func));
     VLOG(FN_glDepthFunc, "%s", E(func));
@@ -241,7 +243,7 @@ void wb_glDepthFunc(GLenum func)
 
 void wb_glDepthMask(GLboolean flag)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDepthMask, __builtin_return_address(0)), real_glDepthMask(flag);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDepthMask, __builtin_return_address(0)), glDepthMask(flag);
     wb_count(FN_glDepthMask);
     HIST(FN_glDepthMask, flag, 0, 0, 0, "%d", flag);
     VLOG(FN_glDepthMask, "%d", flag);
@@ -250,7 +252,7 @@ void wb_glDepthMask(GLboolean flag)
 
 void wb_glDisable(GLenum cap)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDisable, __builtin_return_address(0)), real_glDisable(cap);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDisable, __builtin_return_address(0)), glDisable(cap);
     wb_count(FN_glDisable);
     HIST(FN_glDisable, cap, 0, 0, 0, "%s", E(cap));
     VLOG(FN_glDisable, "%s", E(cap));
@@ -259,7 +261,7 @@ void wb_glDisable(GLenum cap)
 
 void wb_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDrawArrays, __builtin_return_address(0)), real_glDrawArrays(mode, first, count);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDrawArrays, __builtin_return_address(0)), glDrawArrays(mode, first, count);
     wb_count(FN_glDrawArrays);
     g_frame_draws.fetch_add(1, std::memory_order_relaxed);
     HIST(FN_glDrawArrays, mode, s_array_buf != 0, 0, 0, "%s, last attribute source: %s", E_prim(mode),
@@ -270,7 +272,7 @@ void wb_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 
 void wb_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDrawElements, __builtin_return_address(0)), real_glDrawElements(mode, count, type, indices);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glDrawElements, __builtin_return_address(0)), glDrawElements(mode, count, type, indices);
     wb_count(FN_glDrawElements);
     g_frame_draws.fetch_add(1, std::memory_order_relaxed);
     HIST(FN_glDrawElements, mode, type, s_elem_buf != 0, 0, "%s, %s, indices from %s", E_prim(mode), E(type),
@@ -282,7 +284,7 @@ void wb_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *in
 
 void wb_glEnable(GLenum cap)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glEnable, __builtin_return_address(0)), real_glEnable(cap);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glEnable, __builtin_return_address(0)), glEnable(cap);
     wb_count(FN_glEnable);
     HIST(FN_glEnable, cap, 0, 0, 0, "%s", E(cap));
     VLOG(FN_glEnable, "%s", E(cap));
@@ -291,7 +293,7 @@ void wb_glEnable(GLenum cap)
 
 void wb_glGenTextures(GLsizei n, GLuint *textures)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glGenTextures, __builtin_return_address(0)), real_glGenTextures(n, textures);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glGenTextures, __builtin_return_address(0)), glGenTextures(n, textures);
     wb_count(FN_glGenTextures);
     real_glGenTextures(n, textures);
     wb_log(FN_glGenTextures, "%d -> %s", n, ids(n, textures));
@@ -302,7 +304,7 @@ void wb_glGenTextures(GLsizei n, GLuint *textures)
 // table of sizes, the query is repeated into a sentinel-filled scratch array.
 void wb_glGetFloatv(GLenum pname, GLfloat *params)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glGetFloatv, __builtin_return_address(0)), real_glGetFloatv(pname, params);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glGetFloatv, __builtin_return_address(0)), glGetFloatv(pname, params);
     wb_count(FN_glGetFloatv);
     real_glGetFloatv(pname, params);
     bool first = wb_hist(FN_glGetFloatv, pname, 0, 0, 0);
@@ -320,7 +322,7 @@ void wb_glGetFloatv(GLenum pname, GLfloat *params)
 
 void wb_glGetIntegerv(GLenum pname, GLint *params)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glGetIntegerv, __builtin_return_address(0)), real_glGetIntegerv(pname, params);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glGetIntegerv, __builtin_return_address(0)), glGetIntegerv(pname, params);
     wb_count(FN_glGetIntegerv);
     real_glGetIntegerv(pname, params);
     bool first = wb_hist(FN_glGetIntegerv, pname, 0, 0, 0);
@@ -340,7 +342,7 @@ void wb_glGetIntegerv(GLenum pname, GLint *params)
 
 void wb_glPixelStorei(GLenum pname, GLint param)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glPixelStorei, __builtin_return_address(0)), real_glPixelStorei(pname, param);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glPixelStorei, __builtin_return_address(0)), glPixelStorei(pname, param);
     wb_count(FN_glPixelStorei);
     HIST(FN_glPixelStorei, pname, param, 0, 0, "%s, %d", E(pname), param);
     VLOG(FN_glPixelStorei, "%s, %d", E(pname), param);
@@ -349,7 +351,7 @@ void wb_glPixelStorei(GLenum pname, GLint param)
 
 void wb_glPolygonMode(GLenum face, GLenum mode)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glPolygonMode, __builtin_return_address(0)), real_glPolygonMode(face, mode);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glPolygonMode, __builtin_return_address(0)), glPolygonMode(face, mode);
     wb_count(FN_glPolygonMode);
     HIST(FN_glPolygonMode, face, mode, 0, 0, "%s, %s", E(face), E(mode));
     VLOG(FN_glPolygonMode, "%s, %s", E(face), E(mode));
@@ -358,7 +360,7 @@ void wb_glPolygonMode(GLenum face, GLenum mode)
 
 void wb_glTexEnvf(GLenum target, GLenum pname, GLfloat param)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexEnvf, __builtin_return_address(0)), real_glTexEnvf(target, pname, param);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexEnvf, __builtin_return_address(0)), glTexEnvf(target, pname, param);
     wb_count(FN_glTexEnvf);
     HIST(FN_glTexEnvf, target, pname, fbits(param), 0, "%s, %s, %g", E(target), E(pname), param);
     VLOG(FN_glTexEnvf, "%s, %s, %g [unit %u]", E(target), E(pname), param, s_unit);
@@ -369,7 +371,7 @@ void wb_glTexEnvf(GLenum target, GLenum pname, GLfloat param)
 void wb_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border,
                      GLenum format, GLenum type, const GLvoid *pixels)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexImage2D, __builtin_return_address(0)), real_glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexImage2D, __builtin_return_address(0)), glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
     wb_count(FN_glTexImage2D);
     GLuint tex = bound_tex(target);
     {
@@ -389,7 +391,7 @@ void wb_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei w
 
 void wb_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexParameterf, __builtin_return_address(0)), real_glTexParameterf(target, pname, param);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexParameterf, __builtin_return_address(0)), glTexParameterf(target, pname, param);
     wb_count(FN_glTexParameterf);
     bool is_enum = param == std::floor(param) && param >= 0x2600;
     HIST(FN_glTexParameterf, target, pname, fbits(param), 0, "%s, %s, %s", E(target), E(pname),
@@ -402,7 +404,7 @@ void wb_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 
 void wb_glTexParameteri(GLenum target, GLenum pname, GLint param)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexParameteri, __builtin_return_address(0)), real_glTexParameteri(target, pname, param);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glTexParameteri, __builtin_return_address(0)), glTexParameteri(target, pname, param);
     wb_count(FN_glTexParameteri);
     bool is_enum = param >= 0x2600;
     char num[16];
@@ -416,7 +418,7 @@ void wb_glTexParameteri(GLenum target, GLenum pname, GLint param)
 
 void wb_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    if (!from_game(__builtin_return_address(0))) return foreign(FN_glViewport, __builtin_return_address(0)), real_glViewport(x, y, width, height);
+    if (!from_game(__builtin_return_address(0))) return foreign(FN_glViewport, __builtin_return_address(0)), glViewport(x, y, width, height);
     wb_count(FN_glViewport);
     HIST(FN_glViewport, x, y, width, (uint64_t)height << 1 | (s_fbo != 0), "%d, %d, %d, %d on %s", x, y, width, height,
          s_fbo ? "an FBO" : "the screen");
@@ -748,7 +750,7 @@ void wb_glLinkProgram(GLuint program)
             out += "  shader  " + std::to_string(sh) + " " + E(si.type) + " " + si.file + "\n";
         }
     }
-    if (ok) {
+    if (ok && !g_metal) { // these queries need real OpenGL
         char name[256], line[512];
         GLint size;
         GLenum type;
@@ -904,6 +906,12 @@ void wb_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean n
 GLenum wb_glewInit(void)
 {
     wb_count(FN_glewInit);
+    if (g_metal) { // there is no OpenGL context for the real glewInit to inspect
+        wb_gl_install_metal();
+        wb_log(FN_glewInit, "-> GLEW_OK, all pointers routed to the Metal backend");
+        wb_flush();
+        return GLEW_OK;
+    }
     GLenum r = glewInit();
     int swapped = 0;
 #define GL_DIRECT(n)
@@ -929,6 +937,15 @@ WB_INTERPOSE(wb_glewInit, glewInit);
 } // namespace
 
 // ---- helpers used by the SDL hooks and the summary -------------------------
+
+void wb_gl_install_metal()
+{
+#define GL_DIRECT(n) real_gl##n = mtl_gl##n;
+#define GL_GLEW(n)                                                                  \
+    real_gl##n = mtl_gl##n;                                                        \
+    __glew##n = wb_gl##n;
+#include "gl_api.def"
+}
 
 void wb_gl_context_created()
 {

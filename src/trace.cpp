@@ -35,6 +35,7 @@ std::atomic<uint32_t> g_frame{0};
 std::atomic<uint64_t> g_frame_draws{0};
 bool g_glerr = false;
 bool g_native = false;
+bool g_metal = false;
 const char *g_out_dir = "";
 
 namespace {
@@ -322,7 +323,7 @@ void wb_write_summary()
             size_t n = v.size();
             double total = 0;
             for (float ms : v) total += ms;
-            fprintf(f, "mode: %s\naverage: %.1f fps (%.2f ms)\n", g_native ? "native (no tracing)" : "trace", 1000.0 * v.size() / total,
+            fprintf(f, "mode: %s\naverage: %.1f fps (%.2f ms)\n", g_native ? "native (no tracing)" : g_metal ? "metal" : "trace", 1000.0 * v.size() / total,
                     total / v.size());
             fprintf(f, "frame time ms: p50 %.2f  p90 %.2f  p99 %.2f  max %.2f  (%zu frames)\n", pct(0.50), pct(0.90),
                     pct(0.99), v.back(), n);
@@ -386,11 +387,8 @@ static void wb_init()
     unsetenv("DYLD_INSERT_LIBRARIES");
 
     const char *mode = getenv("WBM_MODE");
-    if (mode && !strcmp(mode, "metal")) {
-        fprintf(stderr, "wbmetal: WBM_MODE=metal is not implemented yet; use WBM_MODE=trace\n");
-        exit(1);
-    }
-    if (mode && !strcmp(mode, "native")) g_native = true;
+    if (mode && !strcmp(mode, "metal")) g_metal = true;
+    else if (mode && !strcmp(mode, "native")) g_native = true;
     else if (mode && strcmp(mode, "trace")) fprintf(stderr, "wbmetal: unknown WBM_MODE '%s', using trace\n", mode);
 
     const char *out = getenv("WBM_OUT");
@@ -411,7 +409,7 @@ static void wb_init()
 
     parse_ranges(getenv("WBM_TRACE_FRAMES"));
     if (const char *v = getenv("WBM_LOG_MAX_MB")) s_log_cap = strtoull(v, nullptr, 10) << 20;
-    if (const char *v = getenv("WBM_GLERR")) g_glerr = atoi(v) != 0;
+    if (const char *v = getenv("WBM_GLERR")) g_glerr = atoi(v) != 0 && !g_metal; // no OpenGL context to ask in Metal mode
     g_verbose.store(in_verbose_ranges(0));
 
     struct sigaction sa {};
@@ -425,7 +423,7 @@ static void wb_init()
         wb_flush();
     });
 
-    wb_note("wbmetal %s, pid %d", g_native ? "native mode (frame timing only, GL calls untouched)" : "trace shim", getpid());
+    wb_note("wbmetal %s, pid %d", g_native ? "native mode (frame timing only, GL calls untouched)" : g_metal ? "Metal backend" : "trace shim", getpid());
     wb_note("line format: f<frame> t<thread> <function> <arguments>");
     wb_flush();
     fprintf(stderr, "wbmetal: tracing to %s\n", s_out.c_str());

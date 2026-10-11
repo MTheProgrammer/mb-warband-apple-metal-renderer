@@ -1,4 +1,4 @@
-// Saves the frame about to be presented as frames/frame_<n>.png.
+// Saves frames as frames/frame_<n>.png.
 
 #include "trace.h"
 
@@ -20,15 +20,22 @@ void wb_capture_frame(int w, int h, uint32_t frame)
     }
     for (int y = 0; y < h; y++) memcpy(&top_down[row * y], &gl[row * (h - 1 - y)], row); // GL rows start at the bottom
 
+    wb_save_frame_png(top_down.data(), w, h, frame, false);
+}
+
+void wb_save_frame_png(const unsigned char *pixels, int w, int h, uint32_t frame, bool bgra)
+{
+    size_t row = (size_t)w * 4;
     char name[64];
     snprintf(name, sizeof name, "/frames/frame_%06u.png", frame);
     std::string path = std::string(g_out_dir) + name;
 
     bool ok = false;
+    CGBitmapInfo layout = bgra ? (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst
+                               : (CGBitmapInfo)kCGImageAlphaNoneSkipLast;
     CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGDataProviderRef provider = CGDataProviderCreateWithData(nullptr, top_down.data(), top_down.size(), nullptr);
-    CGImageRef image = CGImageCreate(w, h, 8, 32, row, space, (CGBitmapInfo)kCGImageAlphaNoneSkipLast, provider, nullptr,
-                                     false, kCGRenderingIntentDefault);
+    CGDataProviderRef provider = CGDataProviderCreateWithData(nullptr, pixels, row * h, nullptr);
+    CGImageRef image = CGImageCreate(w, h, 8, 32, row, space, layout, provider, nullptr, false, kCGRenderingIntentDefault);
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8 *)path.c_str(), (CFIndex)path.size(), false);
     if (image && url) {
         if (CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr)) {

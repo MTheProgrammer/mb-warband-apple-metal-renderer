@@ -13,10 +13,12 @@ SDL  := $(RES)/SDL2.framework/Versions/A
 CXX      := clang++
 CXXFLAGS := -arch x86_64 -std=c++17 -O2 -g -Wall -Wextra -Wno-deprecated-declarations \
             -mmacosx-version-min=10.13 -fvisibility=hidden -fno-c++-static-destructors
-FRAMEWORKS := -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation
+FRAMEWORKS := -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
+              -framework Metal -framework QuartzCore -framework AppKit
 
-SRCS := $(wildcard src/*.cpp)
-OBJS := $(SRCS:src/%.cpp=build/%.o)
+HDRS := $(wildcard src/*.h) src/gl_api.def
+OBJS := $(patsubst src/%.cpp,build/%.o,$(wildcard src/*.cpp)) \
+        $(patsubst src/%.mm,build/%.o,$(wildcard src/*.mm))
 LIB  := build/libwbmetal.dylib
 
 all: $(LIB)
@@ -26,8 +28,11 @@ $(LIB): $(OBJS)
 	    "$(GLEW)/GLEW" "$(SDL)/SDL2" $(FRAMEWORKS) \
 	    -Wl,-rpath,"$(RES)" -install_name @rpath/libwbmetal.dylib
 
-build/%.o: src/%.cpp src/trace.h src/interpose.h src/gl_api.def | build
+build/%.o: src/%.cpp $(HDRS) Makefile | build
 	$(CXX) $(CXXFLAGS) -I"$(GLEW)/Headers" -I"$(SDL)/Headers" -c $< -o $@
+
+build/%.o: src/%.mm $(HDRS) Makefile | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I"$(GLEW)/Headers" -I"$(SDL)/Headers" -c $< -o $@
 
 build:
 	mkdir -p build

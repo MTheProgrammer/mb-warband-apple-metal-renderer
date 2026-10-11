@@ -2,7 +2,7 @@
 
 An injected library for Mount & Blade: Warband (Steam, macOS) that will replace the game's OpenGL renderer with Metal. The game's files are not modified.
 
-Status: milestone 1 of 7. The library traces every graphics call the game makes and forwards it to real OpenGL. The Metal backend does not exist yet.
+Status: milestone 2 of 7. The library traces every graphics call the game makes and forwards it either to real OpenGL or to its own Metal backend. The Metal backend so far opens the window and clears it: the game runs, but the screen stays blank. Shaders, textures and drawing come in the next milestones.
 
 ## Build
 
@@ -34,8 +34,9 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 
 | Variable | Meaning |
 |---|---|
-| `WBM_MODE` | `trace` (default), or `native`: the game's own OpenGL calls are left untouched and only frame times are recorded. `metal` is reserved for the Metal backend |
+| `WBM_MODE` | `trace` (default): OpenGL with tracing. `native`: the game's own OpenGL calls are left untouched and only frame times are recorded. `metal`: the Metal backend, with tracing |
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
+| `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
 | `WBM_OUT` | Output directory. `run.sh` sets it |
 | `WBM_TRACE_FRAMES` | Frames to log call by call and capture, for example `1-3,600` |
 | `WBM_GLERR` | `1` checks `glGetError` after every setup call |
@@ -49,6 +50,8 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 
 - 22 are imported from OpenGL.framework and replaced through a dyld interpose table, as are 7 SDL window and context functions.
 - 40 are called through pointer variables exported by the game's bundled GLEW. The shim interposes `glewInit` and swaps those pointers after GLEW has filled them in.
+
+In Metal mode the window is created without an OpenGL surface and gets a `CAMetalLayer`; the game receives a placeholder context, and the 62 functions are routed to `src/metal_backend.mm`.
 
 AppKit also calls a few of the interposed functions when it presents the GL surface. Calls that do not come from the game binary are forwarded and counted separately.
 

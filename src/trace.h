@@ -30,6 +30,7 @@ extern const char *const g_fn_names[FN_COUNT];
 extern std::atomic<bool> g_verbose;       // current frame is logged call by call
 extern std::atomic<uint32_t> g_frame;     // frame 0 is everything before the first swap
 extern std::atomic<uint64_t> g_frame_draws;
+extern bool g_metal;                      // WBM_MODE=metal: calls go to the Metal backend, not OpenGL
 extern bool g_native;                     // WBM_MODE=native: time frames only, trace nothing
 extern bool g_glerr;                      // WBM_GLERR: glGetError after setup calls
 extern const char *g_out_dir;
@@ -74,6 +75,7 @@ uint64_t wb_hash(const void *data, size_t len);
 
 // ---- trace_gl.cpp -------------------------------------------------------
 
+void wb_gl_install_metal();                         // routes all 62 functions to the Metal backend
 void wb_gl_context_created();                       // logs GL strings and limits
 void wb_gl_dump_state(FILE *f);                     // FBO layouts for the summary
 void wb_gl_take_screen_extent(int *w, int *h);
@@ -81,4 +83,6 @@ bool wb_gl_read_backbuffer(int w, int h, unsigned char *rgba);
 
 // ---- capture.cpp --------------------------------------------------------
 
-void wb_capture_frame(int w, int h, uint32_t frame);
+void wb_capture_frame(int w, int h, uint32_t frame); // reads the OpenGL back buffer
+// Writes frames/frame_<n>.png from top-down 32-bit pixels, RGBA or BGRA.
+void wb_save_frame_png(const unsigned char *pixels, int w, int h, uint32_t frame, bool bgra);
