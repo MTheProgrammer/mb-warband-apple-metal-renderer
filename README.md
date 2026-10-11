@@ -65,3 +65,7 @@ Render-to-texture passes are drawn upside down, so that textures keep OpenGL's r
 AppKit also calls a few of the interposed functions when it presents the GL surface. Calls that do not come from the game binary are forwarded and counted separately.
 
 Do not use the shim on multiplayer servers: it changes how the game process loads libraries.
+
+## License
+
+MIT, see `LICENSE`. The build downloads glslang and SPIRV-Cross, which carry their own licences. Mount & Blade: Warband is not included and is required; this project is not affiliated with TaleWorlds Entertainment.
