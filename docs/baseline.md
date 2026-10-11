@@ -28,3 +28,12 @@ Same battle, same routine, `max_framerate = 120`:
 | Metal, Retina, `WBM_VSYNC=0` | `20261011-233259` | 197 s | 5 | 120 fps, at the limit |
 
 Metal never left the game's own limit, so its real ceiling is not measured yet.
+
+## With `max_framerate = 1000`, 2026-10-11
+
+| Renderer | Trace | Length | Average | Median second | Slowest 10% of seconds | Slowest second |
+|---|---|---|---|---|---|---|
+| OpenGL (`WBM_MODE=native`) | `20261011-234133` | 71 s | 110 fps | 117 fps | 86 fps or less | 55 fps |
+| Metal, Retina, `WBM_VSYNC=0` | `20261011-233952` | 76 s | 199 fps | 210 fps | 131 fps or less | 109 fps |
+
+OpenGL still stops at 120 fps: its vsync could not be turned off. The two battles were played by hand and are not identical; this OpenGL battle was lighter than the one in the earlier comparison (55-75 fps).
