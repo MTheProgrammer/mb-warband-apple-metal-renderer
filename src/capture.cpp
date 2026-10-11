@@ -1,0 +1,45 @@
+// Saves the frame about to be presented as frames/frame_<n>.png.
+
+#include "trace.h"
+
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+
+#include <cstring>
+#include <string>
+#include <vector>
+
+void wb_capture_frame(int w, int h, uint32_t frame)
+{
+    if (w <= 0 || h <= 0) return;
+    size_t row = (size_t)w * 4;
+    std::vector<unsigned char> gl(row * h), top_down(row * h);
+    if (!wb_gl_read_backbuffer(w, h, gl.data())) {
+        wb_note("  !! capture of frame %u failed in glReadPixels", frame);
+        return;
+    }
+    for (int y = 0; y < h; y++) memcpy(&top_down[row * y], &gl[row * (h - 1 - y)], row); // GL rows start at the bottom
+
+    char name[64];
+    snprintf(name, sizeof name, "/frames/frame_%06u.png", frame);
+    std::string path = std::string(g_out_dir) + name;
+
+    bool ok = false;
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGDataProviderRef provider = CGDataProviderCreateWithData(nullptr, top_down.data(), top_down.size(), nullptr);
+    CGImageRef image = CGImageCreate(w, h, 8, 32, row, space, (CGBitmapInfo)kCGImageAlphaNoneSkipLast, provider, nullptr,
+                                     false, kCGRenderingIntentDefault);
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8 *)path.c_str(), (CFIndex)path.size(), false);
+    if (image && url) {
+        if (CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr)) {
+            CGImageDestinationAddImage(dest, image, nullptr);
+            ok = CGImageDestinationFinalize(dest);
+            CFRelease(dest);
+        }
+    }
+    if (url) CFRelease(url);
+    CGImageRelease(image);
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(space);
+    wb_note(ok ? "  captured frame %u -> %s" : "  !! could not write frame %u to %s", frame, path.c_str());
+}
