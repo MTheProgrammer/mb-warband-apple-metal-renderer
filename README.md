@@ -39,6 +39,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_MODE` | `trace` (default): OpenGL with tracing. `native`: the game's own OpenGL calls are left untouched and only frame times are recorded. `metal`: the Metal renderer |
 | `WBM_TRACE` | `1` traces the calls in Metal mode too, at a cost in frame rate. Off by default there |
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
+| `WBM_SCALE` | Metal mode: resolution multiplier for the screen and screen-sized render targets. Defaults to the display's scale (2 on Retina); `1` renders at the game's own resolution, as OpenGL does |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
 | `WBM_OUT` | Output directory. `run.sh` sets it |
 | `WBM_TRACE_FRAMES` | Frames to log call by call and capture, for example `1-3,600` |

@@ -39,6 +39,7 @@ struct Texture {
     id<MTLTexture> mtl;
     MTLPixelFormat format = MTLPixelFormatInvalid;
     int top_level = -1; // highest mip level that has content
+    int scale = 1;      // storage is this many times the size the game asked for (see s_scale)
     // sampler parameters, with OpenGL's defaults
     GLenum min_filter = GL_NEAREST_MIPMAP_LINEAR, mag_filter = GL_LINEAR, wrap_s = GL_REPEAT, wrap_t = GL_REPEAT;
     float anisotropy = 1;
@@ -48,6 +49,7 @@ struct Texture {
 
 struct Renderbuffer {
     id<MTLTexture> mtl;
+    int scale = 1;
 };
 
 struct Framebuffer {
@@ -118,6 +120,18 @@ id<MTLCommandBuffer> s_cmd;
 id<MTLRenderCommandEncoder> s_pass;
 id<MTLTexture> s_pass_color, s_pass_depth; // attachments of the open pass
 bool s_pass_screen;
+int s_pass_scale = 1;
+
+// The game renders at the window's size in points. On a Retina display that is
+// half the panel's resolution, so the screen and every screen-sized render
+// target are allocated s_scale times larger and viewports are scaled to match.
+int s_scale = 1;
+int s_screen_w, s_screen_h; // the size the game believes the screen has
+
+int scale_for(int w, int h)
+{
+    return (w == s_screen_w && h == s_screen_h) ? s_scale : 1;
+}
 
 // Uniform data is copied into chunks that live until the GPU has used them.
 std::mutex s_chunk_mu;
@@ -211,6 +225,7 @@ id<MTLTexture> new_depth_texture(NSUInteger width, NSUInteger height)
 struct Target {
     id<MTLTexture> color, depth;
     bool screen = false;
+    int scale = 1;
 };
 
 // The attachments the bound framebuffer currently describes. Returns false
@@ -228,13 +243,19 @@ bool resolve_target(Target &t)
             s_screen_depth = new_depth_texture(t.color.width, t.color.height);
         t.depth = s_screen_depth;
         t.screen = true;
+        t.scale = s_scale;
         return true;
     }
     Framebuffer *fb = find(s_framebuffers, s_fbo);
     if (!fb) return false;
-    if (Texture *tex = find(s_textures, fb->color_texture)) t.color = tex->mtl;
-    if (Renderbuffer *rb = find(s_renderbuffers, fb->depth_renderbuffer)) t.depth = rb->mtl;
-    else if (Texture *tex = find(s_textures, fb->depth_texture)) t.depth = tex->mtl;
+    if (Texture *tex = find(s_textures, fb->color_texture)) t.color = tex->mtl, t.scale = tex->scale;
+    if (Renderbuffer *rb = find(s_renderbuffers, fb->depth_renderbuffer)) {
+        t.depth = rb->mtl;
+        if (!t.color) t.scale = rb->scale;
+    } else if (Texture *tex = find(s_textures, fb->depth_texture)) {
+        t.depth = tex->mtl;
+        if (!t.color) t.scale = tex->scale;
+    }
     return t.color || t.depth;
 }
 
@@ -262,6 +283,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_color = t.color;
     s_pass_depth = t.depth;
     s_pass_screen = t.screen;
+    s_pass_scale = t.scale;
 }
 
 bool ensure_pass()
@@ -707,8 +729,8 @@ bool prepare_draw()
     // viewport then counts from the top like Metal's own.
     bool flip = !s_pass_screen;
     double target_h = s_pass_color ? (double)s_pass_color.height : (double)s_pass_depth.height;
-    [s_pass setViewport:(MTLViewport){(double)s_viewport.x, flip ? (double)s_viewport.y : target_h - s_viewport.y - s_viewport.h,
-                                      (double)s_viewport.w, (double)s_viewport.h, 0.0, 1.0}];
+    double k = s_pass_scale, vx = s_viewport.x * k, vy = s_viewport.y * k, vw = s_viewport.w * k, vh = s_viewport.h * k;
+    [s_pass setViewport:(MTLViewport){vx, flip ? vy : target_h - vy - vh, vw, vh, 0.0, 1.0}];
     [s_pass setFrontFacingWinding:flip ? MTLWindingClockwise : MTLWindingCounterClockwise];
     [s_pass setCullMode:!s_cull ? MTLCullModeNone : s_cull_face == GL_FRONT ? MTLCullModeFront : MTLCullModeBack];
     [s_pass setTriangleFillMode:s_polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
@@ -794,6 +816,9 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_device = MTLCreateSystemDefaultDevice();
     s_queue = [s_device newCommandQueue];
     s_viewport = {0, 0, width, height};
+    s_screen_w = width;
+    s_screen_h = height;
+    const char *scale_env = getenv("WBM_SCALE");
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -810,14 +835,18 @@ void mtl_attach_window(void *nswindow, int width, int height)
 
     void (^attach)(void) = ^{
         NSWindow *window = (__bridge NSWindow *)nswindow;
+        s_scale = scale_env ? atoi(scale_env) : (int)lround(window.backingScaleFactor);
+        s_scale = std::max(1, std::min(4, s_scale));
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = s_device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = NO; // frame captures read the drawable back
         layer.opaque = YES;
-        // The game renders at the size it asked SDL for; the layer stretches that to the view.
-        layer.drawableSize = CGSizeMake(width, height);
+        // The drawable is the game's size times s_scale; the layer stretches it to the view.
+        layer.drawableSize = CGSizeMake(width * s_scale, height * s_scale);
         layer.contentsGravity = kCAGravityResize;
+        layer.magnificationFilter = kCAFilterLinear;
+        layer.minificationFilter = kCAFilterLinear;
         NSView *view = window.contentView;
         view.layer = layer; // set before wantsLayer: the view hosts our layer instead of making its own
         view.wantsLayer = YES;
@@ -825,6 +854,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     };
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
+    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d)", width, height, width * s_scale, height * s_scale, s_scale);
 }
 
 const char *mtl_device_name()
@@ -1030,7 +1060,10 @@ void mtl_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei 
         return;
     }
     @autoreleasepool {
-        if (!ensure_storage(*t, f, level, width, height)) return;
+        // Without data this is a render target: screen-sized ones get the screen's scale.
+        int k = (!pixels && level == 0) ? scale_for(width, height) : 1;
+        if (!ensure_storage(*t, f, level, width * k, height * k)) return;
+        t->scale = k;
         if (!pixels) return;
         bool type_matches = type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT ||
                             (type == GL_FLOAT && (f.format == MTLPixelFormatR32Float || f.format == MTLPixelFormatRGBA32Float));
@@ -1166,7 +1199,9 @@ void mtl_glRenderbufferStorage(GLenum, GLenum internalformat, GLsizei width, GLs
         return;
     }
     @autoreleasepool {
-        s_renderbuffers[s_rbo].mtl = new_depth_texture((NSUInteger)width, (NSUInteger)height);
+        Renderbuffer &rb = s_renderbuffers[s_rbo];
+        rb.scale = scale_for(width, height);
+        rb.mtl = new_depth_texture((NSUInteger)(width * rb.scale), (NSUInteger)(height * rb.scale));
     }
 }
 
