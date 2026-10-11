@@ -2,7 +2,7 @@
 
 An injected library for Mount & Blade: Warband (Steam, macOS) that will replace the game's OpenGL renderer with Metal. The game's files are not modified.
 
-Status: the Metal renderer draws the game: menus, battles with shadows and post-processing, HUD and text. It has been checked in the Native module's battles only. Not done yet: a shader cache (programs are translated at every start), and a systematic comparison of images and frame rates against OpenGL.
+Status: the Metal renderer draws the game: menus, the world map, battles with shadows and post-processing, HUD and text. A 200 vs 200 battle and the world map of the Native module pass Metal's API validation (`MTL_DEBUG_LAYER=1`) without a violation. Frame rates against OpenGL are in `docs/baseline.md`. Not done yet: towns and modules other than Native are unchecked, and there is no shader cache, so programs are translated at every start.
 
 ## Build
 
