@@ -46,3 +46,9 @@ extern const char *const k_xl_yflip_uniform;
 // attrib_locations: names given to glBindAttribLocation and their indices.
 XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,
                        const std::map<std::string, int> &attrib_locations);
+
+// The same, through a cache on disk (~/Library/Caches/warband-metal, or the
+// directory in WBM_CACHE; WBM_CACHE=0 turns it off). Failed translations are
+// not cached.
+XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_glsl,
+                              const std::map<std::string, int> &attrib_locations, bool *from_cache);

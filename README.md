@@ -2,7 +2,7 @@
 
 An injected library for Mount & Blade: Warband (Steam, macOS) that will replace the game's OpenGL renderer with Metal. The game's files are not modified.
 
-Status: the Metal renderer draws the game: menus, the world map, battles with shadows and post-processing, HUD and text. A 200 vs 200 battle and the world map of the Native module pass Metal's API validation (`MTL_DEBUG_LAYER=1`) without a violation. Frame rates against OpenGL are in `docs/baseline.md`. Not done yet: towns and modules other than Native are unchecked, and there is no shader cache, so programs are translated at every start.
+Status: the Metal renderer draws the game: menus, the world map, battles with shadows and post-processing, HUD and text. A 200 vs 200 battle and the world map of the Native module pass Metal's API validation (`MTL_DEBUG_LAYER=1`) without a violation. Frame rates against OpenGL are in `docs/baseline.md`. Not done yet: modules other than Native are unchecked.
 
 ## Build
 
@@ -40,6 +40,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_TRACE` | `1` traces the calls in Metal mode too, at a cost in frame rate. Off by default there |
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
 | `WBM_SCALE` | Metal mode: resolution multiplier for the screen and screen-sized render targets. Defaults to the display's scale (2 on Retina); `1` renders at the game's own resolution, as OpenGL does |
+| `WBM_CACHE` | Directory of the translated-shader cache. Default `~/Library/Caches/warband-metal`; `0` disables it |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
 | `WBM_OUT` | Output directory. `run.sh` sets it |
 | `WBM_TRACE_FRAMES` | Frames to log call by call and capture, for example `1-3,600` |
@@ -57,7 +58,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 
 In Metal mode the window is created without an OpenGL surface and gets a `CAMetalLayer`; the game receives a placeholder context, and the 62 functions are routed to `src/metal_backend.mm`.
 
-Shaders are translated when a program is linked (`src/shader_xlate.cpp`): the engine's GLSL 1.20 is rewritten to GLSL 4.50, compiled to SPIR-V by glslang and turned into Metal Shading Language by SPIRV-Cross. `make build/xlate_test && build/xlate_test traces/latest` runs that translation over every program a trace recorded and compiles the results with Metal.
+Shaders are translated when a program is linked (`src/shader_xlate.cpp`), and the result is cached on disk (`src/shader_cache.cpp`), so later launches skip the translation. Metal then compiles the translated source in the background; a program waits for that only if it draws before its shaders are ready. The translation itself: the engine's GLSL 1.20 is rewritten to GLSL 4.50, compiled to SPIR-V by glslang and turned into Metal Shading Language by SPIRV-Cross. `make build/xlate_test && build/xlate_test traces/latest` runs that translation over every program a trace recorded and compiles the results with Metal.
 
 Render-to-texture passes are drawn upside down, so that textures keep OpenGL's row order and the game's texture coordinates work unchanged.
 

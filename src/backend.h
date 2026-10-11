@@ -16,5 +16,6 @@
 void mtl_attach_window(void *nswindow, int width, int height);
 const char *mtl_device_name();
 void mtl_set_vsync(bool on);
+void mtl_dump_stats(FILE *f); // shader translation and compile timings, for the summary
 // Ends the frame and presents it; saves it to frames/ first when capture is set.
 void mtl_present(bool capture, uint32_t frame);

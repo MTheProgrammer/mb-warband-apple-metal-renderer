@@ -84,12 +84,22 @@ struct UniformLocation {
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
 
+// One stage's MSL being compiled by Metal in the background. Programs that
+// share a shader share the compile.
+struct StageCompile {
+    dispatch_group_t group;
+    id<MTLFunction> function;
+    std::string error;
+};
+
 struct Program {
     std::vector<std::shared_ptr<Shader>> shaders;
     std::map<std::string, int> attribs;
     bool linked = false;
     XlProgram xl;
-    id<MTLFunction> function[2];
+    std::shared_ptr<StageCompile> compile[2];
+    id<MTLFunction> function[2]; // set from compile[] the first time the program draws
+    bool functions_ready = false;
     std::vector<uint8_t> uniform_data[2];
     std::vector<UniformLocation> locations;
     std::unordered_map<std::string, GLint> location_by_name;
@@ -162,6 +172,12 @@ struct {
 bool s_depth_test, s_depth_mask = true, s_cull, s_blend;
 GLenum s_depth_func = GL_LESS, s_cull_face = GL_BACK, s_polygon_mode = GL_FILL;
 GLenum s_blend_src = GL_ONE, s_blend_dst = GL_ZERO, s_blend_eq = GL_FUNC_ADD;
+
+std::unordered_map<std::string, std::shared_ptr<StageCompile>> s_stage_compiles; // by MSL source
+struct {
+    int links, cache_hits, stage_compiles;
+    double translate_ms, wait_ms;
+} s_shader_stats;
 
 std::unordered_map<uint64_t, id<MTLSamplerState>> s_samplers;
 id<MTLDepthStencilState> s_depth_states[2][8][2]; // [test][func - GL_NEVER][write]
@@ -477,21 +493,39 @@ void link_program(GLuint program_id, Program &p)
     p.location_by_name.clear();
     std::string vs, fs;
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
-    p.xl = xl_translate(vs, fs, p.attribs);
+    bool from_cache = false;
+    CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+    p.xl = xl_translate_cached(vs, fs, p.attribs, &from_cache);
+    s_shader_stats.translate_ms += (CFAbsoluteTimeGetCurrent() - started) * 1000;
+    s_shader_stats.links++;
+    s_shader_stats.cache_hits += from_cache;
     if (!p.xl.ok) {
         wb_note("  !! metal: program %u did not translate:\n%s", program_id, p.xl.log.c_str());
         return;
     }
     const XlStage *stages[2] = {&p.xl.vs, &p.xl.fs};
+    p.functions_ready = false;
     for (int s = 0; s < 2; s++) {
-        NSError *error = nil;
-        id<MTLLibrary> library = [s_device newLibraryWithSource:@(stages[s]->msl.c_str()) options:nil error:&error];
-        if (!library) {
-            wb_note("  !! metal: program %u %s shader did not compile: %s", program_id, s ? "fragment" : "vertex",
-                    error.localizedDescription.UTF8String);
-            return;
+        // Metal compiles the source in the background; the program waits for it
+        // only when it first draws (see finish_compile). The engine links every
+        // program at start-up and uses a few of them right away.
+        std::shared_ptr<StageCompile> &compile = s_stage_compiles[stages[s]->msl];
+        if (!compile) {
+            compile = std::make_shared<StageCompile>();
+            compile->group = dispatch_group_create();
+            dispatch_group_enter(compile->group);
+            std::shared_ptr<StageCompile> result = compile;
+            NSString *entry = @(stages[s]->entry.c_str());
+            [s_device newLibraryWithSource:@(stages[s]->msl.c_str())
+                                   options:nil
+                         completionHandler:^(id<MTLLibrary> library, NSError *error) {
+                           if (library) result->function = [library newFunctionWithName:entry];
+                           if (!result->function) result->error = error ? error.localizedDescription.UTF8String : "entry point not found";
+                           dispatch_group_leave(result->group);
+                         }];
+            s_shader_stats.stage_compiles++;
         }
-        p.function[s] = [library newFunctionWithName:@(stages[s]->entry.c_str())];
+        p.compile[s] = compile;
         p.uniform_data[s].assign((size_t)stages[s]->uniform_buffer_size, 0);
 
         auto location = [&](const std::string &name) -> UniformLocation & {
@@ -513,6 +547,25 @@ void link_program(GLuint program_id, Program &p)
     for (int loc : p.xl.vs.input_locations)
         if (loc >= 0 && loc < MAX_ATTRIBS) p.input_mask |= 1u << loc;
     p.linked = true;
+}
+
+// Waits for the program's two shaders to finish compiling. Returns false, and
+// retires the program, if either failed.
+bool finish_compile(Program &p)
+{
+    CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+    for (int s = 0; s < 2; s++) {
+        StageCompile &c = *p.compile[s];
+        dispatch_group_wait(c.group, DISPATCH_TIME_FOREVER);
+        if (!c.function) {
+            complain("program %u %s shader did not compile: %s", s_program, s ? "fragment" : "vertex", c.error.c_str());
+            p.linked = false;
+            return false;
+        }
+        p.function[s] = c.function;
+    }
+    s_shader_stats.wait_ms += (CFAbsoluteTimeGetCurrent() - started) * 1000;
+    return p.functions_ready = true;
 }
 
 // Writes `count` values of `components` 32-bit words each into the uniform's
@@ -705,6 +758,7 @@ bool prepare_draw()
 {
     Program *p = find(s_programs, s_program);
     if (!p || !p->linked) return false;
+    if (!p->functions_ready && !finish_compile(*p)) return false;
     if (!ensure_pass()) return false;
 
     PipelineKey key;
@@ -860,6 +914,14 @@ void mtl_attach_window(void *nswindow, int width, int height)
 const char *mtl_device_name()
 {
     return s_device ? s_device.name.UTF8String : "(no device)";
+}
+
+void mtl_dump_stats(FILE *f)
+{
+    fprintf(f, "\n== Metal shaders ==\n%d programs linked, %d from the disk cache, %.0f ms translating\n", s_shader_stats.links,
+            s_shader_stats.cache_hits, s_shader_stats.translate_ms);
+    fprintf(f, "%d distinct shaders compiled by Metal in the background, %.0f ms spent waiting for them at draws\n",
+            s_shader_stats.stage_compiles, s_shader_stats.wait_ms);
 }
 
 void mtl_set_vsync(bool on)

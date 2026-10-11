@@ -1018,6 +1018,7 @@ void wb_gl_dump_state(FILE *f)
         }
     }
     fprintf(f, "\ntextures created: %zu, shaders: %zu\n", s_texinfo.size(), s_shaders.size());
+    if (g_metal) mtl_dump_stats(f);
 }
 
 // The extent of the viewports the game set on the default framebuffer since
