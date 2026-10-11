@@ -1,7 +1,7 @@
 #!/bin/sh
 # Summarises frame rates of one or more runs from their fps.log.
 # Usage: scripts/fps.sh [trace-dir ...]        (default: traces/latest)
-# Seconds at the display's cap say nothing about the renderer, so the summary
+# Seconds at the game's frame-rate limit say nothing about the renderer, so the summary
 # also reports the seconds that fell below it.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 [ $# -eq 0 ] && set -- "$ROOT/traces/latest"
