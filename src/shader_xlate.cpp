@@ -664,8 +664,15 @@ bool add_shell_push(std::string &vs)
     // strand they are (see build_strands in the backend). The strand is laid
     // out here: it leaves the skin the way the hair map has it combed, bends
     // over to hang, and is widened across the line of sight.
-    //   colour x: segment * 2 + side; y: a chance number, plus 128 for the tail;
-    //   z, w: the hair map's red and green at the root.
+    //   colour x: segment * 2 + side, plus 32 times how far down the tail the
+    //   root is (0 to 7); y: a chance number (0 to 63), plus 64 for a mane that
+    //   falls to the model's +x side, plus 128 for the tail; z, w: the hair
+    //   map's red and green at the root.
+    // The mane grows from the crest of the neck and falls down one side of it;
+    // on the head (marked like the far end of a tail) it is the forelock, shorter, falling forwards.
+    // The tail's hair runs on along the tail (which at rest hangs straight down
+    // the model, and is turned with its bones), past its end, and droops: long
+    // from the dock, shorter from farther down, so that it ends much together.
     // wbm_shell.x: -(the mane's length), y: the tail's, metres.
     std::string strand;
     if (placed && vs.find("attribute vec4 inColor0;") != std::string::npos && vs.find("attribute vec3 inTangent;") != std::string::npos) {
@@ -679,23 +686,27 @@ bool add_shell_push(std::string &vs)
         const std::string eye = vs.find("uniform vec4 vCameraPos;") != std::string::npos ? "((vCameraPos.xyz - matWorld[3].xyz) * mat3(matWorld) - $1.xyz)" : "wbm_n";
         strand = "\n  if (wbm_shell.x < 0.0) {\n"
                  "    float wbm_v = floor(inColor0.x * 255.0 + 0.5), wbm_r = floor(inColor0.y * 255.0 + 0.5);\n"
+                 "    float wbm_far = floor(wbm_v / 32.0) / 7.0;\n"
+                 "    wbm_v -= floor(wbm_v / 32.0) * 32.0;\n"
                  "    float wbm_side = mod(wbm_v, 2.0) * 2.0 - 1.0, wbm_t = floor(wbm_v / 2.0) / 8.0;\n"
-                 "    float wbm_tail = step(128.0, wbm_r), wbm_chance = (wbm_r - 128.0 * wbm_tail) / 127.0;\n"
+                 "    float wbm_tail = step(128.0, wbm_r);\n"
+                 "    wbm_r -= 128.0 * wbm_tail;\n"
+                 "    float wbm_fall = step(64.0, wbm_r) * 2.0 - 1.0, wbm_chance = (wbm_r - 64.0 * step(64.0, wbm_r)) / 63.0;\n"
                  "    vec2 wbm_d = inColor0.zw * 2.0 - 1.0;\n"
                  "    mat3 wbm_m = mat3(matWorldArray[$2]) * inBlendWeight.x + mat3(matWorldArray[$4]) * inBlendWeight.y + mat3(matWorldArray[$5]) * inBlendWeight.z + mat3(matWorldArray[$6]) * inBlendWeight.w;\n"
                  "    vec3 wbm_n = normalize(wbm_m * inNormal), wbm_along = wbm_m * inTangent;\n"
                  "    vec3 wbm_down = " + down + ";\n"
                  "    vec3 wbm_c = wbm_along * wbm_d.x - cross(wbm_n, wbm_along) * " + handed + " * wbm_d.y;\n"
                  "    wbm_c = dot(wbm_c, wbm_c) > 0.0004 ? normalize(wbm_c) : wbm_down;\n"
-                 "    vec3 wbm_out = wbm_tail > 0.5 ? normalize(wbm_down + wbm_n * 0.3 + wbm_c * 0.2) : normalize(wbm_c + wbm_n * 0.2);\n"
-                 "    float wbm_len = (wbm_tail > 0.5 ? wbm_shell.y : -wbm_shell.x) * (0.55 + 0.45 * wbm_chance);\n"
-                 "    float wbm_k = wbm_tail > 0.5 ? 0.95 : 0.6;\n"
+                 "    vec3 wbm_out = wbm_tail > 0.5 ? normalize(normalize(wbm_m * vec3(0.0, -0.12, -1.0)) + wbm_n * 0.12) : normalize(normalize(wbm_m * (wbm_far > 0.5 ? vec3(wbm_fall * 0.25, 1.0, 0.0) : vec3(wbm_fall, (fract(wbm_chance * 5.7) - 0.5) * 0.9, 0.0))) * (0.3 + 0.35 * fract(wbm_chance * 3.1)) + wbm_n * 0.2 + wbm_down * 0.35);\n"
+                 "    float wbm_len = (wbm_tail > 0.5 ? wbm_shell.y * (1.0 - 0.6 * wbm_far) : -wbm_shell.x * (1.0 - 0.45 * wbm_far)) * (wbm_tail > 0.5 ? 0.7 + 0.3 * wbm_chance : 0.45 + 0.55 * wbm_chance);\n"
+                 "    float wbm_k = wbm_tail > 0.5 ? 0.85 : 1.0;\n"
                  "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
                  "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
                  "    vec3 wbm_eye = " + eye + ";\n"
                  "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
                  "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
-                 "    float wbm_w = min(0.005, wbm_len * 0.03) * (0.6 + 0.8 * fract(wbm_chance * 7.3)) * (1.0 - 0.6 * wbm_t);\n" // half the width of a lock, metres
+                 "    float wbm_w = (wbm_tail > 0.5 ? 0.005 : 0.003) * (0.6 + 0.8 * fract(wbm_chance * 7.3)) * (1.0 - 0.6 * wbm_t);\n" // half the width of a lock, metres
                  "    float wbm_used = max(wbm_w, 0.0012 * length(wbm_eye));\n" // not much under a pixel wide: the rest is made up in how much it covers
                  "    $1.xyz += wbm_across * (wbm_side * wbm_used);\n"
                  "    wbm_strand_v = vec4(wbm_side, wbm_t, wbm_chance, wbm_w / wbm_used);\n"
@@ -856,6 +867,8 @@ vec4 wbm_hair_tint(vec4 painted)
 {
     if (wbm_shell.z >= 0.0 || wbm_shell.y <= 0.0 || wbm_hair_colour.w <= 0.0) return painted;
     float tone = dot(painted.xyz, vec3(0.3333)) / max(dot(wbm_hair_colour.xyz, vec3(0.3333)), 0.004);
+    // A strand is of one tone from end to end, its own; what is painted at its root (a highlight on the crest) is not it.
+    if (wbm_shell.x < 0.0) tone = (0.55 + 0.75 * fract(wbm_strand.z * 9.7)) * mix(0.75, 1.0, wbm_strand.y);
     return vec4(wbm_hair_colour.xyz * clamp(tone, 0.55, 1.7), painted.w);
 }
 
@@ -894,10 +907,10 @@ float wbm_shell_cover(vec2 uv, vec3 down)
     if (wbm_shell.x < 0.0) { // a strand: its edges are soft, and it thins out to nothing at the tip
         float pixel = max(fwidth(wbm_strand.x), 1e-4);
         // A ribbon is a lock: some hairs side by side with gaps between, more gaps towards the tip.
-        float hairs = wbm_strand.x * 3.5 + wbm_strand.z * 31.0;
+        float hairs = wbm_strand.x * 2.0 + wbm_strand.z * 31.0;
         float gap = abs(fract(hairs) - 0.5) * 2.0; // 0 on a hair, 1 between two
         float thin = mix(0.25, 0.9, wbm_strand.y) * (0.6 + 0.4 * fract(sin(floor(hairs) * 12.9898 + wbm_strand.z * 78.233) * 43758.5453));
-        float lock = mix(1.0, 1.0 - thin * smoothstep(0.35, 0.9, gap), clamp(0.6 / (pixel * 3.5), 0.0, 1.0)); // too fine to see, they even out
+        float lock = mix(1.0, 1.0 - thin * smoothstep(0.35, 0.9, gap), clamp(0.6 / (pixel * 2.0), 0.0, 1.0)); // too fine to see, they even out
         float cover = clamp((1.0 - abs(wbm_strand.x)) / pixel + 0.5, 0.0, 1.0) * wbm_strand.w * smoothstep(1.0, 0.8, wbm_strand.y) * lock;
         if (wbm_strand_soft > 0.5) return cover < 0.7 ? cover : 0.0;
         return cover < 0.7 ? 0.0 : 1.0;

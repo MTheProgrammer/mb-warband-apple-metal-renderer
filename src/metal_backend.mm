@@ -421,10 +421,10 @@ double s_wind_time;        // the same for every draw of a frame
 int s_fur_shells;
 float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its texture a metre of its surface covers
 // WBM_HAIR_STRANDS: mane and tail as strands of their own, in place of layers
-// (see build_strands). WBM_TAIL_LENGTH: how long the tail's are, metres; the
-// mane's are WBM_HAIR_LENGTH. WBM_HAIR_STRANDS_DENSITY: strands to the square metre.
+// (see build_strands). WBM_TAIL_LENGTH and WBM_MANE_LENGTH: how long the
+// longest are, metres. WBM_HAIR_STRANDS_DENSITY: strands to the square metre.
 bool s_hair_strands;
-float s_tail_length = 0.25f, s_strand_density = 30000.0f;
+float s_tail_length = 0.8f, s_mane_length = 0.18f, s_strand_density = 30000.0f;
 float s_hair_length = 0.07f; // WBM_HAIR_LENGTH: how far mane and tail stand off the body, metres; 0 for no layers of their own
 float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 1400.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per metre
 float s_shell_now[4];  // the shaders' wbm_shell for the draw being prepared
@@ -2714,6 +2714,20 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
     const size_t most = 12000; // strands to a mesh
     size_t strands = 0;
     float density = s_strand_density;
+    // The bone a vertex hangs on most. The tail is what hangs on the last two bones of a horse's skeleton.
+    auto bone_of = [&](const uint8_t *from) {
+        int bone = 0;
+        float heaviest = -1;
+        for (int k = 0; k < std::min<int>(wa.size, 4); k++) {
+            float weight = component(from + wa.offset, wa.type, k);
+            if (weight > heaviest) heaviest = weight, bone = (int)component(from + ba.offset, ba.type, k);
+        }
+        return bone;
+    };
+    // A mane grows from the crest of the neck only, which lies on the model's
+    // plane of symmetry (x = 0), and the hair there is closer set than a tail's.
+    const float crest = 0.035f, closer = 6.0f;
+    float tail_top = -1e9f, tail_bottom = 1e9f; // the model's z over the tail, found in the first pass
     for (int pass = 0; pass < 2; pass++) { // first to see how much skin there is to cover, so that the allowance is spread evenly
     double covered = 0;
     for (size_t i = 0; i + 2 < count && strands < most; i += 3) {
@@ -2728,9 +2742,16 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
         if (!any) continue;
         float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]}, e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
         float cx = e1[1] * e2[2] - e1[2] * e2[1], cy = e1[2] * e2[0] - e1[0] * e2[2], cz = e1[0] * e2[1] - e1[1] * e2[0];
-        float wanted = 0.5f * sqrtf(cx * cx + cy * cy + cz * cz) * density;
-        covered += 0.5 * sqrt((double)cx * cx + (double)cy * cy + (double)cz * cz);
-        if (pass == 0) continue;
+        bool tail_here = bone_of(vertices + v[0] * stride) >= 26;
+        if (!tail_here && std::min({fabsf(p[0][0]), fabsf(p[1][0]), fabsf(p[2][0])}) > crest) continue;
+        float area = 0.5f * sqrtf(cx * cx + cy * cy + cz * cz) * (tail_here ? 1.0f : closer);
+        float wanted = area * density;
+        covered += area;
+        if (pass == 0) {
+            if (tail_here)
+                for (int k = 0; k < 3; k++) tail_top = std::max(tail_top, p[k][2]), tail_bottom = std::min(tail_bottom, p[k][2]);
+            continue;
+        }
         int roots = (int)wanted + (chance() < wanted - floorf(wanted) ? 1 : 0);
         for (int r = 0; r < roots && strands < most; r++) {
             float a = chance(), b = chance();
@@ -2741,26 +2762,37 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
             for (int k = 0; k < 2; k++) uv[k] = w[0] * t[0][k] + w[1] * t[1][k] + w[2] * t[2][k];
             const uint8_t *here = at(uv[0], uv[1]);
             float luck = chance(), luck2 = chance(); // drawn whether or not the root is kept, so that a map's edit moves no other strand
-            (void)luck2;
             if (here[2] <= 204) continue;
             int nearest = w[1] > w[0] ? (w[2] > w[1] ? 2 : 1) : (w[2] > w[0] ? 2 : 0);
             const uint8_t *from = vertices + v[nearest] * stride;
-            // The tail is what hangs on the last two bones of a horse's skeleton.
-            int bone = 0;
-            float heaviest = -1;
-            for (int k = 0; k < std::min<int>(wa.size, 4); k++) {
-                float weight = component(from + wa.offset, wa.type, k);
-                if (weight > heaviest) heaviest = weight, bone = (int)component(from + ba.offset, ba.type, k);
-            }
+            int bone = bone_of(from);
             bool tail = bone >= 26;
+            if (!tail && fabsf(root[0]) > crest) continue;
+            bool to_plus = fabsf(root[0]) > 0.004f ? root[0] > 0 : luck2 > 0.5f; // the side the mane falls to
+            int far = tail && tail_top > tail_bottom ? std::min(7, std::max(0, (int)lroundf(7.0f * (tail_top - root[2]) / (tail_top - tail_bottom)))) : !tail && bone == 7 ? 7 : 0; // bone 7 is the head: the forelock
             uint32_t first = (uint32_t)(out.size() / stride);
             for (int segment = 0; segment <= k_strand_segments; segment++) {
                 for (int side = 0; side < 2; side++) {
                     size_t o = out.size();
                     out.insert(out.end(), from, from + stride);
                     memcpy(&out[o + pa.offset], root, 12), memcpy(&out[o + ta.offset], uv, 8);
+                    // Normal, tangent and binormal are blended between the corners as well, or the lighting would go in patches.
+                    for (int attrib : {1, 5, 6}) {
+                        const Attrib &na = s_attribs[attrib];
+                        if (!na.enabled || na.buffer != pa.buffer || na.type != GL_FLOAT || na.size < 3) continue;
+                        float blended[3] = {0, 0, 0}, corner[3];
+                        for (int c = 0; c < 3; c++) {
+                            memcpy(corner, vertices + v[c] * stride + na.offset, 12);
+                            for (int k = 0; k < 3; k++) blended[k] += w[c] * corner[k];
+                        }
+                        float len = sqrtf(blended[0] * blended[0] + blended[1] * blended[1] + blended[2] * blended[2]);
+                        if (len > 1e-6f) {
+                            for (float &f : blended) f /= len;
+                            memcpy(&out[o + na.offset], blended, 12);
+                        }
+                    }
                     uint8_t *colour = &out[o + ca.offset];
-                    colour[0] = (uint8_t)(segment * 2 + side), colour[1] = (uint8_t)((int)(luck * 127.0f) + (tail ? 128 : 0)), colour[2] = here[0], colour[3] = here[1];
+                    colour[0] = (uint8_t)(segment * 2 + side + far * 32), colour[1] = (uint8_t)((int)(luck * 63.0f) + (!tail && to_plus ? 64 : 0) + (tail ? 128 : 0)), colour[2] = here[0], colour[3] = here[1];
                 }
                 if (segment < k_strand_segments) {
                     uint32_t q = first + (uint32_t)segment * 2;
@@ -3666,6 +3698,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_HAIR_LENGTH")) s_hair_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_HAIR_STRANDS")) s_hair_strands = atoi(v) != 0;
     if (const char *v = getenv("WBM_TAIL_LENGTH")) s_tail_length = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_MANE_LENGTH")) s_mane_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_HAIR_STRANDS_DENSITY")) s_strand_density = std::max(100.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_LENGTH")) s_fur_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_RANGE")) s_fur_range = std::max(0.0f, (float)atof(v));
@@ -4660,7 +4693,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                     s_cull = false;
                     for (int soft = 0; soft < 2; soft++) {
                         if (soft) s_blend = true, s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD, s_depth_mask = false;
-                        const float now[4] = {-std::max(s_hair_length, 0.001f), s_tail_length, soft ? s_fur_density : -s_fur_density, clock};
+                        const float now[4] = {-std::max(s_mane_length, 0.001f), s_tail_length, soft ? s_fur_density : -s_fur_density, clock};
                         memcpy(s_shell_now, now, sizeof now);
                         if (prepare_draw())
                             [s_pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:strands.count indexType:MTLIndexTypeUInt32 indexBuffer:strands.indices indexBufferOffset:0];
