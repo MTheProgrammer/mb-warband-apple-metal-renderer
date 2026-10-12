@@ -892,7 +892,7 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
         within = vec2(dot(within, lie) / (1.0 + 1.6 * min(sqrt(known), 1.0)), dot(within, vec2(-lie.y, lie.x)));
     }
     float tufts = 0.6 * wbm_noise(at / 9.0) + 0.4 * wbm_noise(at / 3.5 + 17.0);
-    float length_ = (0.3 + 0.35 * chance + 0.35 * tufts) * mix(0.6, 1.0, grows.y);
+    float length_ = (0.45 + 0.15 * chance + 0.4 * tufts) * mix(0.6, 1.0, grows.y); // neighbours are much of a length; it is the tufts that differ
     if (share > length_) return true;
     // Towards the next halving, the hairs that will not survive it go, and the rest grow to fill in.
     if (fract(chance * 5.31) < between * 0.75 && (mod(cell.x, 2.0) > 0.5 || mod(cell.y, 2.0) > 0.5)) return true;
@@ -903,8 +903,10 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
 // Hairs shade one another: dark at the roots, full at the tips.
 float wbm_shell_shade(vec2 uv)
 {
-    if (wbm_shell.y > 0.0) return (wbm_shell.z < 0.0 ? 0.72 : 0.6) + (wbm_shell.z < 0.0 ? 0.28 : 0.4) * wbm_shell.y; // long hair: the sun's part is in wbm_fur_lit
-    return wbm_shell.w > 0.5 && wbm_grows(uv).x >= 0.5 ? 0.6 : 1.0;
+    // The coat's roots are only a little darker than its tips: more, and the
+    // gaps between hairs a pixel wide show as dark specks all over the horse.
+    if (wbm_shell.y > 0.0) return (wbm_shell.z < 0.0 ? 0.72 : 0.82) + (wbm_shell.z < 0.0 ? 0.28 : 0.18) * wbm_shell.y; // long hair: the sun's part is in wbm_fur_lit
+    return wbm_shell.w > 0.5 && wbm_grows(uv).x >= 0.5 ? 0.82 : 1.0;
 }
 
 // What long hair reflects of the sky: a broad sheen where the strands lie
