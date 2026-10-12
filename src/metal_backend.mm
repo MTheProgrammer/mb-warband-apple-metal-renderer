@@ -424,6 +424,14 @@ float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its te
 // (see build_strands). WBM_TAIL_LENGTH and WBM_MANE_LENGTH: how long the
 // longest are, metres. WBM_HAIR_STRANDS_DENSITY: strands to the square metre.
 bool s_hair_strands;
+// WBM_PEOPLE_HAIR: people's hair and beards as strands over the hair mesh, for
+// characters within WBM_PEOPLE_HAIR_RANGE metres, at most WBM_PEOPLE_HAIR_MOST
+// meshes a frame; WBM_PEOPLE_HAIR_LENGTH: the longest strand, metres;
+// WBM_PEOPLE_HAIR_DENSITY: strands to the square metre of mesh.
+bool s_people_hair;
+float s_people_hair_range = 5.0f, s_people_hair_length = 0.06f, s_people_hair_density = 60000.0f;
+int s_people_hair_most = 12, s_people_hair_drawn;
+uint64_t s_people_hair_frame;
 float s_tail_length = 0.8f, s_mane_length = 0.18f, s_strand_density = 30000.0f;
 float s_hair_length = 0.07f; // WBM_HAIR_LENGTH: how far mane and tail stand off the body, metres; 0 for no layers of their own
 float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 1400.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per metre
@@ -2681,20 +2689,23 @@ GLuint s_strand_names = 0x7f000000; // buffer names of the shim's own, out of th
 
 // vertices, elements: the mesh as the game gave it. Attributes 0 (position),
 // 2 (colour), 4 (texture coordinate), 7 and 8 (bone weights and numbers) must share the buffer.
+// Without a map it is a person's hair (see add_hair_strands): a rigid mesh,
+// all of it hair, with roots everywhere; the texture's clear parts are left to the shader.
 const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t vertex_bytes, const uint8_t *elements, size_t count, size_t width, id<MTLTexture> map)
 {
+    const bool person = map == nil;
     StrandMesh &mesh = s_strand_meshes[key];
     if (mesh.buffer) return mesh;
     mesh.buffer = s_strand_names++;
     const Attrib &pa = s_attribs[0], &ca = s_attribs[2], &ta = s_attribs[4], &wa = s_attribs[7], &ba = s_attribs[8];
     size_t stride = (size_t)pa.stride;
     bool fits = stride > 0 && pa.type == GL_FLOAT && ta.type == GL_FLOAT && ca.type == GL_UNSIGNED_BYTE && ca.size == 4 && ta.buffer == pa.buffer && ca.buffer == pa.buffer &&
-                wa.buffer == pa.buffer && ba.buffer == pa.buffer && wa.enabled && ba.enabled && (size_t)ta.stride == stride && (size_t)ca.stride == stride &&
-                map.pixelFormat == MTLPixelFormatRGBA8Unorm;
+                (person || (wa.buffer == pa.buffer && ba.buffer == pa.buffer && wa.enabled && ba.enabled)) && (size_t)ta.stride == stride && (size_t)ca.stride == stride &&
+                (person || map.pixelFormat == MTLPixelFormatRGBA8Unorm);
     if (!fits) return mesh;
-    size_t n = vertex_bytes / stride, mw = map.width, mh = map.height;
-    std::vector<uint8_t> px(mw * mh * 4);
-    [map getBytes:px.data() bytesPerRow:mw * 4 fromRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:0];
+    size_t n = vertex_bytes / stride, mw = person ? 1 : map.width, mh = person ? 1 : map.height;
+    std::vector<uint8_t> px(mw * mh * 4, 255); // a person's: long hair everywhere
+    if (!person) [map getBytes:px.data() bytesPerRow:mw * 4 fromRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:0];
     auto at = [&](float u, float v) {
         size_t x = std::min(mw - 1, (size_t)((u - floorf(u)) * (float)mw)), y = std::min(mh - 1, (size_t)((v - floorf(v)) * (float)mh));
         return &px[(y * mw + x) * 4];
@@ -2711,12 +2722,13 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
     };
     std::vector<uint8_t> out;
     std::vector<uint32_t> indices;
-    const size_t most = 12000; // strands to a mesh
+    const size_t most = person ? 6000 : 12000; // strands to a mesh
     size_t strands = 0;
-    float density = s_strand_density;
+    float density = person ? s_people_hair_density : s_strand_density;
     // The bone a vertex hangs on most. The tail is what hangs on the last two bones of a horse's skeleton.
     auto bone_of = [&](const uint8_t *from) {
         int bone = 0;
+        if (person) return bone;
         float heaviest = -1;
         for (int k = 0; k < std::min<int>(wa.size, 4); k++) {
             float weight = component(from + wa.offset, wa.type, k);
@@ -2742,9 +2754,24 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
         if (!any) continue;
         float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]}, e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
         float cx = e1[1] * e2[2] - e1[2] * e2[1], cy = e1[2] * e2[0] - e1[0] * e2[2], cz = e1[0] * e2[1] - e1[1] * e2[0];
+        // A person's hair runs the way its texture is painted: down the picture, which is towards v = 0.
+        // (The band along the picture's top is a braid and a ribbon, lying sideways: nothing is rooted there.)
+        float flow[3] = {0, 0, 0}, reach = 1; // reach: how long strands are here, as a share of the longest
+        if (person) {
+            float du1 = t[1][0] - t[0][0], dv1 = t[1][1] - t[0][1], du2 = t[2][0] - t[0][0], dv2 = t[2][1] - t[0][1], det = du1 * dv2 - du2 * dv1;
+            if (fabsf(det) < 1e-9f) continue;
+            if (std::max({t[0][1], t[1][1], t[2][1]}) > 0.93f) continue;
+            for (int k = 0; k < 3; k++) flow[k] = -(e2[k] * du1 - e1[k] * du2) / det;
+            float len = sqrtf(flow[0] * flow[0] + flow[1] * flow[1] + flow[2] * flow[2]);
+            if (len < 1e-9f) continue;
+            for (float &f : flow) f /= len;
+            // len is how many metres the whole texture's length of hair is drawn over here: little for a
+            // beard or a cropped head, whose painted hairs are short, and loose strands are short with them.
+            reach = std::min(1.0f, std::max(0.12f, len * 0.12f / s_people_hair_length));
+        }
         bool tail_here = bone_of(vertices + v[0] * stride) >= 26;
-        if (!tail_here && std::min({fabsf(p[0][0]), fabsf(p[1][0]), fabsf(p[2][0])}) > crest) continue;
-        float area = 0.5f * sqrtf(cx * cx + cy * cy + cz * cz) * (tail_here ? 1.0f : closer);
+        if (!person && !tail_here && std::min({fabsf(p[0][0]), fabsf(p[1][0]), fabsf(p[2][0])}) > crest) continue;
+        float area = 0.5f * sqrtf(cx * cx + cy * cy + cz * cz) * (tail_here || person ? 1.0f : closer);
         float wanted = area * density;
         covered += area;
         if (pass == 0) {
@@ -2767,7 +2794,7 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
             const uint8_t *from = vertices + v[nearest] * stride;
             int bone = bone_of(from);
             bool tail = bone >= 26;
-            if (!tail && fabsf(root[0]) > crest) continue;
+            if (!person && !tail && fabsf(root[0]) > crest) continue;
             bool to_plus = fabsf(root[0]) > 0.004f ? root[0] > 0 : luck2 > 0.5f; // the side the mane falls to
             int far = tail && tail_top > tail_bottom ? std::min(7, std::max(0, (int)lroundf(7.0f * (tail_top - root[2]) / (tail_top - tail_bottom)))) : !tail && bone == 7 ? 7 : 0; // bone 7 is the head: the forelock
             uint32_t first = (uint32_t)(out.size() / stride);
@@ -2793,6 +2820,11 @@ const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t ve
                     }
                     uint8_t *colour = &out[o + ca.offset];
                     colour[0] = (uint8_t)(segment * 2 + side + far * 32), colour[1] = (uint8_t)((int)(luck * 63.0f) + (!tail && to_plus ? 64 : 0) + (tail ? 128 : 0)), colour[2] = here[0], colour[3] = here[1];
+                    if (person) {
+                        colour[0] = (uint8_t)(segment * 2 + side), colour[1] = (uint8_t)(luck * 255.0f), colour[2] = (uint8_t)(reach * 255.0f);
+                        const Attrib &fa = s_attribs[6]; // the binormal, which this shader takes for the hair's run
+                        if (fa.enabled && fa.buffer == pa.buffer && fa.type == GL_FLOAT && fa.size >= 3) memcpy(&out[o + fa.offset], flow, 12);
+                    }
                 }
                 if (segment < k_strand_segments) {
                     uint32_t q = first + (uint32_t)segment * 2;
@@ -3697,6 +3729,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_SHELLS")) s_fur_shells = std::min(24, std::max(0, atoi(v)));
     if (const char *v = getenv("WBM_HAIR_LENGTH")) s_hair_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_HAIR_STRANDS")) s_hair_strands = atoi(v) != 0;
+    if (const char *v = getenv("WBM_PEOPLE_HAIR")) s_people_hair = atoi(v) != 0;
+    if (const char *v = getenv("WBM_PEOPLE_HAIR_RANGE")) s_people_hair_range = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_PEOPLE_HAIR_LENGTH")) s_people_hair_length = std::max(0.001f, (float)atof(v));
+    if (const char *v = getenv("WBM_PEOPLE_HAIR_DENSITY")) s_people_hair_density = std::max(100.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_PEOPLE_HAIR_MOST")) s_people_hair_most = std::max(0, atoi(v));
     if (const char *v = getenv("WBM_TAIL_LENGTH")) s_tail_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_MANE_LENGTH")) s_mane_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_HAIR_STRANDS_DENSITY")) s_strand_density = std::max(100.0f, (float)atof(v));
@@ -3704,6 +3741,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_RANGE")) s_fur_range = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
+    s_shader_options.hair_strands = s_people_hair;
     if (const char *v = getenv("WBM_EYES_MOVE")) s_gaze_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FOLIAGE")) s_foliage_backlight = std::max(0.0f, (float)atof(v));
@@ -4671,6 +4709,42 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             s_shell_draws++;
         }
         s_depth_mask = depth_mask; // mane and tail do leave depth: their layers hang far from the body and must hide one another
+        // People's hair as strands over the hair mesh, near the camera (see add_hair_strands).
+        if (s_people_hair && s_pass_scene && primitive == MTLPrimitiveTypeTriangle) {
+            Program *hp = find(s_programs, s_program);
+            Buffer *vb = s_attribs[0].enabled ? find(s_buffers, s_attribs[0].buffer) : nullptr;
+            const uint32_t needed = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 4 | 1u << 6;
+            // The hair shader is the one that takes wbm_shell in both stages without being a coat's or having bones.
+            bool hair = hp && hp->shell_offset[0] >= 0 && hp->shell_offset[1] >= 0 && hp->fur_offset < 0 && !hp->u_bones && hp->u_wvp && (hp->input_mask & needed) == needed;
+            float distance = 0;
+            if (hair) memcpy(&distance, hp->uniform_data[0].data() + hp->u_wvp->offset + 60, 4);
+            if (s_people_hair_frame != s_frame_serial) s_people_hair_frame = s_frame_serial, s_people_hair_drawn = 0;
+            if (hair && vb && vb->mtl && distance > 0 && distance < s_people_hair_range && s_people_hair_drawn < s_people_hair_most) {
+                const StrandMesh &strands = build_strands(mesh_id((NSUInteger)count, offset) ^ 0x5bd1e995a4c7f3d1ull, (const uint8_t *)vb->mtl.contents, vb->mtl.length,
+                                                          (const uint8_t *)b->mtl.contents + offset, (size_t)count, type == GL_UNSIGNED_SHORT ? 2 : 4, nil);
+                if (strands.count) {
+                    Attrib attribs[MAX_ATTRIBS];
+                    memcpy(attribs, s_attribs, sizeof attribs);
+                    bool cull = s_cull, was_blend = s_blend, depth_mask = s_depth_mask;
+                    GLenum src = s_blend_src, dst = s_blend_dst, eq = s_blend_eq;
+                    for (Attrib &a : s_attribs)
+                        if (a.enabled && a.buffer == attribs[0].buffer) a.buffer = strands.buffer;
+                    s_cull = false;
+                    for (int soft = 0; soft < 2; soft++) { // what is solid first, leaving depth; then the soft edges, blended, leaving none
+                        s_blend = soft != 0, s_depth_mask = soft == 0;
+                        if (soft) s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD;
+                        const float now[4] = {-s_people_hair_length, 0, soft ? 1.0f : -1.0f, clock};
+                        memcpy(s_shell_now, now, sizeof now);
+                        if (prepare_draw())
+                            [s_pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:strands.count indexType:MTLIndexTypeUInt32 indexBuffer:strands.indices indexBufferOffset:0];
+                        s_shell_draws++;
+                    }
+                    memcpy(s_attribs, attribs, sizeof attribs);
+                    s_cull = cull, s_blend = was_blend, s_depth_mask = depth_mask, s_blend_src = src, s_blend_dst = dst, s_blend_eq = eq;
+                    s_people_hair_drawn++;
+                }
+            }
+        }
         // Mane and tail as strands (see build_strands): one more draw of the same program, over ribbons.
         if (long_hair && s_hair_strands && primitive == MTLPrimitiveTypeTriangle) {
             Program *fp = find(s_programs, s_program);

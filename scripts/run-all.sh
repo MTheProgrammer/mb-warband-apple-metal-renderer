@@ -23,6 +23,7 @@ export WBM_FOLIAGE=${WBM_FOLIAGE:-0.6}          # sunlight through leaves seen f
 export WBM_FUR=${WBM_FUR:-1}                    # a soft, velvety coat on horses (needs coat maps: build/texture_tool pbr)
 export WBM_FUR_SHELLS=${WBM_FUR_SHELLS:-12}     # layers of fur on horses within a few metres, and long hair where a hair map says (0: none)
 export WBM_HAIR_STRANDS=${WBM_HAIR_STRANDS:-1} # mane and tail as strands in place of layers (0: layers)
+export WBM_PEOPLE_HAIR=${WBM_PEOPLE_HAIR:-1}   # loose strands over the hair and beards of people within a few metres
 export WBM_EYES=${WBM_EYES:-1}                  # a highlight and a reflection in the eyes of faces
 export WBM_SSS=${WBM_SSS:-1}                    # light scattering in the skin of faces
 export WBM_TONEMAP=${WBM_TONEMAP:-1}  # filmic tone map

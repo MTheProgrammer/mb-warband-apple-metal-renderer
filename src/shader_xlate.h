@@ -97,6 +97,10 @@ struct XlOptions {
     // highlight are toned down. Adds the wbm_fur_map sampler and wbm_fur
     // uniform (x: strength, 0 without a map).
     bool fur = false;
+    // People's hair as strands: the engine's hair shader learns to lay out
+    // ribbons the backend draws over the hair mesh of characters near the
+    // camera (see add_hair_strands). Adds the wbm_shell uniform to both stages.
+    bool hair_strands = false;
     // Eyes that catch the light: faces have their eyes painted on, at the same
     // place in every face texture, since all heads share one layout. There the
     // engine's skin shader gets a small sharp highlight from the sun and a

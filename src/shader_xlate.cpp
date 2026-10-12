@@ -719,6 +719,65 @@ bool add_shell_push(std::string &vs)
     return true;
 }
 
+// People's hair as strands. The engine's hair shader draws a rigid mesh whose
+// binormal is the way the hair runs. For characters near the camera the backend
+// draws ribbons over it (build_strands), all of whose vertices sit at a root on
+// that mesh; here each is laid out along the hair's run, lifted a little off
+// the mesh and drooping a little, and widened across the line of sight.
+//   colour x: segment * 2 + side; y: a chance number (0 to 255); z: how long
+//   strands are at this root, as a share of the longest.
+// wbm_shell.x: -(the longest strand's length), metres.
+bool add_hair_strands(std::string &glsl, bool vertex)
+{
+    if (glsl.find("varying vec3 tangent;") == std::string::npos || glsl.find("varying vec3 viewVec;") == std::string::npos) return false;
+    size_t body = glsl.find("void main ()");
+    if (body != std::string::npos) body = glsl.find('{', body);
+    if (body == std::string::npos) return false;
+    if (!vertex) {
+        static const std::regex result(R"(gl_FragColor = (\w+);)");
+        if (glsl.find("0.800118") == std::string::npos || !std::regex_search(glsl, result)) return false;
+        // A strand has the texture's colour where it is rooted, in a tone of its
+        // own; where the texture is clear there is no hair to root one in.
+        glsl = std::regex_replace(glsl, result,
+                                  "if (wbm_shell.x < 0.0) {\n    wbm_strand_soft = step(0.0, wbm_shell.z);\n    $1.w = wbm_strand_pass(wbm_strand_edge(false) * smoothstep(0.3, 0.6, $1.w));\n"
+                                  "    if ($1.w < 0.02) discard;\n    $1.xyz *= 0.75 + 0.45 * fract(wbm_strand.z * 9.7);\n  }\n  $&");
+        glsl.insert(body + 1, "\n  wbm_strand = wbm_strand_v;");
+        glsl.insert(0, "varying vec4 wbm_strand_v;\n");
+        return true;
+    }
+    static const std::regex placed(R"((\w+)\.xyz = inPosition;)");
+    const char *needed[] = {"attribute vec3 inBinormal;", "attribute vec4 inColor0;", "attribute vec3 inNormal;", "uniform mat4 matWorld;", "uniform vec4 vCameraPos;"};
+    for (const char *n : needed)
+        if (glsl.find(n) == std::string::npos) return false;
+    if (glsl.find("matWorldArray") != std::string::npos || !std::regex_search(glsl, placed)) return false;
+    glsl = std::regex_replace(glsl, std::regex(R"(\binColor0\b(?!;))"), "wbm_colour");
+    if (glsl.find("Tex0 = inTexCoord;") == std::string::npos) return false;
+    glsl = std::regex_replace(glsl, std::regex(R"(Tex0 = inTexCoord;)"), "Tex0 = wbm_uv;");
+    body = glsl.find('{', glsl.find("void main ()"));
+    glsl.insert(body + 1, "\n  wbm_colour = wbm_shell.x < 0.0 ? vec4(1.0) : inColor0;\n  wbm_uv = inTexCoord;\n  wbm_strand_v = vec4(0.0);");
+    glsl = std::regex_replace(glsl, placed,
+                              "$&\n  if (wbm_shell.x < 0.0) {\n"
+                              "    float wbm_v = floor(inColor0.x * 255.0 + 0.5), wbm_chance = inColor0.y;\n"
+                              "    float wbm_side = mod(wbm_v, 2.0) * 2.0 - 1.0, wbm_t = floor(wbm_v / 2.0) / 8.0;\n"
+                              "    vec3 wbm_n = normalize(inNormal), wbm_down = normalize(vec3(0.0, 0.0, -1.0) * mat3(matWorld));\n"
+                              "    vec3 wbm_c = dot(inBinormal, inBinormal) > 0.0004 ? normalize(inBinormal) : wbm_down;\n"
+                              "    vec3 wbm_out = normalize(wbm_c + wbm_n * (fract(wbm_chance * 3.1) > 0.95 ? 0.45 : 0.02 + 0.14 * fract(wbm_chance * 3.1)));\n"
+                              "    float wbm_len = -wbm_shell.x * inColor0.z * (0.4 + 0.6 * wbm_chance), wbm_k = 0.4;\n"
+                              "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
+                              "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
+                              "    vec3 wbm_eye = (vCameraPos.xyz - matWorld[3].xyz) * mat3(matWorld) - $1.xyz;\n"
+                              "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
+                              "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
+                              "    float wbm_w = 0.0004 * (0.6 + 0.8 * fract(wbm_chance * 7.3)) * (1.0 - 0.5 * wbm_t);\n" // half the width of a lock, metres
+                              "    float wbm_used = max(wbm_w, 0.0012 * length(wbm_eye));\n"
+                              "    $1.xyz += wbm_across * (wbm_side * wbm_used);\n"
+                              "    wbm_strand_v = vec4(wbm_side, wbm_t, wbm_chance, wbm_w / wbm_used);\n"
+                              "  }",
+                              std::regex_constants::format_first_only);
+    glsl.insert(0, "varying vec4 wbm_strand_v;\n");
+    return true;
+}
+
 // Shaders that light per vertex get the wrap alone, from the vertex normal.
 const char k_skin_vertex_function[] = R"(
 uniform vec4 wbm_skin;
@@ -743,6 +802,43 @@ bool add_skin_scattering_vertex(std::string &vs)
     return true;
 }
 
+// Strands: hair drawn as ribbons that the vertex shader lays out (see
+// add_shell_push and add_hair_strands). wbm_strand says where on its ribbon a
+// pixel is: x -1 to 1 across, y 0 at the root to 1 at the tip, z a chance
+// number of the strand's own, w how much of the ribbon's drawn width is hair.
+const char k_strand_function[] = R"(
+vec4 wbm_strand = vec4(0.0);
+// Strands are drawn twice: first what is solid, which leaves depth; then the
+// soft edges and thin tips, blended, which leave none and so hide nothing behind them.
+float wbm_strand_soft = 0.0; // 1 in the second
+
+// How much of the pixel the strand covers: its edges are soft, and it thins out to nothing at the tip.
+// How much of the pixel the ribbon covers, 0 to 1. fibres: whether it is a lock of separate hairs with gaps between.
+float wbm_strand_edge(bool fibres)
+{
+    float pixel = max(fwidth(wbm_strand.x), 1e-4);
+    // A ribbon is a lock: some hairs side by side with gaps between, more gaps towards the tip.
+    float hairs = wbm_strand.x * 2.0 + wbm_strand.z * 31.0;
+    float gap = abs(fract(hairs) - 0.5) * 2.0; // 0 on a hair, 1 between two
+    float thin = mix(0.25, 0.9, wbm_strand.y) * (0.6 + 0.4 * fract(sin(floor(hairs) * 12.9898 + wbm_strand.z * 78.233) * 43758.5453));
+    float lock = mix(1.0, 1.0 - thin * smoothstep(0.35, 0.9, gap), clamp(0.6 / (pixel * 2.0), 0.0, 1.0)); // too fine to see, they even out
+    float cover = clamp((1.0 - abs(wbm_strand.x)) / pixel + 0.5, 0.0, 1.0) * wbm_strand.w * smoothstep(1.0, 0.8, wbm_strand.y) * (fibres ? lock : 1.0);
+    return cover;
+}
+
+// The same, as each of the two draws wants it: all or nothing in the first, the rest in the second.
+float wbm_strand_pass(float cover)
+{
+    if (wbm_strand_soft > 0.5) return cover < 0.7 ? cover : 0.0;
+    return cover < 0.7 ? 0.0 : 1.0;
+}
+
+float wbm_strand_cover()
+{
+    return wbm_strand_pass(wbm_strand_edge(true));
+}
+)";
+
 // Fur. See XlOptions::fur.
 const char k_fur_function[] = R"(
 uniform sampler2D wbm_fur_map;  // blue: how much of the surface is coat (a texture's _pbr map)
@@ -760,10 +856,6 @@ uniform vec4 wbm_shell;
 // where on it this is: x -1 to 1 across, y 0 at the root to 1 at the tip, z a
 // chance number of its own, w how much of its drawn width is really hair. It
 // stands for a layer of long hair as far along as it has got.
-vec4 wbm_strand = vec4(0.0);
-// Strands are drawn twice: first what is solid, which leaves depth; then the
-// soft edges and thin tips, blended, which leave none and so hide nothing behind them.
-float wbm_strand_soft = 0.0; // 1 in the second
 vec4 wbm_shell_given() { return wbm_shell; }
 vec4 wbm_layer;
 #define wbm_shell wbm_layer
@@ -904,17 +996,7 @@ vec2 wbm_shell_root(vec2 uv, vec3 down)
 // cover part of it and are blended in; cut out whole or not at all they dither.
 float wbm_shell_cover(vec2 uv, vec3 down)
 {
-    if (wbm_shell.x < 0.0) { // a strand: its edges are soft, and it thins out to nothing at the tip
-        float pixel = max(fwidth(wbm_strand.x), 1e-4);
-        // A ribbon is a lock: some hairs side by side with gaps between, more gaps towards the tip.
-        float hairs = wbm_strand.x * 2.0 + wbm_strand.z * 31.0;
-        float gap = abs(fract(hairs) - 0.5) * 2.0; // 0 on a hair, 1 between two
-        float thin = mix(0.25, 0.9, wbm_strand.y) * (0.6 + 0.4 * fract(sin(floor(hairs) * 12.9898 + wbm_strand.z * 78.233) * 43758.5453));
-        float lock = mix(1.0, 1.0 - thin * smoothstep(0.35, 0.9, gap), clamp(0.6 / (pixel * 2.0), 0.0, 1.0)); // too fine to see, they even out
-        float cover = clamp((1.0 - abs(wbm_strand.x)) / pixel + 0.5, 0.0, 1.0) * wbm_strand.w * smoothstep(1.0, 0.8, wbm_strand.y) * lock;
-        if (wbm_strand_soft > 0.5) return cover < 0.7 ? cover : 0.0;
-        return cover < 0.7 ? 0.0 : 1.0;
-    }
+    if (wbm_shell.x < 0.0) return wbm_strand_cover();
     if (wbm_shell.y <= 0.0) return 1.0;
     bool long_ = wbm_shell.z < 0.0;
     float share = wbm_shell.y, density = abs(wbm_shell.z) / max(abs(wbm_fur.w), 0.02) * (long_ ? 0.17 : 1.0); // long hair is coarser than the coat
@@ -1457,6 +1539,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
     bool wind = vertex && options.wind && add_wind(glsl);
     bool shell_push = vertex && options.fur && add_shell_push(glsl);
+    bool hair_strands = options.hair_strands && add_hair_strands(glsl, vertex);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
@@ -1476,7 +1559,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_environment) out << k_pbr_environment_function;
     if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
     if (eyes) out << k_eye_function;
+    if (!vertex && (fur || hair_strands)) out << k_strand_function;
     if (fur) out << k_fur_function;
+    if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\n" : "");
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
     if (shell_push) out << "uniform vec4 wbm_shell;\n";
