@@ -40,6 +40,8 @@ struct Texture {
     MTLPixelFormat format = MTLPixelFormatInvalid;
     int top_level = -1; // highest mip level that has content
     int scale = 1;      // storage is this many times the size the game asked for (see s_scale)
+    bool screen_sized = false; // a render target the size of the screen: scaled, and multisampled if that is on
+    id<MTLTexture> ms;         // multisampled companion that is rendered into; `mtl` receives the resolve
     // sampler parameters, with OpenGL's defaults
     GLenum min_filter = GL_NEAREST_MIPMAP_LINEAR, mag_filter = GL_LINEAR, wrap_s = GL_REPEAT, wrap_t = GL_REPEAT;
     float anisotropy = 1;
@@ -48,7 +50,7 @@ struct Texture {
 };
 
 struct Renderbuffer {
-    id<MTLTexture> mtl;
+    id<MTLTexture> mtl; // multisampled itself when it belongs to a multisampled target
     int scale = 1;
 };
 
@@ -70,7 +72,8 @@ struct PipelineKey {
     uint16_t color_format, depth_format;
     uint16_t blend_src, blend_dst, blend_eq;
     uint8_t blend;
-    uint8_t pad[3];
+    uint8_t samples;
+    uint8_t pad[2];
     bool operator==(const PipelineKey &o) const { return !memcmp(this, &o, sizeof *this); }
 };
 struct PipelineKeyHash {
@@ -103,7 +106,8 @@ struct Program {
     std::vector<uint8_t> uniform_data[2];
     std::vector<UniformLocation> locations;
     std::unordered_map<std::string, GLint> location_by_name;
-    int yflip_offset = -1;
+    int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
+    int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     uint32_t input_mask = 0; // attribute locations the vertex shader reads
     std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines;
 };
@@ -130,7 +134,14 @@ id<MTLCommandBuffer> s_cmd;
 id<MTLRenderCommandEncoder> s_pass;
 id<MTLTexture> s_pass_color, s_pass_depth; // attachments of the open pass
 bool s_pass_screen;
-int s_pass_scale = 1;
+int s_pass_scale = 1, s_pass_samples = 1;
+
+// Multisampling (WBM_MSAA). Screen-sized render targets, and the screen, are
+// rendered into multisampled textures that are resolved when each pass ends.
+// Being multisampled is a property of the target, not of the pass, so a
+// target's contents always live in the same place.
+int s_msaa = 1;
+id<MTLTexture> s_screen_ms;
 
 // The game renders at the window's size in points. On a Retina display that is
 // half the panel's resolution, so the screen and every screen-sized render
@@ -138,9 +149,14 @@ int s_pass_scale = 1;
 int s_scale = 1;
 int s_screen_w, s_screen_h; // the size the game believes the screen has
 
+bool is_screen_sized(int w, int h)
+{
+    return w == s_screen_w && h == s_screen_h;
+}
+
 int scale_for(int w, int h)
 {
-    return (w == s_screen_w && h == s_screen_h) ? s_scale : 1;
+    return is_screen_sized(w, h) ? s_scale : 1;
 }
 
 // Uniform data is copied into chunks that live until the GPU has used them.
@@ -228,21 +244,28 @@ void end_pass()
     s_pass_color = s_pass_depth = nil;
 }
 
-id<MTLTexture> new_depth_texture(NSUInteger width, NSUInteger height)
+id<MTLTexture> new_render_texture(MTLPixelFormat format, NSUInteger width, NSUInteger height, int samples)
 {
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                 width:width
-                                                                                height:height
-                                                                             mipmapped:NO];
-    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget;
     d.storageMode = MTLStorageModePrivate;
+    if (samples > 1) {
+        d.textureType = MTLTextureType2DMultisample;
+        d.sampleCount = (NSUInteger)samples;
+    }
     return [s_device newTextureWithDescriptor:d];
 }
 
+id<MTLTexture> new_depth_texture(NSUInteger width, NSUInteger height, int samples)
+{
+    return new_render_texture(MTLPixelFormatDepth32Float, width, height, samples);
+}
+
 struct Target {
-    id<MTLTexture> color, depth;
+    id<MTLTexture> color, depth; // color is what later passes sample; with multisampling it receives the resolve
+    id<MTLTexture> ms_color;     // what is rendered into when multisampled
     bool screen = false;
-    int scale = 1;
+    int scale = 1, samples = 1;
 };
 
 // The attachments the bound framebuffer currently describes. Returns false
@@ -256,22 +279,40 @@ bool resolve_target(Target &t)
             if (!s_drawable) return false;
         }
         t.color = s_drawable.texture;
-        if (!s_screen_depth || s_screen_depth.width != t.color.width || s_screen_depth.height != t.color.height)
-            s_screen_depth = new_depth_texture(t.color.width, t.color.height);
+        if (!s_screen_depth || s_screen_depth.width != t.color.width || s_screen_depth.height != t.color.height) {
+            s_screen_depth = new_depth_texture(t.color.width, t.color.height, s_msaa);
+            s_screen_ms = s_msaa > 1 ? new_render_texture(t.color.pixelFormat, t.color.width, t.color.height, s_msaa) : nil;
+        }
         t.depth = s_screen_depth;
+        t.ms_color = s_screen_ms;
+        t.samples = s_msaa;
         t.screen = true;
         t.scale = s_scale;
         return true;
     }
     Framebuffer *fb = find(s_framebuffers, s_fbo);
     if (!fb) return false;
-    if (Texture *tex = find(s_textures, fb->color_texture)) t.color = tex->mtl, t.scale = tex->scale;
+    if (Texture *tex = find(s_textures, fb->color_texture)) {
+        t.color = tex->mtl;
+        t.scale = tex->scale;
+        if (tex->mtl && tex->screen_sized && s_msaa > 1) {
+            if (!tex->ms) tex->ms = new_render_texture(tex->mtl.pixelFormat, tex->mtl.width, tex->mtl.height, s_msaa);
+            t.ms_color = tex->ms;
+            t.samples = s_msaa;
+        }
+    }
     if (Renderbuffer *rb = find(s_renderbuffers, fb->depth_renderbuffer)) {
         t.depth = rb->mtl;
         if (!t.color) t.scale = rb->scale;
     } else if (Texture *tex = find(s_textures, fb->depth_texture)) {
         t.depth = tex->mtl;
         if (!t.color) t.scale = tex->scale;
+    }
+    if (!t.color && t.depth) t.samples = (int)t.depth.sampleCount;
+    if (t.color && t.depth && (int)t.depth.sampleCount != t.samples) {
+        complain("framebuffer mixes a %d-sample colour target with a %d-sample depth buffer; depth is ignored", t.samples,
+                 (int)t.depth.sampleCount);
+        t.depth = nil;
     }
     return t.color || t.depth;
 }
@@ -284,9 +325,15 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (t.color) {
         bool clear = clear_mask & GL_COLOR_BUFFER_BIT;
-        d.colorAttachments[0].texture = t.color;
         d.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
-        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (t.ms_color) { // keep the samples for later passes on this target, and resolve for anything that reads it
+            d.colorAttachments[0].texture = t.ms_color;
+            d.colorAttachments[0].resolveTexture = t.color;
+            d.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        } else {
+            d.colorAttachments[0].texture = t.color;
+            d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
         d.colorAttachments[0].clearColor = s_debug_clear && t.screen ? MTLClearColorMake(0.10, 0.30, 0.60, 1.0) : s_clear_color;
     }
     if (t.depth) {
@@ -301,6 +348,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_depth = t.depth;
     s_pass_screen = t.screen;
     s_pass_scale = t.scale;
+    s_pass_samples = t.samples;
 }
 
 bool ensure_pass()
@@ -437,6 +485,7 @@ bool ensure_storage(Texture &t, const FormatInfo &f, int level, int w, int h)
     t.format = f.format;
     t.top_level = -1;
     t.sampler = nil;
+    t.ms = nil;
     return t.mtl != nil;
 }
 
@@ -492,6 +541,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
+    p.yflip_offset = p.samples_offset = -1;
     std::string vs, fs;
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
     bool from_cache = false;
@@ -540,6 +590,7 @@ void link_program(GLuint program_id, Program &p)
         };
         for (const XlUniform &u : stages[s]->uniforms) {
             if (u.name == k_xl_yflip_uniform) p.yflip_offset = u.offset;
+            else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -724,6 +775,7 @@ id<MTLRenderPipelineState> pipeline_for(Program &p, const PipelineKey &key)
         c.rgbBlendOperation = c.alphaBlendOperation = blend_operation(key.blend_eq);
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)key.depth_format;
+    d.rasterSampleCount = key.samples;
 
     NSError *error = nil;
     id<MTLRenderPipelineState> state = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
@@ -768,6 +820,7 @@ bool prepare_draw()
     if (!build_vertex_layout(*p, key, binding)) return false;
     key.color_format = (uint16_t)(s_pass_color ? s_pass_color.pixelFormat : MTLPixelFormatInvalid);
     key.depth_format = (uint16_t)(s_pass_depth ? s_pass_depth.pixelFormat : MTLPixelFormatInvalid);
+    key.samples = (uint8_t)s_pass_samples;
     if (s_blend) {
         key.blend = 1;
         key.blend_src = (uint16_t)s_blend_src;
@@ -790,6 +843,10 @@ bool prepare_draw()
     [s_pass setCullMode:!s_cull ? MTLCullModeNone : s_cull_face == GL_FRONT ? MTLCullModeFront : MTLCullModeBack];
     [s_pass setTriangleFillMode:s_polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
+    if (p->samples_offset >= 0) {
+        float samples = (float)s_pass_samples;
+        memcpy(p->uniform_data[1].data() + p->samples_offset, &samples, 4);
+    }
     if (p->yflip_offset >= 0) {
         float yflip = flip ? -1.0f : 1.0f;
         memcpy(p->uniform_data[0].data() + p->yflip_offset, &yflip, 4);
@@ -876,6 +933,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     const char *scale_env = getenv("WBM_SCALE");
     const char *shadows_env = getenv("WBM_SHADOWS"); // on unless set to 0
     s_shader_options.soft_shadows = !(shadows_env && atoi(shadows_env) == 0);
+    const char *msaa_env = getenv("WBM_MSAA");
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -886,6 +944,12 @@ void mtl_attach_window(void *nswindow, int width, int height)
     [s_white replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:white bytesPerRow:4];
     Texture defaults;
     sampler_for(defaults); // guarantees s_samplers is never empty
+    s_msaa = msaa_env ? atoi(msaa_env) : 1;
+    if (s_msaa < 1 || ![s_device supportsTextureSampleCount:(NSUInteger)s_msaa]) {
+        wb_note("  !! metal: WBM_MSAA=%s is not a sample count this GPU supports; multisampling is off", msaa_env);
+        s_msaa = 1;
+    }
+    s_shader_options.smooth_alpha_test = s_msaa > 1;
     const float constant[4] = {0, 0, 0, 1}; // OpenGL's value for a disabled attribute array
     s_constant_attrib = [s_device newBufferWithBytes:constant length:sizeof constant options:MTLResourceStorageModeShared];
     if (!s_device.supportsBCTextureCompression) wb_note("  !! metal: this GPU does not support DXT textures");
@@ -911,8 +975,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     };
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
-    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s", width, height, width * s_scale,
-            height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off");
+    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling", width, height,
+            width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa);
 }
 
 const char *mtl_device_name()
@@ -1130,6 +1194,7 @@ void mtl_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei 
         int k = (!pixels && level == 0) ? scale_for(width, height) : 1;
         if (!ensure_storage(*t, f, level, width * k, height * k)) return;
         t->scale = k;
+        if (level == 0) t->screen_sized = !pixels && is_screen_sized(width, height);
         if (!pixels) return;
         bool type_matches = type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT ||
                             (type == GL_FLOAT && (f.format == MTLPixelFormatR32Float || f.format == MTLPixelFormatRGBA32Float));
@@ -1267,7 +1332,8 @@ void mtl_glRenderbufferStorage(GLenum, GLenum internalformat, GLsizei width, GLs
     @autoreleasepool {
         Renderbuffer &rb = s_renderbuffers[s_rbo];
         rb.scale = scale_for(width, height);
-        rb.mtl = new_depth_texture((NSUInteger)(width * rb.scale), (NSUInteger)(height * rb.scale));
+        rb.mtl = new_depth_texture((NSUInteger)(width * rb.scale), (NSUInteger)(height * rb.scale),
+                                   is_screen_sized(width, height) ? s_msaa : 1);
     }
 }
 

@@ -13,6 +13,7 @@
 #include <sstream>
 
 const char *const k_xl_yflip_uniform = "wbm_yflip";
+const char *const k_xl_samples_uniform = "wbm_samples";
 
 namespace {
 
@@ -86,6 +87,49 @@ bool soften_shadows(std::string &fs)
     return true;
 }
 
+// The engine cuts shapes out of textures (leaves, hair, fur, fences) with an
+// alpha test: the pixel is dropped when alpha is below a threshold. That edge
+// is not smoothed by multisampling, because the shader runs once per pixel.
+//
+// This rewrites each test so that alpha near the threshold covers only some of
+// the pixel's samples: how far alpha is from the threshold, measured in pixels
+// (fwidth), becomes the covered fraction. With one sample per pixel the result
+// is exactly the original test. A threshold of zero means the engine has the
+// test switched off, and the pixel is then left fully covered.
+//
+// Only tests against a positive threshold are rewritten; "alpha < 0.0" tests
+// follow a subtraction the pattern does not see, and are left alone.
+bool smooth_alpha_tests(std::string &fs)
+{
+    static const std::regex tests[] = {
+        std::regex(R"(if \(\(\(([\w.]+) - (alpha_test_val|\d+\.\d+)\) < 0\.0\)\) \{\s*discard;\s*\})"),
+        std::regex(R"(if \(\(([\w.]+) < (\d+\.\d+)\)\) \{\s*discard;\s*\})"),
+    };
+    bool changed = false;
+    for (const std::regex &test : tests) {
+        std::string out;
+        auto begin = std::sregex_iterator(fs.begin(), fs.end(), test), end = std::sregex_iterator();
+        size_t pos = 0;
+        for (auto it = begin; it != end; ++it) {
+            std::string alpha = (*it)[1], threshold = (*it)[2];
+            out.append(fs, pos, (size_t)it->position() - pos);
+            pos = (size_t)(it->position() + it->length());
+            if (threshold != "alpha_test_val" && atof(threshold.c_str()) <= 0) {
+                out += it->str();
+                continue;
+            }
+            out += "{ float wbm_c = clamp((" + alpha + " - " + threshold + ") / max(fwidth(" + alpha +
+                   "), 0.00001) + 0.5, 0.0, 1.0); if (" + threshold + " > 0.0) { int wbm_n = int(wbm_c * " +
+                   k_xl_samples_uniform + " + 0.5); if (wbm_n <= 0) { discard; } wbm_cover &= (1 << wbm_n) - 1; } "
+                   "gl_SampleMask[0] = wbm_cover; }";
+            changed = true;
+        }
+        out.append(fs, pos, std::string::npos);
+        fs = out;
+    }
+    return changed;
+}
+
 // Rewrites the declarations and built-ins that changed between GLSL 1.20 and
 // 4.50. Attributes and varyings get explicit locations so that the two stages
 // and the vertex descriptor agree without relying on declaration order.
@@ -94,6 +138,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
 {
     std::string glsl = source;
     bool soft_shadows = !vertex && options.soft_shadows && soften_shadows(glsl);
+    bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
@@ -104,6 +149,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
     if (soft_shadows) out << k_soft_shadow_function;
+    if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
 
     std::istringstream in(glsl);
     std::string line;

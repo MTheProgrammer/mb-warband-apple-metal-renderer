@@ -44,11 +44,18 @@ struct XlProgram {
 struct XlOptions {
     // Replace the engine's 2x2-texel shadow filter with a 4x4-texel one.
     bool soft_shadows = false;
+    // Turn alpha tests (discard below a threshold) into partial coverage of a
+    // multisampled pixel, so cut-out edges are smoothed like geometry edges.
+    bool smooth_alpha_test = false;
 };
 
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space
 // Y: 1 when drawing to the screen, -1 when drawing to a texture.
 extern const char *const k_xl_yflip_uniform;
+
+// With smooth_alpha_test, fragment shaders that test alpha get a uniform,
+// wbm_samples, that must hold the sample count of the target being drawn to.
+extern const char *const k_xl_samples_uniform;
 
 // attrib_locations: names given to glBindAttribLocation and their indices.
 XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,

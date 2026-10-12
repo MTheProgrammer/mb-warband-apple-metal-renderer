@@ -16,7 +16,7 @@ namespace {
 
 // Bump when the translation changes (the rewriter, its options, or the
 // versions of glslang and SPIRV-Cross), so that stale entries are ignored.
-const char k_version[] = "wbx-2 glslang-15.1.0 spirv-cross-1.4.304.0";
+const char k_version[] = "wbx-3 glslang-15.1.0 spirv-cross-1.4.304.0";
 const uint32_t k_magic = 0x31584257; // "WBX1"
 
 uint64_t fnv(const std::string &s, uint64_t h)
@@ -160,6 +160,7 @@ XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_
     std::string key = std::string(k_version) + '\0' + vs_glsl + '\0' + fs_glsl + '\0';
     for (auto &a : attrib_locations) key += a.first + "=" + std::to_string(a.second) + ";";
     key += std::string("\0soft_shadows=", 14) + (options.soft_shadows ? "1" : "0");
+    key += std::string("\0smooth_alpha_test=", 19) + (options.smooth_alpha_test ? "1" : "0");
     char name[40];
     snprintf(name, sizeof name, "/%016llx%016llx.wbx", (unsigned long long)fnv(key, 0xcbf29ce484222325ull),
              (unsigned long long)fnv(key, 0x84222325cbf29ce4ull));
