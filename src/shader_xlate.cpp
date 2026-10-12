@@ -212,7 +212,9 @@ float wbm_dyn_thickness(vec3 coord)
     float sum = 0.0;
     for (int i = 0; i < 4; i++) {
         vec2 t = q.xy + vec2(i < 2 ? -0.7 : 0.7, (i & 1) == 0 ? -0.7 : 0.7) / size;
-        sum += max(q.z - textureLod(wbm_dyn_map, vec2((t.x + 1.0) * 0.5, t.y), 0.0).x, 0.0);
+        float nearest = textureLod(wbm_dyn_map, vec2((t.x + 1.0) * 0.5, t.y), 0.0).x;
+        if (nearest > 1.0e8) return -1.0; // nothing was drawn there: no telling
+        sum += max(q.z - nearest, 0.0);
     }
     return sum * 0.25;
 }

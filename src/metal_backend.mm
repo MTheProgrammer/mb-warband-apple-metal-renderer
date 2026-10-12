@@ -544,6 +544,7 @@ bool s_motion_blur;
 float s_motion_blur_strength = 1.0f; // WBM_MOTION_BLUR_STRENGTH: exposure time in units of 1/48 s
 void apply_motion_blur();
 // Anti-aliasing after the fact (WBM_FXAA=1): see apply_fxaa.
+bool s_replaying;  // a captured frame is being played back (frame_capture.inc)
 bool s_previewing; // the frame player is showing a model (model_preview.inc)
 bool s_preview_keeps_scene;
 bool s_fxaa;
@@ -3017,7 +3018,10 @@ bool prepare_draw()
     bind_buffer(0, s_constant_attrib, 0, CONSTANT_SLOT);
     s_last.draws++;
     s_draw_binding = binding;
-    if (s_dyn_shadows && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world)
+    // (Played back with the camera moved, the sky only turns while the scene also
+    // shifts, so the sky's matrices do not give the scene's camera; a draw that
+    // tests depth does. In the game the two agree and the sky comes first.)
+    if (s_dyn_shadows && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world && (!s_replaying || s_depth_test))
         render_dynamic_shadows(*p);
     if (s_pass_scene && (((s_ao || s_contact_shadows || s_light_shafts || s_foliage_backlight > 0) && s_camera.view_frame != s_frame_serial) ||
                          (s_motion_blur && s_camera.view_proj_frame != s_frame_serial)))
@@ -3546,6 +3550,7 @@ bool mtl_replay_open(const char *path, int *width, int *height)
     uint32_t kind;
     Rd r{};
     if (!read || !next_record(s_replay.file, &at, &kind, &r) || kind != CAP_HEADER || r.i() != CAP_VERSION) return false;
+    s_replaying = true;
     s_replay.width = *width = (int)r.i();
     s_replay.height = *height = (int)r.i();
     s_replay.state_at = at;

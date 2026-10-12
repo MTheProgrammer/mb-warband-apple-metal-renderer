@@ -368,6 +368,14 @@ void preview_draw(bool prepass)
                 s_bound_texture[24 + n] = own[n].texture;
                 mine = true;
             }
+            // On an empty stage the scenery's shadow map is left out: the trees and
+            // walls in it are not there, and at 7 cm a texel their shadows fall on a
+            // small model as large blocks.
+            if (!pv.keep_scene && l.name == "shadowmap_texture") {
+                l.unit = 30;
+                s_bound_texture[30] = 0; // nothing bound reads as white: nothing nearer the sun
+                continue;
+            }
             if (mine || !stand_in) continue;
             auto there = stand_in->location_by_name.find(l.name);
             if (there != stand_in->location_by_name.end()) l.unit = stand_in->locations[(size_t)there->second].unit;
