@@ -695,6 +695,8 @@ const char k_fur_function[] = R"(
 uniform sampler2D wbm_fur_map;  // blue: how much of the surface is coat (a texture's _pbr map)
 uniform sampler2D wbm_hair_map; // a texture's _hair map: red and green the way the hair is combed, in the picture; blue 1 long hair, about 0.5 coat, 0 none
 uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts; w: how much of the texture a metre of the surface covers, negated without a hair map
+uniform vec4 wbm_hair_colour; // the long hair's own colour; w 0 when it is not known
+vec3 wbm_hair_shine = vec3(0.0); // what long hair reflects and lets through, per unit of sunlight; added to the finished colour
 uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size there; w: strength, 0 for none
 // wbm_shell. x: how far out this layer is, metres (vertex stage); y: the same
 // as a share of the longest hair, 0 for the surface itself; z: hairs per unit
@@ -742,16 +744,35 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
         float towards = pow(clamp(dot(v, -normalize(l + vec3(0.0, 0.0, 0.35))), 0.0, 1.0), 2.0);
         back = towards * smoothstep(0.25, -0.15, l.z) * wbm_fur.z * exp(-(depth * wbm_fur.y + 0.004) * vec3(70.0, 190.0, 300.0));
     }
-    // Long hair shines in a band across the strands, where they lie at a right
-    // angle to the line halfway between the eye and the sun.
+    // Long hair, after Marschner: a strand sends light back three ways. Off
+    // its surface, white, in a narrow band shifted towards the root. From
+    // inside, having passed through the hair twice, in its colour, in a wider
+    // band shifted towards the tip and broken up from strand to strand. And
+    // straight through, when the sun is behind it, in its colour again. None
+    // of that depends on what is painted under the hair, so it is kept apart
+    // (wbm_hair_shine) and added to the finished colour.
     float strands = 0.0;
     vec3 combed = wbm_combed(uv);
     if (grows.y > 0.0 && dot(combed, combed) > 0.04) {
-        vec3 t = normalize(combed + normalize(normal) * 0.15);
-        float along = dot(t, normalize(v + l));
-        strands = grows.y * pow(sqrt(max(1.0 - along * along, 0.0)), 70.0) * 1.6 * clamp(facing * 0.6 + 0.4, 0.0, 1.0);
+        vec3 n = normalize(normal), t = normalize(combed);
+        vec3 h = normalize(v + l);
+        float jitter = fract(sin(dot(floor(uv * 900.0), vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+        vec3 t_surface = normalize(t - n * 0.10), t_inside = normalize(t + n * (0.16 + 0.10 * jitter));
+        float a = dot(t_surface, h), b = dot(t_inside, h);
+        float off_surface = pow(sqrt(max(1.0 - a * a, 0.0)), 220.0), from_inside = pow(sqrt(max(1.0 - b * b, 0.0)), 36.0);
+        vec3 hue = wbm_hair_colour.w > 0.0 ? wbm_hair_colour.xyz / max(max(wbm_hair_colour.x, max(wbm_hair_colour.y, wbm_hair_colour.z)), 0.02) : vec3(1.0, 0.85, 0.7);
+        hue = mix(vec3(1.0), hue, 0.75);
+        // Dark hair swallows what goes into it: little comes back from inside or passes through.
+        float fair = wbm_hair_colour.w > 0.0 ? smoothstep(0.08, 0.45, max(wbm_hair_colour.x, max(wbm_hair_colour.y, wbm_hair_colour.z))) : 0.5;
+        hue *= mix(0.2, 1.0, fair);
+        float lit_side = clamp(facing * 0.7 + 0.5, 0.0, 1.0);
+        float through = pow(clamp(dot(-v, l), 0.0, 1.0), 7.0) * (1.0 - abs(dot(t, l))) ;
+        wbm_hair_shine = grows.y * wbm_fur.x * (lit_side * (0.10 * off_surface + 0.16 * from_inside * hue) + 0.22 * through * hue);
+        // A strand is lit by how far it lies across the light, not by which way the skin under it faces.
+        float c = dot(t, l);
+        strands = grows.y * (0.8 * sqrt(max(1.0 - c * c, 0.0)) * clamp(facing * 0.5 + 0.6, 0.0, 1.0) - wrapped) * 0.25;
     }
-    vec4 coat = vec4(vec3(wrapped + rim + strands) + back, plain.w) + vec4(highlight.xyz * mix(0.45, 0.15, grows.y), 0.0);
+    vec4 coat = vec4(vec3(wrapped + rim + strands) + back, plain.w) + vec4(highlight.xyz * mix(0.45, 0.0, grows.y), 0.0);
     return mix(plain, coat, fur);
 }
 
@@ -768,7 +789,6 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
 // lighter and darker as the texture is where the hair is rooted: what else is
 // painted across the mane there, a strap or a patch of coat, keeps only its
 // brightness.
-uniform vec4 wbm_hair_colour;
 vec4 wbm_hair_tint(vec4 painted)
 {
     if (wbm_shell.z >= 0.0 || wbm_shell.y <= 0.0 || wbm_hair_colour.w <= 0.0) return painted;
@@ -921,6 +941,7 @@ bool add_fur(std::string &fs)
         return false;
     }
     fs = std::regex_replace(fs, encode, "$1.xyz *= wbm_shell_shade(Tex0);\n  $&", std::regex_constants::format_first_only);
+    fs = std::regex_replace(fs, encode, "$1.xyz += wbm_hair_shine * vSunColor.xyz * (" + lit + " * wbm_shell_shade(Tex0));\n  $&", std::regex_constants::format_first_only);
     size_t body = fs.find("void main ()");
     if (body != std::string::npos) body = fs.find('{', body);
     if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0, " + down + ")) discard;");
