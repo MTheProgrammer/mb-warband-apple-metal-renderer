@@ -47,6 +47,8 @@ enum {
 
 struct Buffer {
     id<MTLBuffer> mtl;
+    void *scale_of = nullptr; // the MTLBuffer texture_per_metre was worked out for
+    float texture_per_metre = 0;
     void *wind_weights = nullptr; // the MTLBuffer whose vertices have been given heights for the wind (see weigh_foliage)
 };
 
@@ -401,7 +403,9 @@ float s_wind_strength;     // WBM_WIND, 0 for none
 double s_wind_time;        // the same for every draw of a frame
 // Shells of fur (WBM_FUR_SHELLS): how many layers a coat near the camera is drawn in, 0 for none.
 int s_fur_shells;
-float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 2600.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per unit of texture coordinate
+float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its texture a metre of its surface covers
+float s_hair_length = 0.07f; // WBM_HAIR_LENGTH: how far mane and tail stand off the body, metres; 0 for no layers of their own
+float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 800.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per metre
 float s_shell_now[4];  // the shaders' wbm_shell for the draw being prepared
 uint64_t s_shell_draws;
 float s_fur_strength; // WBM_FUR: the coat of horses, 0 for none
@@ -2948,7 +2952,7 @@ bool prepare_draw()
     }
     if (p->fur_offset >= 0) {
         const float fur[4] = {diffuse && (diffuse->pbr || diffuse->hair) ? s_fur_strength : 0.0f, s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f,
-                              s_skin_backlight, diffuse && diffuse->hair ? 1.0f : 0.0f};
+                              s_skin_backlight, diffuse && diffuse->hair ? s_texture_per_metre : -s_texture_per_metre};
         if (p->horse_eye_offset >= 0) {
             const float eye[4] = {diffuse ? diffuse->horse_eye[0] : 0, diffuse ? diffuse->horse_eye[1] : 0, diffuse && diffuse->horse_eye[2] > 0 ? diffuse->horse_eye[2] : 1.0f,
                                   diffuse && diffuse->horse_eye[2] > 0 && s_shader_options.eyes ? 1.0f : 0.0f};
@@ -3430,6 +3434,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.eyes = getenv("WBM_EYES") && atoi(getenv("WBM_EYES")) != 0; // off unless set
     if (const char *v = getenv("WBM_FUR")) s_fur_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_SHELLS")) s_fur_shells = std::min(24, std::max(0, atoi(v)));
+    if (const char *v = getenv("WBM_HAIR_LENGTH")) s_hair_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_LENGTH")) s_fur_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_RANGE")) s_fur_range = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
@@ -4314,7 +4319,37 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             return;
         }
         // A coat near the camera is drawn again in layers, as fur (see k_fur_function).
+        // How much of the texture a metre of this mesh covers, from its triangles; once per vertex buffer.
+        if (s_fur_strength > 0 && s_pass_scene) {
+            Program *fp = find(s_programs, s_program);
+            Buffer *vb = fp && fp->fur_offset >= 0 && s_attribs[0].enabled ? find(s_buffers, s_attribs[0].buffer) : nullptr;
+            const Attrib &pa = s_attribs[0], &ta = s_attribs[4];
+            if (vb && vb->mtl && vb->scale_of != (__bridge void *)vb->mtl) {
+                vb->scale_of = (__bridge void *)vb->mtl;
+                vb->texture_per_metre = 0.3f;
+                if (ta.enabled && ta.buffer == pa.buffer && pa.type == GL_FLOAT && ta.type == GL_FLOAT && pa.stride > 0) {
+                    const uint8_t *vertices = (const uint8_t *)vb->mtl.contents, *elements = (const uint8_t *)b->mtl.contents + (uintptr_t)indices;
+                    size_t stride = (size_t)pa.stride, n = vb->mtl.length / stride, width = type == GL_UNSIGNED_SHORT ? 2 : 4;
+                    double in_texture = 0, in_space = 0;
+                    for (GLsizei i = 0; i + 2 < std::min<GLsizei>(count, 3000); i += 3) {
+                        uint32_t v[3];
+                        for (int k = 0; k < 3; k++) v[k] = width == 2 ? *(const uint16_t *)(elements + (size_t)(i + k) * 2) : *(const uint32_t *)(elements + (size_t)(i + k) * 4);
+                        if (v[0] >= n || v[1] >= n || v[2] >= n) continue;
+                        for (int k = 0; k < 3; k++) {
+                            float p0[3], p1[3], t0[2], t1[2];
+                            memcpy(p0, vertices + v[k] * stride + pa.offset, 12), memcpy(p1, vertices + v[(k + 1) % 3] * stride + pa.offset, 12);
+                            memcpy(t0, vertices + v[k] * stride + ta.offset, 8), memcpy(t1, vertices + v[(k + 1) % 3] * stride + ta.offset, 8);
+                            in_space += sqrt((p1[0] - p0[0]) * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1]) + (p1[2] - p0[2]) * (p1[2] - p0[2]));
+                            in_texture += hypot(t1[0] - t0[0], t1[1] - t0[1]);
+                        }
+                    }
+                    if (in_space > 1e-6 && in_texture > 1e-6) vb->texture_per_metre = (float)(in_texture / in_space);
+                }
+            }
+            if (vb) s_texture_per_metre = vb->texture_per_metre;
+        }
         int shells = 0;
+        bool long_hair = false; // the coat has a hair map, which says where mane and tail are
         if (s_fur_shells > 0 && s_fur_strength > 0 && s_pass_scene && !s_blend) {
             Program *fp = find(s_programs, s_program);
             if (fp && fp->shell_offset[0] >= 0 && fp->shell_offset[1] >= 0 && fp->u_wvp && fp->alpha_texture_location >= 0) {
@@ -4322,18 +4357,30 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                 Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
                 float distance; // of the object's origin ahead of the camera
                 memcpy(&distance, fp->uniform_data[0].data() + fp->u_wvp->offset + 60, 4);
-                if (coat && (coat->pbr || coat->hair) && distance > 0 && distance < s_fur_range)
+                if (coat && (coat->pbr || coat->hair) && distance > 0 && distance < s_fur_range) {
                     shells = std::max(2, (int)lroundf((float)s_fur_shells * std::min(1.0f, 1.6f * (1.0f - distance / s_fur_range))));
+                    long_hair = coat->hair != nil && s_hair_length > 0;
+                }
             }
         }
-        const float surface[4] = {0, 0, s_fur_density, shells ? 1.0f : 0.0f};
+        float clock = 1.0f + (float)fmod(s_wind_time, 600.0); // above 0.5, which is all the coat's layers ask of it
+        const float surface[4] = {0, 0, s_fur_density, shells ? clock : 0.0f};
         memcpy(s_shell_now, surface, sizeof surface);
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
         for (int layer = 1; layer <= shells; layer++) {
             float share = (float)layer / (float)shells;
-            const float now[4] = {s_fur_length * share, share, s_fur_density, 1.0f};
+            const float now[4] = {s_fur_length * share, share, s_fur_density, clock};
+            memcpy(s_shell_now, now, sizeof now);
+            if (!prepare_draw()) break;
+            [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
+            s_shell_draws++;
+        }
+        // Mane and tail: layers of their own, reaching much farther out (see wbm_shell_bare).
+        for (int layer = 1; long_hair && layer <= shells * 2; layer++) {
+            float share = (float)layer / (float)(shells * 2);
+            const float now[4] = {s_hair_length * share, share, -s_fur_density, clock};
             memcpy(s_shell_now, now, sizeof now);
             if (!prepare_draw()) break;
             [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];

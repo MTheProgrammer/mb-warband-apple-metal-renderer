@@ -686,7 +686,7 @@ bool add_skin_scattering_vertex(std::string &vs)
 const char k_fur_function[] = R"(
 uniform sampler2D wbm_fur_map;  // blue: how much of the surface is coat (a texture's _pbr map)
 uniform sampler2D wbm_hair_map; // a texture's _hair map: red and green the way the hair is combed, in the picture; blue 1 long hair, about 0.5 coat, 0 none
-uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts; w: 1 with a hair map
+uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts; w: how much of the texture a metre of the surface covers, negated without a hair map
 uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size there; w: strength, 0 for none
 // wbm_shell. x: how far out this layer is, metres (vertex stage); y: the same
 // as a share of the longest hair, 0 for the surface itself; z: hairs per unit
@@ -696,7 +696,7 @@ uniform vec4 wbm_shell;
 // What grows at a place: x how much it is coat or hair at all, y how much of that is long hair.
 vec2 wbm_grows(vec2 uv)
 {
-    if (wbm_fur.w > 0.5) {
+    if (wbm_fur.w > 0.0) {
         float kind = texture2D(wbm_hair_map, uv).z;
         return vec2(smoothstep(0.15, 0.35, kind), smoothstep(0.65, 0.85, kind));
     }
@@ -707,7 +707,7 @@ vec2 wbm_grows(vec2 uv)
 // lights in (x along the texture, y up it). Zero where that is not known.
 vec3 wbm_combed(vec2 uv)
 {
-    if (wbm_fur.w < 0.5) return vec3(0.0);
+    if (wbm_fur.w <= 0.0) return vec3(0.0);
     vec2 d = texture2D(wbm_hair_map, uv).xy * 2.0 - 1.0;
     return vec3(d.x, -d.y, 0.0); // the picture's rows run downwards
 }
@@ -751,24 +751,47 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
 // texture holds one, of a length of its own, thinner towards its tip. The
 // hair leans the way it is combed and droops (down: which way that is along
 // the surface), so a layer farther out finds its hairs a little way along.
+//
+// Long hair (mane, tail) gets layers of its own, marked by a negative
+// wbm_shell.z: fewer, thicker strands that reach several centimetres out,
+// hang much farther along the surface, and swing a little (wbm_shell.w
+// carries the time, as 1 + seconds).
 bool wbm_shell_bare(vec2 uv, vec3 down)
 {
     if (wbm_shell.y <= 0.0) return false;
     vec2 grows = wbm_grows(uv);
-    if (grows.x < 0.5) return true; // nothing grows here
-    vec2 lean = wbm_combed(uv).xy * 0.0022 * wbm_shell.y + down.xy * 0.0016 * wbm_shell.y * wbm_shell.y;
-    vec2 at = (uv - lean) * wbm_shell.z;
+    bool long_ = wbm_shell.z < 0.0;
+    // Lengths are in metres and hairs are counted per metre; how much of the
+    // texture a metre covers differs from one horse to the next.
+    float per_metre = max(abs(wbm_fur.w), 0.02);
+    float share = wbm_shell.y, density = abs(wbm_shell.z) / per_metre;
+    vec2 lean;
+    if (long_) {
+        float t = wbm_shell.w - 1.0;
+        vec2 swing = vec2(sin(t * 1.7 + uv.x * 40.0), cos(t * 1.3 + uv.y * 31.0)) * 0.012;
+        lean = (wbm_combed(uv).xy * 0.05 + down.xy * 0.07 + swing) * share * share + wbm_combed(uv).xy * 0.02 * share;
+        density *= 0.3;
+    } else {
+        lean = wbm_combed(uv).xy * 0.007 * share + down.xy * 0.005 * share * share;
+    }
+    lean *= per_metre;
+    // What grows is asked where the hair is rooted, not where it has got to.
+    vec2 root = uv - lean;
+    grows = wbm_grows(root);
+    if (long_ ? grows.y < 0.5 : grows.x < 0.5) return true;
+    vec2 at = root * density;
     vec2 cell = floor(at), within = fract(at) - 0.5;
-    float length_ = (0.35 + 0.65 * fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453)) * mix(0.6, 1.0, grows.y);
-    if (wbm_shell.y > length_) return true;
-    float thickness = 0.5 * (1.0 - 0.75 * wbm_shell.y / length_);
+    float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+    float length_ = long_ ? 0.45 + 0.55 * chance : (0.35 + 0.65 * chance) * mix(0.6, 1.0, grows.y);
+    if (share > length_) return true;
+    float thickness = 0.5 * (1.0 - (long_ ? 0.55 : 0.75) * share / length_);
     return dot(within, within) > thickness * thickness;
 }
 
 // Hairs shade one another: dark at the roots, full at the tips.
 float wbm_shell_shade(vec2 uv)
 {
-    if (wbm_shell.y > 0.0) return 0.6 + 0.4 * wbm_shell.y;
+    if (wbm_shell.y > 0.0) return (wbm_shell.z < 0.0 ? 0.5 : 0.6) + (wbm_shell.z < 0.0 ? 0.5 : 0.4) * wbm_shell.y;
     return wbm_shell.w > 0.5 && wbm_grows(uv).x >= 0.5 ? 0.6 : 1.0;
 }
 
