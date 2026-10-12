@@ -4,6 +4,19 @@
 //   build/replay capture.wbcap                 a window showing the frame, redrawn continuously
 //   build/replay capture.wbcap --png out.png   draws it a few times, saves the last, and exits
 //
+// In the window the camera can be moved about the scene:
+//   drag                 turn the scene about a point ahead of the camera
+//   shift-drag, or drag with the right button   slide sideways and up
+//   scroll               move nearer and farther
+//   [ and ]              bring the point the scene turns about nearer and farther
+//   u                    hide and show the game's interface
+//   r                    back to the view as captured
+// The same from the command line, for stills: --yaw and --pitch (degrees),
+// --pan x y, --forward and --pivot (metres), --no-ui.
+//
+// Only what the game drew for its own view is there to look at: turn far
+// enough and the scene ends where the game's camera stopped seeing it.
+//
 // The WBM_* variables select the renderer's options exactly as they do in the
 // game, so the same frame can be looked at with any combination of them.
 
@@ -11,6 +24,7 @@
 
 #import <AppKit/AppKit.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <string>
 #include <sys/stat.h>
@@ -40,19 +54,35 @@ void wb_flush() {}
 bool wb_gl_read_backbuffer(int, int, unsigned char *) { return false; }
 void wb_gl_take_screen_extent(int *w, int *h) { *w = *h = 0; }
 
+// The camera, set from the main thread's events and read by the thread that draws.
+struct View {
+    std::atomic<double> yaw{0}, pitch{0}, pan_x{0}, pan_y{0}, forward{0}, pivot{5};
+    std::atomic<bool> interface{true};
+};
+static View s_view;
+
 int main(int argc, char **argv)
 {
     const char *path = nullptr, *png = nullptr;
     int frames = 8;
+    const double degrees = M_PI / 180.0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--png") && i + 1 < argc) png = argv[++i];
+        else if (!strcmp(argv[i], "--yaw") && i + 1 < argc) s_view.yaw = atof(argv[++i]) * degrees;
+        else if (!strcmp(argv[i], "--pitch") && i + 1 < argc) s_view.pitch = atof(argv[++i]) * degrees;
+        else if (!strcmp(argv[i], "--pan") && i + 2 < argc) s_view.pan_x = atof(argv[i + 1]), s_view.pan_y = atof(argv[i + 2]), i += 2;
+        else if (!strcmp(argv[i], "--forward") && i + 1 < argc) s_view.forward = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--pivot") && i + 1 < argc) s_view.pivot = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--no-ui")) s_view.interface = false;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) s_quiet = true;
         else path = argv[i];
     }
     int width = 0, height = 0;
     if (!path || !mtl_replay_open(path, &width, &height)) {
-        fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet]\n%s\n", path ? "that file is not a frame capture" : "");
+        fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet]\n"
+                        "              [--yaw deg] [--pitch deg] [--pan x y] [--forward m] [--pivot m] [--no-ui]\n%s\n",
+                path ? "that file is not a frame capture" : "");
         return 2;
     }
     static std::string out_dir = png ? std::string(png) + ".d" : std::string(".");
@@ -73,6 +103,29 @@ int main(int argc, char **argv)
             [window makeKeyAndOrderFront:nil];
             [NSApp activateIgnoringOtherApps:YES];
         }
+        NSEventMask mask = NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskScrollWheel | NSEventMaskKeyDown;
+        [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent *(NSEvent *e) {
+          double reach = std::max(1.0, s_view.pivot.load()); // movements are in proportion to how far away the subject is
+          if (e.type == NSEventTypeScrollWheel) {
+              s_view.forward = s_view.forward + e.scrollingDeltaY * reach * (e.hasPreciseScrollingDeltas ? 0.004 : 0.04);
+          } else if (e.type == NSEventTypeKeyDown) {
+              NSString *key = e.charactersIgnoringModifiers.lowercaseString;
+              if ([key isEqualToString:@"r"]) s_view.yaw = 0, s_view.pitch = 0, s_view.pan_x = 0, s_view.pan_y = 0, s_view.forward = 0;
+              else if ([key isEqualToString:@"u"]) s_view.interface = !s_view.interface.load();
+              else if ([key isEqualToString:@"["]) s_view.pivot = std::max(0.5, s_view.pivot.load() / 1.25);
+              else if ([key isEqualToString:@"]"]) s_view.pivot = s_view.pivot.load() * 1.25;
+              else if ([key isEqualToString:@"q"]) exit(0);
+              else return e;
+              return nil;
+          } else if (e.type == NSEventTypeRightMouseDragged || (e.modifierFlags & NSEventModifierFlagShift)) {
+              s_view.pan_x = s_view.pan_x + e.deltaX * reach * 0.002;
+              s_view.pan_y = s_view.pan_y - e.deltaY * reach * 0.002;
+          } else {
+              s_view.yaw = s_view.yaw + e.deltaX * 0.006;
+              s_view.pitch = std::min(1.4, std::max(-1.4, s_view.pitch + e.deltaY * 0.006));
+          }
+          return e;
+        }];
         static std::atomic<bool> closed{false};
         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:window queue:nil usingBlock:^(NSNotification *) {
           closed = true;
@@ -86,6 +139,8 @@ int main(int argc, char **argv)
             // colours, grass in the shadow map), so a still needs a few runs.
             for (uint32_t n = 1; png ? n <= (uint32_t)frames : !closed.load(); n++) {
                 g_frame = n;
+                mtl_replay_orbit(s_view.yaw, s_view.pitch, s_view.pan_x, s_view.pan_y, s_view.forward, s_view.pivot);
+                mtl_replay_show_interface(s_view.interface);
                 mtl_replay_frame(png && n == (uint32_t)frames, n);
             }
             if (png) {

@@ -3152,7 +3152,20 @@ bool mtl_replay_open(const char *path, int *width, int *height)
     return r.ok;
 }
 
-bool mtl_replay_restore() { return restore_state(); }
+bool mtl_replay_restore()
+{
+    if (!restore_state()) return false;
+    find_camera();
+    return true;
+}
+
+void mtl_replay_orbit(double yaw, double pitch, double pan_x, double pan_y, double forward, double pivot)
+{
+    const double o[6] = {yaw, pitch, pan_x, pan_y, forward, pivot};
+    memcpy(s_replay.orbit, o, sizeof o);
+}
+
+void mtl_replay_show_interface(bool show) { s_replay.hide_ui = !show; }
 
 void mtl_replay_frame(bool capture, uint32_t frame)
 {

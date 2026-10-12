@@ -30,3 +30,9 @@ void mtl_request_capture();
 bool mtl_replay_open(const char *path, int *width, int *height);
 bool mtl_replay_restore();
 void mtl_replay_frame(bool capture, uint32_t frame);
+// Moves the camera for the runs that follow: the scene is turned about a point
+// `pivot` metres ahead of the captured camera by yaw (about the world's up
+// axis) and pitch, in radians, then shifted sideways and up by pan_x and pan_y
+// and brought nearer by `forward`, all in metres. Zeros restore the capture's own view.
+void mtl_replay_orbit(double yaw, double pitch, double pan_x, double pan_y, double forward, double pivot);
+void mtl_replay_show_interface(bool show);

@@ -280,6 +280,15 @@ struct Replay {
     std::vector<uint8_t> gl_state, counters; // payloads, applied again before each pass over the frame
     int width = 0, height = 0;
     uint64_t calls = 0, skipped_uniforms = 0;
+    // The free camera. The captured frame's camera is found once (find_camera);
+    // `delta` then takes a position in that camera's view space to the same
+    // position seen from the moved camera, and `turn` is its rotation alone.
+    bool camera_known = false, camera_moved = false, hide_ui = false;
+    double p00 = 1, p11 = 1, A = 0, B = 0, C = -1; // the projection: x and y scales, z = A * z_view + B, w = C * z_view
+    double view[16] = {};                          // world to view space
+    double delta[16] = {}, turn[16] = {};
+    float eye[4] = {};                             // the moved camera's position in the world
+    double orbit[6] = {};                          // yaw, pitch (radians), pan x, pan y, forward (metres), pivot distance
 };
 Replay s_replay;
 
@@ -527,6 +536,122 @@ bool restore_state()
     return true;
 }
 
+// Looks through the frame for a draw of the scene proper that sets its
+// world-view-projection, world-view and world matrices, and takes the camera
+// apart from them: projection = WVP x inverse(WV), view = WV x inverse(W).
+void find_camera()
+{
+    Replay &rp = s_replay;
+    size_t at = rp.frame_at;
+    uint32_t kind;
+    Rd r{};
+    double wvp[16], wv[16], w[16];
+    bool have_wvp = false, have_wv = false, have_w = false, depth_test = true;
+    while (!rp.camera_known && next_record(rp.file, &at, &kind, &r) && kind != CAP_END) {
+        if (kind == FN_glUseProgram) {
+            have_wvp = have_wv = have_w = false;
+        } else if (kind == FN_glEnable || kind == FN_glDisable) {
+            if ((GLenum)r.i() == GL_DEPTH_TEST) depth_test = kind == FN_glEnable;
+        } else if (kind == FN_glUniformMatrix4fv) {
+            std::string name = r.s();
+            (void)r.i();
+            auto data = r.blob();
+            double *to = name == "matWorldViewProj" ? wvp : name == "matWorldView" ? wv : name == "matWorld" ? w : nullptr;
+            if (to && data.first && data.second >= 64) {
+                float m[16];
+                memcpy(m, data.first, 64);
+                for (int k = 0; k < 16; k++) to[k] = m[k];
+                (to == wvp ? have_wvp : to == wv ? have_wv : have_w) = true;
+            }
+        } else if ((kind == FN_glDrawElements || kind == FN_glDrawArrays) && have_wvp && have_wv && have_w && depth_test) {
+            double inv[16], proj[16];
+            if (!mat_inverse(wv, inv)) continue;
+            mat_mul(wvp, inv, proj);
+            bool perspective = fabs(fabs(proj[11]) - 1.0) < 0.01 && fabs(proj[15]) < 0.01 && fabs(proj[0]) > 1e-3 && fabs(proj[5]) > 1e-3 && fabs(proj[14]) > 1e-6;
+            if (!perspective || !mat_inverse(w, inv)) continue;
+            rp.p00 = proj[0], rp.p11 = proj[5], rp.A = proj[10], rp.B = proj[14], rp.C = proj[11];
+            mat_mul(wv, inv, rp.view);
+            rp.camera_known = true;
+        }
+    }
+    if (!rp.camera_known) wb_note("replay: no camera was found in the frame; it cannot be moved");
+}
+
+void rotation_about(const double *axis, double angle, double *out)
+{
+    double x = axis[0], y = axis[1], z = axis[2], len = sqrt(x * x + y * y + z * z);
+    if (len < 1e-12) len = 1, x = 0, y = 0, z = 1;
+    x /= len, y /= len, z /= len;
+    double c = cos(angle), s = sin(angle), t = 1 - c;
+    const double m[16] = {t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0, t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0,
+                          t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0, 0, 0, 0, 1};
+    memcpy(out, m, sizeof m);
+}
+
+void translation(double x, double y, double z, double *out)
+{
+    const double m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1};
+    memcpy(out, m, sizeof m);
+}
+
+// Turns the orbit settings into `delta` and `turn`. The scene is turned about
+// a point straight ahead of the captured camera, by yaw about the world's up
+// axis and by pitch about the camera's own horizontal, then shifted.
+void update_camera()
+{
+    Replay &rp = s_replay;
+    const double *o = rp.orbit;
+    rp.camera_moved = rp.camera_known && (o[0] != 0 || o[1] != 0 || o[2] != 0 || o[3] != 0 || o[4] != 0);
+    if (!rp.camera_moved) return;
+    const double up[3] = {rp.view[8], rp.view[9], rp.view[10]}, across[3] = {1, 0, 0}; // the world's Z axis, in view space
+    double yaw[16], pitch[16], to_pivot[16], from_pivot[16], shift[16], a[16], b[16];
+    rotation_about(up, o[0], yaw);
+    rotation_about(across, o[1], pitch);
+    mat_mul(pitch, yaw, rp.turn);
+    double pivot_z = o[5] / rp.C; // view-space z of a point that far ahead
+    translation(0, 0, -pivot_z, from_pivot);
+    translation(0, 0, pivot_z, to_pivot);
+    translation(o[2], o[3], -o[4] / rp.C, shift);
+    mat_mul(rp.turn, from_pivot, a);
+    mat_mul(to_pivot, a, b);
+    mat_mul(shift, b, rp.delta);
+    double moved[16], inv[16];
+    mat_mul(rp.delta, rp.view, moved);
+    if (mat_inverse(moved, inv))
+        for (int k = 0; k < 3; k++) rp.eye[k] = (float)inv[12 + k];
+}
+
+// Whether the framebuffer bound now is one the scene's camera draws into.
+bool replay_scene_target()
+{
+    Target t;
+    return s_fbo != 0 && resolve_target(t) && (t.scene || t.prepass);
+}
+
+// Rewrites one matrix of a uniform call for the moved camera. clip: the
+// matrix ends in the projection (rows x, y, z, w of clip space); otherwise it
+// ends in view space. The sky and whatever else is drawn without a depth test
+// sits at no particular distance, and only turns.
+void move_matrix(float *m, bool clip)
+{
+    Replay &rp = s_replay;
+    const double *d = s_depth_test ? rp.delta : rp.turn;
+    for (int c = 0; c < 4; c++) {
+        double h = c == 3 ? 1.0 : 0.0; // these matrices are affine up to the projection
+        double v[3] = {clip ? m[c * 4 + 0] / rp.p00 : m[c * 4 + 0], clip ? m[c * 4 + 1] / rp.p11 : m[c * 4 + 1], clip ? m[c * 4 + 3] / rp.C : m[c * 4 + 2]};
+        double n[3];
+        for (int row = 0; row < 3; row++) n[row] = d[row] * v[0] + d[4 + row] * v[1] + d[8 + row] * v[2] + d[12 + row] * h;
+        if (clip) {
+            m[c * 4 + 0] = (float)(rp.p00 * n[0]);
+            m[c * 4 + 1] = (float)(rp.p11 * n[1]);
+            m[c * 4 + 2] = (float)(rp.A * n[2] + rp.B * h);
+            m[c * 4 + 3] = (float)(rp.C * n[2]);
+        } else {
+            m[c * 4 + 0] = (float)n[0], m[c * 4 + 1] = (float)n[1], m[c * 4 + 2] = (float)n[2];
+        }
+    }
+}
+
 GLint replay_location(const std::string &name)
 {
     GLint loc = name.empty() ? -1 : mtl_glGetUniformLocation(s_program, name.c_str());
@@ -540,11 +665,16 @@ void replay_calls()
     Replay &rp = s_replay;
     if (!rp.counters.empty()) apply_counters(Rd{rp.counters.data(), rp.counters.data() + rp.counters.size()});
     if (!rp.gl_state.empty()) apply_gl_state(Rd{rp.gl_state.data(), rp.gl_state.data() + rp.gl_state.size()});
+    update_camera();
+    int screen_draws = 0;
     size_t at = rp.frame_at;
     uint32_t kind;
     Rd r{};
     while (next_record(rp.file, &at, &kind, &r) && kind != CAP_END) {
         rp.calls++;
+        // Without the interface: on the screen itself, only the first draw, which
+        // is the finished scene, is let through.
+        if (rp.hide_ui && s_fbo == 0 && (kind == FN_glDrawElements || kind == FN_glDrawArrays) && screen_draws++ > 0) continue;
         switch (kind) {
         case FN_glClear: mtl_glClear((GLbitfield)r.i()); break;
         case FN_glClearColor: {
@@ -716,11 +846,29 @@ void replay_calls()
         case FN_glUniform1iv:
         case FN_glUniform4fv:
         case FN_glUniformMatrix4fv: {
-            GLint loc = replay_location(r.s());
+            std::string name = r.s();
+            GLint loc = replay_location(name);
             GLsizei count = (GLsizei)r.i();
             auto data = r.blob();
             size_t each = kind == FN_glUniform1iv ? 4 : kind == FN_glUniform4fv ? 16 : 64;
             if (loc < 0 || !data.first || data.second < each * (size_t)count) break;
+            if (rp.camera_moved && count == 1 && kind != FN_glUniform1iv && replay_scene_target()) {
+                bool clip = name == "matWorldViewProj" || name == "matViewProj", view = name == "matWorldView";
+                if (kind == FN_glUniformMatrix4fv && (clip || view)) {
+                    float m[16];
+                    memcpy(m, data.first, sizeof m);
+                    move_matrix(m, clip);
+                    mtl_glUniformMatrix4fv(loc, 1, GL_FALSE, m);
+                    break;
+                }
+                if (kind == FN_glUniform4fv && name == "vCameraPos") {
+                    float v[4];
+                    memcpy(v, data.first, sizeof v);
+                    memcpy(v, rp.eye, 12);
+                    mtl_glUniform4fv(loc, 1, v);
+                    break;
+                }
+            }
             if (kind == FN_glUniform1iv) mtl_glUniform1iv(loc, count, (const GLint *)data.first);
             else if (kind == FN_glUniform4fv) mtl_glUniform4fv(loc, count, (const GLfloat *)data.first);
             else mtl_glUniformMatrix4fv(loc, count, GL_FALSE, (const GLfloat *)data.first);
