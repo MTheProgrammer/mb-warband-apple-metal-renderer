@@ -57,6 +57,7 @@ struct Texture {
     bool woman = false;       // a woman's face, whose eyes are elsewhere in the texture than a man's (see k_eye_function)
     bool radial_wind = false; // foliage that hangs from a crown (a palm's leaves): the wind takes hold by distance from the middle, not by height
     bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
+    id<MTLTexture> hair;   // a pack's hair map for this texture (<name>_hair), see k_fur_function in shader_xlate.cpp
     id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
     GLint gl_internal = 0;
@@ -115,6 +116,7 @@ struct UniformLocation {
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
+    bool is_hair_map = false;                         // the wbm_hair_map sampler, which gets the bound texture's hair map
     bool is_fur_map = false;                          // the wbm_fur_map sampler, which gets the same map
     bool is_pbr_map = false;                          // the wbm_pbr_map sampler, which gets the bound texture's metalness map
     bool is_dyn_map = false;                          // the wbm_dyn_map sampler, which gets the per-frame shadow map
@@ -1061,6 +1063,7 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.back().is_dyn_map = name == k_xl_dyn_sampler;
                 p.locations.back().is_pbr_map = name == k_xl_pbr_sampler;
                 p.locations.back().is_fur_map = name == "wbm_fur_map";
+                p.locations.back().is_hair_map = name == "wbm_hair_map";
                 p.locations.back().is_sun_matrix = name == "matSunViewProj";
             }
             return p.locations[(size_t)it->second];
@@ -2944,8 +2947,8 @@ bool prepare_draw()
         p->uniform_dirty[stage] = true;
     }
     if (p->fur_offset >= 0) {
-        const float fur[4] = {diffuse && diffuse->pbr ? s_fur_strength : 0.0f, s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f,
-                              s_skin_backlight, 0};
+        const float fur[4] = {diffuse && (diffuse->pbr || diffuse->hair) ? s_fur_strength : 0.0f, s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f,
+                              s_skin_backlight, diffuse && diffuse->hair ? 1.0f : 0.0f};
         if (p->horse_eye_offset >= 0) {
             const float eye[4] = {diffuse ? diffuse->horse_eye[0] : 0, diffuse ? diffuse->horse_eye[1] : 0, diffuse && diffuse->horse_eye[2] > 0 ? diffuse->horse_eye[2] : 1.0f,
                                   diffuse && diffuse->horse_eye[2] > 0 && s_shader_options.eyes ? 1.0f : 0.0f};
@@ -3094,6 +3097,9 @@ bool prepare_draw()
             } else if (l.is_dyn_map) {
                 texture = s_dyn_map ? s_dyn_map : s_white;
                 if (s_dyn_sampler) sampler = s_dyn_sampler;
+            } else if (l.is_hair_map) {
+                texture = diffuse && diffuse->hair ? diffuse->hair : s_white;
+                sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
             } else if (l.is_pbr_map || l.is_fur_map) {
                 texture = diffuse && diffuse->pbr ? diffuse->pbr : s_white;
                 sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
@@ -4316,7 +4322,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                 Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
                 float distance; // of the object's origin ahead of the camera
                 memcpy(&distance, fp->uniform_data[0].data() + fp->u_wvp->offset + 60, 4);
-                if (coat && coat->pbr && distance > 0 && distance < s_fur_range)
+                if (coat && (coat->pbr || coat->hair) && distance > 0 && distance < s_fur_range)
                     shells = std::max(2, (int)lroundf((float)s_fur_shells * std::min(1.0f, 1.6f * (1.0f - distance / s_fur_range))));
             }
         }

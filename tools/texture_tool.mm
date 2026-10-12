@@ -9,12 +9,14 @@
 //       map (bright there means metal) and, for textures the name says are
 //       metal, from which parts are grey; and, for horses, in blue how much of
 //       the surface is coat (not armour, cloth or saddle).
-//   texture_tool hair <picture> <name> <out-folder>
+//   texture_tool hair <picture> <name> <out-folder> [tack-picture]
 //       writes <name>_hair.png for the game's texture <name> from a picture of
 //       that texture with everything but the long hair (mane, tail, forelock)
 //       blacked out: red and green give the way the hair is combed, worked out
 //       from the run of the strands in the picture and in the texture's normal
 //       map; blue says what grows there (255 long hair, about 128 coat, 0 none).
+//       A second picture, of the saddle, straps and other gear alone, keeps
+//       the coat off those.
 //
 // The game's folder is taken from WBM_GAME, or from where Steam puts it.
 
@@ -273,13 +275,16 @@ static bool is_horse(const std::string &name)
     return horse;
 }
 
-// How much of a horse's texture at (u, v) is coat. With a specular map, what is
-// neither metal (bright there) nor cloth (black). Without one, all that is
-// painted, less the saddle of the horse_a layout.
-static float coat_at(bool has_spec, float spec, float u, float v, float brightest)
+// How much of a horse's texture at (u, v) is coat. On an armoured horse,
+// whose specular map tells its parts apart: what is neither metal (bright
+// there) nor cloth (black). On a plain one, all that is painted; less the
+// saddle where the layout is known, which it is for horse_a and horse_b.
+static float coat_at(const std::string &name, bool has_spec, float spec, float u, float v, float brightest)
 {
-    if (has_spec) return smoothstep(0.03f, 0.10f, spec) * (1 - smoothstep(0.24f, 0.36f, spec));
-    bool saddle = (u > 0.485f && u < 0.755f && v > 0.02f && v < 0.335f) || (u > 0.195f && u < 0.315f && v > 0.455f && v < 0.715f) || (u > 0.03f && u < 0.10f && v > 0.44f && v < 0.60f);
+    bool armoured = name.find("war") != std::string::npos || name.find("charger") != std::string::npos;
+    if (armoured && has_spec) return smoothstep(0.03f, 0.10f, spec) * (1 - smoothstep(0.24f, 0.36f, spec));
+    bool saddle = (name == "horse_a" || name == "horse_b") &&
+                  ((u > 0.485f && u < 0.755f && v > 0.02f && v < 0.335f) || (u > 0.195f && u < 0.315f && v > 0.455f && v < 0.715f) || (u > 0.03f && u < 0.10f && v > 0.44f && v < 0.60f));
     return saddle ? 0.0f : smoothstep(0.0002f, 0.0012f, brightest); // a black coat is dark, but not as black as the unused parts
 }
 
@@ -292,8 +297,12 @@ static bool load_specular(const std::map<std::string, std::string> &files, const
     return false;
 }
 
-static int hair_map(const std::string &picture, std::string name, const std::string &out)
+// tack: optionally, a picture of the same texture with all but the saddle, straps and other gear blacked out.
+static int hair_map(const std::string &picture, std::string name, const std::string &out, const char *tack_picture)
 {
+    Image tack;
+    bool has_tack = tack_picture && read_picture(tack_picture, &tack);
+    if (tack_picture && !has_tack) fprintf(stderr, "%s could not be read; going on without it\n", tack_picture);
     for (char &c : name) c = (char)tolower((unsigned char)c);
     std::map<std::string, std::string> files = game_textures();
     Image hair, base, spec, normal;
@@ -317,6 +326,11 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     auto picture_at = [&](int x, int y) {
         int X = std::min(hair.w - 1, (int)((x + 0.5f) * hair.w / w)), Y = std::min(hair.h - 1, (int)((y + 0.5f) * hair.h / h));
         const uint8_t *p = &hair.px[((size_t)Y * hair.w + X) * 4];
+        return (float)std::max({p[0], p[1], p[2]}) / 255.0f;
+    };
+    auto tack_at = [&](int x, int y) {
+        int X = std::min(tack.w - 1, (int)((x + 0.5f) * tack.w / w)), Y = std::min(tack.h - 1, (int)((y + 0.5f) * tack.h / h));
+        const uint8_t *p = &tack.px[((size_t)Y * tack.w + X) * 4];
         return (float)std::max({p[0], p[1], p[2]}) / 255.0f;
     };
     // Where the long hair is: what the picture did not black out. Smoothed, so
@@ -383,7 +397,8 @@ static int hair_map(const std::string &picture, std::string name, const std::str
             const uint8_t *c = &base.px[i * 4];
             float brightest = powf(std::max({c[0], c[1], c[2]}) / 255.0f, 2.2f);
             float s = has_spec ? sample_luminance(spec, (x + 0.5f) / w, (y + 0.5f) / h) : 0;
-            float coat = coat_at(has_spec, s, (x + 0.5f) / w, (y + 0.5f) / h, brightest) * 0.5f;
+            float coat = coat_at(name, has_spec, s, (x + 0.5f) / w, (y + 0.5f) / h, brightest) * 0.5f;
+            if (has_tack && tack_at(x, y) > 0.07f) coat = 0; // saddle, straps and the like, as the second picture shows them
             float kind = std::max(coat * (1 - mask[i]), mask[i]);
             uint8_t *o = &map.px[i * 4];
             o[0] = (uint8_t)lroundf(127.5f + 127.5f * dx[i] * mask[i]);
@@ -399,16 +414,16 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         return 1;
     }
     printf("%s: %dx%d, long hair on %.1f%% of it%s%s\n", path.c_str(), w, h, 100.0 * (double)covered / (double)count, has_normal ? ", normal map used" : ", no normal map found",
-           has_spec ? ", coat from the specular map" : "");
+           has_tack ? ", gear from the second picture" : ", no picture of the gear: saddle and straps count as coat");
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    if (argc == 5 && !strcmp(argv[1], "hair")) return hair_map(argv[2], argv[3], argv[4]);
+    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "hair")) return hair_map(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
     if (argc < 3 || (strcmp(argv[1], "export") && strcmp(argv[1], "pbr"))) {
         fprintf(stderr, "usage: texture_tool export <out-folder> [name...]\n       texture_tool pbr <out-folder> [name...]\n"
-                        "       texture_tool hair <picture of the hair alone> <name> <out-folder>\n");
+                        "       texture_tool hair <picture of the hair alone> <name> <out-folder> [picture of the saddle and straps alone]\n");
         return 2;
     }
     bool pbr = !strcmp(argv[1], "pbr");
@@ -453,9 +468,7 @@ int main(int argc, char **argv)
             }
         }
         bool metal_class = classify_texture_name(name) == MAT_METAL;
-        bool horse = false;
-        for (const char *word : {"horse", "charger", "courser", "hunter", "steed"}) horse = horse || name.find(word) != std::string::npos;
-        if (name.compare(0, 4, "pic_") == 0 || name.find("boot") != std::string::npos || name.find("horseman") != std::string::npos) horse = false; // pictures and riders' gear
+        bool horse = is_horse(name);
         if (!has_spec && !metal_class && !horse) {
             skipped++;
             continue;
@@ -484,17 +497,7 @@ int main(int argc, char **argv)
                 // Blue: how much of the surface is a horse's coat. With a specular map,
                 // what is neither metal (bright) nor cloth (black). Without one, all that
                 // is painted, less the saddle, which every plain horse has at the same place.
-                float fur = 0;
-                if (horse) {
-                    float u = (x + 0.5f) / base.w, v = (y + 0.5f) / base.h;
-                    if (has_spec) {
-                        fur = smoothstep(0.03f, 0.10f, s) * (1 - smoothstep(0.24f, 0.36f, s));
-                    } else {
-                        bool saddle = (u > 0.485f && u < 0.755f && v > 0.02f && v < 0.335f) || (u > 0.195f && u < 0.315f && v > 0.455f && v < 0.715f) ||
-                                      (u > 0.03f && u < 0.10f && v > 0.44f && v < 0.60f);
-                        fur = saddle ? 0.0f : smoothstep(0.0002f, 0.0012f, hi); // a black coat is dark, but not as black as the unused parts
-                    }
-                }
+                float fur = horse ? coat_at(name, has_spec, s, (x + 0.5f) / base.w, (y + 0.5f) / base.h, hi) : 0.0f;
                 o[0] = (uint8_t)lroundf(metal * 255), o[1] = (uint8_t)lroundf(rough * 255), o[2] = (uint8_t)lroundf(fur * 255), o[3] = 255;
                 most = std::max(most, std::max(metal, fur));
             }

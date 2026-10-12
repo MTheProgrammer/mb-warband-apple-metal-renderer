@@ -317,11 +317,18 @@ bool replace_from_pack(Texture &t, const KnownTexture &known)
 void attach_pbr_map(Texture &t, const KnownTexture &known)
 {
     t.pbr = nil;
+    t.hair = nil;
     if (s_pack_files.empty()) return;
     std::string name = s_texture_names[known.name];
     const char suffix[] = "_degraded_";
     size_t n = sizeof suffix - 1;
     if (name.size() > n && !name.compare(name.size() - n, n, suffix)) name.resize(name.size() - n);
+    auto hair = s_pack_files.find(name + "_hair");
+    if (hair != s_pack_files.end()) {
+        Texture map;
+        if (load_replacement(map, hair->second, known.flipped)) t.hair = map.mtl;
+        else s_pack_stats.failed++;
+    }
     auto it = s_pack_files.find(name + "_pbr");
     if (it == s_pack_files.end()) return;
     Texture map;

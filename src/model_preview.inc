@@ -157,8 +157,10 @@ GLuint preview_texture(const std::string &texture_name)
                 t.min_filter = GL_LINEAR_MIPMAP_LINEAR;
                 t.anisotropy = 16;
                 auto map = s_pack_files.find(name + "_pbr");
-                Texture pbr;
+                Texture pbr, hair;
                 if (map != s_pack_files.end() && load_replacement(pbr, map->second, true)) t.pbr = pbr.mtl;
+                map = s_pack_files.find(name + "_hair");
+                if (map != s_pack_files.end() && load_replacement(hair, map->second, true)) t.hair = hair.mtl;
             } else {
                 s_textures.erase(id);
                 id = 0;

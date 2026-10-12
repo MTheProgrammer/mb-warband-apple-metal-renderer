@@ -684,16 +684,42 @@ bool add_skin_scattering_vertex(std::string &vs)
 
 // Fur. See XlOptions::fur.
 const char k_fur_function[] = R"(
-uniform sampler2D wbm_fur_map;
-uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts
+uniform sampler2D wbm_fur_map;  // blue: how much of the surface is coat (a texture's _pbr map)
+uniform sampler2D wbm_hair_map; // a texture's _hair map: red and green the way the hair is combed, in the picture; blue 1 long hair, about 0.5 coat, 0 none
+uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts; w: 1 with a hair map
 uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size there; w: strength, 0 for none
+// wbm_shell. x: how far out this layer is, metres (vertex stage); y: the same
+// as a share of the longest hair, 0 for the surface itself; z: hairs per unit
+// of texture coordinate; w: 1 on the surface when layers will follow.
+uniform vec4 wbm_shell;
+
+// What grows at a place: x how much it is coat or hair at all, y how much of that is long hair.
+vec2 wbm_grows(vec2 uv)
+{
+    if (wbm_fur.w > 0.5) {
+        float kind = texture2D(wbm_hair_map, uv).z;
+        return vec2(smoothstep(0.15, 0.35, kind), smoothstep(0.65, 0.85, kind));
+    }
+    return vec2(texture2D(wbm_fur_map, uv).z, 0.0);
+}
+
+// The way the hair is combed, along the surface, in the space the shader
+// lights in (x along the texture, y up it). Zero where that is not known.
+vec3 wbm_combed(vec2 uv)
+{
+    if (wbm_fur.w < 0.5) return vec3(0.0);
+    vec2 d = texture2D(wbm_hair_map, uv).xy * 2.0 - 1.0;
+    return vec3(d.x, -d.y, 0.0); // the picture's rows run downwards
+}
 
 // facing: the cosine of the sun's angle to the surface; highlight: the engine's
-// own; fur: 0 to 1; depth: how far behind the sunward surface this point is
+// own; depth: how far behind the sunward surface this point is
 // (wbm_dyn_thickness), below 0 when unknown.
-vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_sun, float fur, float depth)
+vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_sun, vec2 uv, float depth)
 {
     vec4 plain = vec4(clamp(facing, 0.0, 1.0)) + highlight;
+    vec2 grows = wbm_grows(uv);
+    float fur = grows.x * wbm_fur.x;
     if (fur <= 0.0) return plain;
     float wrapped = clamp((facing + 0.3) / 1.3, 0.0, 1.0) / 1.12;
     // Hairs standing off the surface catch light when seen along it: brightest
@@ -708,23 +734,32 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
         float towards = pow(clamp(dot(v, -normalize(l + vec3(0.0, 0.0, 0.35))), 0.0, 1.0), 2.0);
         back = towards * smoothstep(0.25, -0.15, l.z) * wbm_fur.z * exp(-(depth * wbm_fur.y + 0.004) * vec3(70.0, 190.0, 300.0));
     }
-    vec4 coat = vec4(vec3(wrapped + rim) + back, plain.w) + vec4(highlight.xyz * 0.45, 0.0);
+    // Long hair shines in a band across the strands, where they lie at a right
+    // angle to the line halfway between the eye and the sun.
+    float strands = 0.0;
+    vec3 combed = wbm_combed(uv);
+    if (grows.y > 0.0 && dot(combed, combed) > 0.04) {
+        vec3 t = normalize(combed + normalize(normal) * 0.15);
+        float along = dot(t, normalize(v + l));
+        strands = grows.y * pow(sqrt(max(1.0 - along * along, 0.0)), 70.0) * 1.6 * clamp(facing * 0.6 + 0.4, 0.0, 1.0);
+    }
+    vec4 coat = vec4(vec3(wrapped + rim + strands) + back, plain.w) + vec4(highlight.xyz * mix(0.45, 0.15, grows.y), 0.0);
     return mix(plain, coat, fur);
 }
 
-// wbm_shell. x: how far out this layer is, metres (vertex stage); y: the same
-// as a share of the longest hair, 0 for the surface itself; z: hairs per unit
-// of texture coordinate; w: 1 on the surface when layers will follow.
-uniform vec4 wbm_shell;
-
 // Whether this layer has a hair here: each cell of a fine grid over the
-// texture holds one, of a length of its own, thinner towards its tip.
-bool wbm_shell_bare(vec2 uv)
+// texture holds one, of a length of its own, thinner towards its tip. The
+// hair leans the way it is combed and droops (down: which way that is along
+// the surface), so a layer farther out finds its hairs a little way along.
+bool wbm_shell_bare(vec2 uv, vec3 down)
 {
     if (wbm_shell.y <= 0.0) return false;
-    if (texture2D(wbm_fur_map, uv).z < 0.5) return true; // not coat
-    vec2 cell = floor(uv * wbm_shell.z), within = fract(uv * wbm_shell.z) - 0.5;
-    float length_ = 0.35 + 0.65 * fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+    vec2 grows = wbm_grows(uv);
+    if (grows.x < 0.5) return true; // nothing grows here
+    vec2 lean = wbm_combed(uv).xy * 0.0022 * wbm_shell.y + down.xy * 0.0016 * wbm_shell.y * wbm_shell.y;
+    vec2 at = (uv - lean) * wbm_shell.z;
+    vec2 cell = floor(at), within = fract(at) - 0.5;
+    float length_ = (0.35 + 0.65 * fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453)) * mix(0.6, 1.0, grows.y);
     if (wbm_shell.y > length_) return true;
     float thickness = 0.5 * (1.0 - 0.75 * wbm_shell.y / length_);
     return dot(within, within) > thickness * thickness;
@@ -734,7 +769,7 @@ bool wbm_shell_bare(vec2 uv)
 float wbm_shell_shade(vec2 uv)
 {
     if (wbm_shell.y > 0.0) return 0.6 + 0.4 * wbm_shell.y;
-    return wbm_shell.w > 0.5 && texture2D(wbm_fur_map, uv).z >= 0.5 ? 0.6 : 1.0;
+    return wbm_shell.w > 0.5 && wbm_grows(uv).x >= 0.5 ? 0.6 : 1.0;
 }
 
 // A wet eye: a sharp highlight from the sun and a little of the sky, on top of
@@ -761,7 +796,9 @@ bool add_fur(std::string &fs)
     static const std::regex plain(R"(\(\(\s*clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\)\s*\+ (fSpecular_\d+)\) \* (tmpvar_\d+)\))");
     static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
     if (fs.find("0.800118") == std::string::npos || fs.find("varying vec3 ViewDir;") == std::string::npos) return false; // the engine's hair-like highlight marks the shaders
-    const std::string fur = "(texture2D(wbm_fur_map, Tex0).z * wbm_fur.x)";
+    const std::string fur = "Tex0";
+    // Which way is down along the surface, for hair to droop: these shaders carry the world's up as the sky light's direction.
+    const std::string down = fs.find("varying vec3 SkyLightDir;") != std::string::npos ? "-SkyLightDir" : "vec3(0.0)";
     const std::string depth = fs.find("wbm_dynamic_shadow(") != std::string::npos ? "wbm_dyn_thickness(ShadowTexCoord.xyz)" : "-1.0";
     std::smatch m;
     std::string normal, lit = "1.0";
@@ -778,7 +815,7 @@ bool add_fur(std::string &fs)
     fs = std::regex_replace(fs, encode, "$1.xyz *= wbm_shell_shade(Tex0);\n  $&", std::regex_constants::format_first_only);
     size_t body = fs.find("void main ()");
     if (body != std::string::npos) body = fs.find('{', body);
-    if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0)) discard;");
+    if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0, " + down + ")) discard;");
     if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos)
         fs = std::regex_replace(fs, encode, "$1.xyz += wbm_horse_glint(Tex0, ViewDir, " + normal + ", SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz);\n  $&",
                                 std::regex_constants::format_first_only);
