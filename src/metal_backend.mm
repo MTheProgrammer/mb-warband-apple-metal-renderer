@@ -173,6 +173,7 @@ bool s_depth_test, s_depth_mask = true, s_cull, s_blend;
 GLenum s_depth_func = GL_LESS, s_cull_face = GL_BACK, s_polygon_mode = GL_FILL;
 GLenum s_blend_src = GL_ONE, s_blend_dst = GL_ZERO, s_blend_eq = GL_FUNC_ADD;
 
+XlOptions s_shader_options; // set once in mtl_attach_window, from the environment
 std::unordered_map<std::string, std::shared_ptr<StageCompile>> s_stage_compiles; // by MSL source
 struct {
     int links, cache_hits, stage_compiles;
@@ -495,7 +496,7 @@ void link_program(GLuint program_id, Program &p)
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
     bool from_cache = false;
     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
-    p.xl = xl_translate_cached(vs, fs, p.attribs, &from_cache);
+    p.xl = xl_translate_cached(vs, fs, p.attribs, s_shader_options, &from_cache);
     s_shader_stats.translate_ms += (CFAbsoluteTimeGetCurrent() - started) * 1000;
     s_shader_stats.links++;
     s_shader_stats.cache_hits += from_cache;
@@ -873,6 +874,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_screen_w = width;
     s_screen_h = height;
     const char *scale_env = getenv("WBM_SCALE");
+    const char *shadows_env = getenv("WBM_SHADOWS"); // on unless set to 0
+    s_shader_options.soft_shadows = !(shadows_env && atoi(shadows_env) == 0);
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -908,7 +911,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     };
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
-    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d)", width, height, width * s_scale, height * s_scale, s_scale);
+    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s", width, height, width * s_scale,
+            height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off");
 }
 
 const char *mtl_device_name()

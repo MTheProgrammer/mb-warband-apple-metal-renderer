@@ -16,7 +16,7 @@ namespace {
 
 // Bump when the translation changes (the rewriter, its options, or the
 // versions of glslang and SPIRV-Cross), so that stale entries are ignored.
-const char k_version[] = "wbx-1 glslang-15.1.0 spirv-cross-1.4.304.0";
+const char k_version[] = "wbx-2 glslang-15.1.0 spirv-cross-1.4.304.0";
 const uint32_t k_magic = 0x31584257; // "WBX1"
 
 uint64_t fnv(const std::string &s, uint64_t h)
@@ -150,14 +150,16 @@ void store(const std::string &path, const XlProgram &p)
 } // namespace
 
 XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_glsl,
-                              const std::map<std::string, int> &attrib_locations, bool *from_cache)
+                              const std::map<std::string, int> &attrib_locations, const XlOptions &options,
+                              bool *from_cache)
 {
     *from_cache = false;
     std::string dir = cache_dir();
-    if (dir.empty()) return xl_translate(vs_glsl, fs_glsl, attrib_locations);
+    if (dir.empty()) return xl_translate(vs_glsl, fs_glsl, attrib_locations, options);
 
     std::string key = std::string(k_version) + '\0' + vs_glsl + '\0' + fs_glsl + '\0';
     for (auto &a : attrib_locations) key += a.first + "=" + std::to_string(a.second) + ";";
+    key += std::string("\0soft_shadows=", 14) + (options.soft_shadows ? "1" : "0");
     char name[40];
     snprintf(name, sizeof name, "/%016llx%016llx.wbx", (unsigned long long)fnv(key, 0xcbf29ce484222325ull),
              (unsigned long long)fnv(key, 0x84222325cbf29ce4ull));
@@ -168,7 +170,7 @@ XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_
         *from_cache = true;
         return p;
     }
-    p = xl_translate(vs_glsl, fs_glsl, attrib_locations);
+    p = xl_translate(vs_glsl, fs_glsl, attrib_locations, options);
     if (p.ok) store(path, p);
     return p;
 }

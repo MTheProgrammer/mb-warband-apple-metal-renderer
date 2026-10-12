@@ -1,6 +1,7 @@
 // Translates every program recorded in a trace directory and compiles the
-// result with Metal. Usage: xlate_test <trace-dir> [-v] [-d program-id]
+// result with Metal. Usage: xlate_test <trace-dir> [-v] [-s] [-d program-id]
 //   -v  print the log of failing programs      -d  dump one program's sources
+//   -s  translate with soft shadows; also reports how many programs it changed
 
 #include "../src/shader_xlate.h"
 
@@ -23,9 +24,12 @@ int main(int argc, char **argv)
     if (argc < 2) return fprintf(stderr, "usage: %s <trace-dir> [-v] [-d program-id]\n", argv[0]), 2;
     std::string dir = argv[1];
     bool verbose = false;
+    XlOptions options;
+    int softened = 0;
     int dump = -1;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = true;
+        if (!strcmp(argv[i], "-s")) options.soft_shadows = true;
         if (!strcmp(argv[i], "-d") && i + 1 < argc) dump = atoi(argv[++i]);
     }
     const std::map<std::string, int> attribs = {{"inPosition", 0}, {"inNormal", 1},   {"inColor0", 2},
@@ -38,7 +42,8 @@ int main(int argc, char **argv)
     auto finish = [&] {
         if (vs.empty() || fs.empty()) return;
         total++;
-        XlProgram p = xl_translate(slurp(dir + "/" + vs), slurp(dir + "/" + fs), attribs);
+        XlProgram p = xl_translate(slurp(dir + "/" + vs), slurp(dir + "/" + fs), attribs, options);
+        softened += p.fs.msl.find("wbm_shadow") != std::string::npos;
         std::string error = p.ok ? p.log : "translation failed:\n" + p.log;
         if (p.ok) {
             for (const XlStage *stage : {&p.vs, &p.fs}) {
@@ -82,5 +87,6 @@ int main(int argc, char **argv)
     }
     finish();
     printf("%d programs, %d failed\n", total, failed);
+    if (options.soft_shadows) printf("%d programs use the soft shadow filter\n", softened);
     return failed != 0;
 }

@@ -34,12 +34,67 @@ std::string replace_word(const std::string &src, const char *word, const char *w
     return std::regex_replace(src, std::regex(std::string("\\b") + word + "\\b"), with);
 }
 
+// The engine filters its shadow map with four samples, blended by where the
+// pixel falls between them. This does the same over a 4x4 block of texels: the
+// average of that 2x2 filter at nine positions one texel apart, which gives a
+// soft edge about three texels wide instead of one.
+//
+// Samples away from the centre are compared against the receiving surface's
+// own depth at that spot (estimated from screen-space derivatives), not the
+// centre's. Without that, a surface sloping away from the sun would shadow
+// itself. The estimate is clamped, since it grows without bound where the
+// surface is nearly parallel to the light.
+const char k_soft_shadow_function[] = R"(
+float wbm_shadow(sampler2D map, vec3 coord, float size)
+{
+    vec2 p = coord.xy * size;
+    vec2 base = floor(p);
+    vec2 f = p - base;
+    vec3 dx = dFdx(coord), dy = dFdy(coord);
+    float det = dx.x * dy.y - dx.y * dy.x;
+    vec2 slope = vec2(0.0); // change of the surface's depth per shadow-map texel
+    if (abs(det) > 1e-14) slope = vec2(dy.y * dx.z - dx.y * dy.z, dx.x * dy.z - dy.x * dx.z) / (det * size);
+    slope = clamp(slope, vec2(-0.002), vec2(0.002));
+    vec4 wx = vec4(1.0 - f.x, 1.0, 1.0, f.x);
+    vec4 wy = vec4(1.0 - f.y, 1.0, 1.0, f.y);
+    float lit = 0.0;
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            vec2 texel = base + vec2(float(i) - 0.5, float(j) - 0.5); // a texel centre
+            float surface = coord.z + dot(slope, texel - p);
+            float nearest = textureLod(map, texel / size, 0.0).x;
+            lit += wx[i] * wy[j] * (nearest < surface ? 0.0 : 1.0);
+        }
+    }
+    return lit / 9.0;
+}
+)";
+
+// Swaps the engine's shadow filter for wbm_shadow. The block is generated code
+// and has one shape in every shader that has it; a shader where the shape is
+// not found is left as it is.
+bool soften_shadows(std::string &fs)
+{
+    static const std::regex blend(
+        R"((\w+) = clamp \(mix \(mix \(\w+, \w+, \w+\.x\), mix \(\w+, \w+, \w+\.x\), \w+\.y\), 0\.0, 1\.0\);)");
+    for (const char *name : {"uniform sampler2D shadowmap_texture;", "uniform float fShadowMapSize;", "ShadowTexCoord"})
+        if (fs.find(name) == std::string::npos) return false;
+    std::smatch m;
+    if (!std::regex_search(fs, m, blend)) return false;
+    fs = std::string(m.prefix()) + std::string(m[1]) + " = wbm_shadow(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize);" +
+         std::string(m.suffix());
+    return true;
+}
+
 // Rewrites the declarations and built-ins that changed between GLSL 1.20 and
 // 4.50. Attributes and varyings get explicit locations so that the two stages
 // and the vertex descriptor agree without relying on declaration order.
-std::string modernise(const std::string &glsl, bool vertex, const std::map<std::string, int> &attribs, Varyings &varyings,
-                      std::string &log)
+std::string modernise(const std::string &source, bool vertex, const std::map<std::string, int> &attribs, Varyings &varyings,
+                      const XlOptions &options, std::string &log)
 {
+    std::string glsl = source;
+    bool soft_shadows = !vertex && options.soft_shadows && soften_shadows(glsl);
+
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
     for (auto &a : attribs) used_attribs.insert(a.second);
@@ -48,6 +103,7 @@ std::string modernise(const std::string &glsl, bool vertex, const std::map<std::
     out << "#version 450\n";
     if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
+    if (soft_shadows) out << k_soft_shadow_function;
 
     std::istringstream in(glsl);
     std::string line;
@@ -183,12 +239,12 @@ bool to_msl(const std::vector<uint32_t> &spirv, bool vertex, XlStage &stage, std
 } // namespace
 
 XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,
-                       const std::map<std::string, int> &attrib_locations)
+                       const std::map<std::string, int> &attrib_locations, const XlOptions &options)
 {
     XlProgram p;
     Varyings varyings;
-    std::string vs = modernise(vs_glsl, true, attrib_locations, varyings, p.log);
-    std::string fs = modernise(fs_glsl, false, attrib_locations, varyings, p.log);
+    std::string vs = modernise(vs_glsl, true, attrib_locations, varyings, options, p.log);
+    std::string fs = modernise(fs_glsl, false, attrib_locations, varyings, options, p.log);
     std::vector<uint32_t> vs_spirv, fs_spirv;
     p.ok = to_spirv(EShLangVertex, vs, vs_spirv, p.log) && to_spirv(EShLangFragment, fs, fs_spirv, p.log) &&
            to_msl(vs_spirv, true, p.vs, p.log) && to_msl(fs_spirv, false, p.fs, p.log);
