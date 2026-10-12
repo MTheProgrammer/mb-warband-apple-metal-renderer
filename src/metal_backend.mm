@@ -88,7 +88,6 @@ struct UniformLocation {
     const XlUniform *uniform[2] = {nullptr, nullptr}; // per stage: vertex, fragment
     int texture_index[2] = {-1, -1};                  // set for samplers
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
-    bool is_view_proj = false;                        // the uniform named matViewProj, which ambient occlusion reads
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
@@ -254,8 +253,16 @@ float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macO
 bool s_ao;
 float s_ao_radius = 0.6f, s_ao_strength = 0.5f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
 bool s_ao_full; // WBM_AO_FULL: compute at the depth buffer's full resolution instead of half
-float s_view_proj[16];                          // the camera's matViewProj, as last set while drawing the scene
-bool s_view_proj_valid;
+// The scene camera, worked out afresh each frame from the matrices of a draw
+// into the scene buffer (see observe_camera). clip z = a * w + b; p00 and p11
+// are the projection's x and y scales; view holds the camera's axes in world
+// space, the third being the direction of increasing w.
+struct Camera {
+    double a = 0, b = 0, p00 = 1, p11 = 1, view[3][3] = {};
+    uint64_t projection_frame = 0, view_frame = 0;
+};
+Camera s_camera;
+bool s_pass_scene;
 // Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
 // pass as ambient occlusion. They need the sun: its direction and colour as
 // last given to a shader while the scene was being drawn.
@@ -456,6 +463,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_scale = t.scale;
     s_pass_samples = t.samples;
     if (t.scene) s_scene_frame = s_frame_serial;
+    s_pass_scene = t.scene;
     if (s_last.color != t.color) s_last.draws = 0; // a clear restarts the pass on the same target; keep counting
     s_last.color = t.color;
     s_last.ms_color = t.ms_color;
@@ -721,7 +729,6 @@ void link_program(GLuint program_id, Program &p)
                 it = p.location_by_name.emplace(name, (GLint)p.locations.size()).first;
                 p.locations.emplace_back();
                 p.locations.back().name = name;
-                p.locations.back().is_view_proj = name == "matViewProj";
                 p.locations.back().is_sun_dir = name == "vSunDir";
                 p.locations.back().is_sun_color = name == "vSunColor";
             }
@@ -772,18 +779,15 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (!p || loc < 0 || (size_t)loc >= p->locations.size()) return;
     UniformLocation &l = p->locations[(size_t)loc];
     if ((l.texture_index[0] >= 0 || l.texture_index[1] >= 0) && data_is_int) l.unit = *(const GLint *)data;
-    if ((s_ao || s_contact_shadows) && (l.is_view_proj || l.is_sun_dir || l.is_sun_color) && count >= 1) {
-        // Other cameras (shadows, water reflection) and the UI set these too; only
-        // the values in use while the scene buffer is bound describe the scene.
+    if (s_contact_shadows && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
+        // The UI and other passes set these too; only the values in use while the
+        // scene buffer is bound describe the scene's sun.
         Target t;
         if (s_fbo != 0 && resolve_target(t) && t.scene) {
-            if (l.is_view_proj && components == 16) {
-                memcpy(s_view_proj, data, sizeof s_view_proj);
-                s_view_proj_valid = true;
-            } else if (l.is_sun_dir && components == 4) {
+            if (l.is_sun_dir) {
                 memcpy(s_sun_dir, data, sizeof s_sun_dir);
                 s_sun_valid = true;
-            } else if (l.is_sun_color && components == 4) {
+            } else {
                 memcpy(s_sun_color, data, sizeof s_sun_color);
             }
         }
@@ -1090,7 +1094,7 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
     float3 n = normalize(cross(dy, dx));
     if (dot(n, P) > 0.0) n = -n; // towards the camera
 
-    float radius_px = clamp(p.radius * p.p00 / P.z * 0.5 * p.ao_size.x, 2.0, 96.0 * p.ao_size.x / p.depth_size.x);
+    float radius_px = clamp(p.radius * abs(p.p00) / P.z * 0.5 * p.ao_size.x, 2.0, 96.0 * p.ao_size.x / p.depth_size.x);
     float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
     float bias = 0.02 + 0.004 * P.z;
     float sum = 0.0;
@@ -1238,53 +1242,40 @@ id<MTLRenderPipelineState> ao_apply_pipeline(MTLPixelFormat format, int samples)
 // render passes, with none open.
 void apply_ambient_occlusion()
 {
-    if (!s_view_proj_valid || !s_last.depth || !ao_setup()) return;
-
-    // The projection's depth terms and scales, read out of view-projection. With
-    // rows r0..r3 of that matrix: r3.xyz is the camera's forward direction, clip
-    // w is distance along it, and clip z = a * w + b.
-    const float *m = s_view_proj; // column-major: row r is m[r], m[4 + r], m[8 + r], m[12 + r]
-    auto row = [&](int r, float out[4]) {
-        for (int c = 0; c < 4; c++) out[c] = m[c * 4 + r];
-    };
-    float r0[4], r1[4], r2[4], r3[4];
-    row(0, r0), row(1, r1), row(2, r2), row(3, r3);
-    auto dot3 = [](const float *x, const float *y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
-    float forward2 = dot3(r3, r3);
-    if (forward2 < 1e-12f) return;
+    // Without this frame's camera there is nothing sound to compute with; a
+    // camera left over from another scene is worse than no effect.
+    if (s_camera.projection_frame != s_frame_serial || !s_last.depth || !ao_setup()) return;
     AOParams params;
-    params.a = dot3(r2, r3) / forward2;
-    params.b = r2[3] - params.a * r3[3];
-    params.p00 = sqrtf(dot3(r0, r0) / forward2);
-    params.p11 = sqrtf(dot3(r1, r1) / forward2);
-    if (!(fabsf(params.b) > 1e-6f) || !(params.p00 > 1e-4f)) {
-        complain("ambient occlusion: the camera matrix is not a perspective projection it understands");
-        return;
-    }
+    params.a = (float)s_camera.a;
+    params.b = (float)s_camera.b;
+    params.p00 = (float)s_camera.p00;
+    params.p11 = (float)s_camera.p11;
+    // Distances are in the scene's own units, and scenes differ in scale: a
+    // battlefield is life-size with a far plane around 1250, the world map a
+    // miniature with one around 300. The radius, fade distance and shadow
+    // length are scaled by the far plane so that they stay in proportion.
+    double far = fabs(1.0 - s_camera.a) > 1e-9 ? fabs(s_camera.b / (1.0 - s_camera.a)) : 1250.0;
+    float scale = (float)std::min(1.0, std::max(0.15, far / 1250.0));
     NSUInteger w = s_last.depth.width, h = s_last.depth.height;
     NSUInteger aw = s_ao_full ? w : (w + 1) / 2, ah = s_ao_full ? h : (h + 1) / 2;
     params.depth_size[0] = (float)w, params.depth_size[1] = (float)h;
     params.ao_size[0] = (float)aw, params.ao_size[1] = (float)ah;
-    params.radius = s_ao_radius;
+    params.radius = s_ao_radius * scale;
     params.strength = s_ao ? s_ao_strength : 0.0f;
-    // The sun in view space: rows 0, 1 and 3 of view-projection are the camera's
-    // right, up and forward axes, each scaled. vSunDir points the way the light
-    // travels, so the direction to the sun is its negative. No sun (night,
-    // interiors) means no contact shadows.
+    // vSunDir points the way the light travels, so the direction to the sun is
+    // its negative. No sun (night, interiors) means no contact shadows.
     memset(params.sun, 0, sizeof params.sun);
     params.shadow_strength = 0;
-    params.shadow_length = s_contact_length;
+    params.shadow_length = s_contact_length * scale;
     params.pad[0] = params.pad[1] = 0;
     float sun_brightness = s_sun_color[0] + s_sun_color[1] + s_sun_color[2];
-    if (s_contact_shadows && s_sun_valid && sun_brightness > 0.05f) {
-        float to_sun[3] = {-s_sun_dir[0], -s_sun_dir[1], -s_sun_dir[2]};
-        params.sun[0] = dot3(r0, to_sun) / sqrtf(dot3(r0, r0));
-        params.sun[1] = dot3(r1, to_sun) / sqrtf(dot3(r1, r1));
-        params.sun[2] = dot3(r3, to_sun) / sqrtf(forward2);
+    if (s_contact_shadows && s_sun_valid && sun_brightness > 0.05f && s_camera.view_frame == s_frame_serial) {
+        for (int r = 0; r < 3; r++)
+            params.sun[r] = (float)-(s_camera.view[r][0] * s_sun_dir[0] + s_camera.view[r][1] * s_sun_dir[1] + s_camera.view[r][2] * s_sun_dir[2]);
         params.shadow_strength = s_contact_strength;
     }
     params.reversed = s_reverse_depth ? 1.0f : 0.0f;
-    params.fade_start = 60.0f; // metres: beyond this the effect fades out, and is gone at twice it
+    params.fade_start = 60.0f * scale; // beyond this the effect fades out, and is gone at twice it
 
     if (!s_ao_texture || s_ao_texture.width != aw || s_ao_texture.height != ah) {
         auto make = [&](MTLPixelFormat format) {
@@ -1331,6 +1322,101 @@ void apply_ambient_occlusion()
     [pass setFragmentBytes:&params length:sizeof params atIndex:0];
     [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [pass endEncoding];
+}
+
+// ---- the scene camera ------------------------------------------------------------------
+
+// Column-major 4x4 matrices, as OpenGL passes them: element (row r, column c) is m[c * 4 + r].
+void mat_mul(const double *x, const double *y, double *out)
+{
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            double v = 0;
+            for (int k = 0; k < 4; k++) v += x[k * 4 + r] * y[c * 4 + k];
+            out[c * 4 + r] = v;
+        }
+}
+
+bool mat_inverse(const double *m, double *out)
+{
+    double inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (fabs(det) < 1e-30) return false;
+    for (int i = 0; i < 16; i++) out[i] = inv[i] / det;
+    return true;
+}
+
+// The current value of a mat4 uniform of the vertex stage, or false if the program has none by that name.
+bool vertex_matrix(Program &p, const char *name, double *out)
+{
+    auto it = p.location_by_name.find(name);
+    if (it == p.location_by_name.end()) return false;
+    const XlUniform *u = p.locations[(size_t)it->second].uniform[0];
+    if (!u || u->columns != 4 || u->components != 4) return false;
+    float m[16];
+    memcpy(m, p.uniform_data[0].data() + u->offset, sizeof m);
+    for (int i = 0; i < 16; i++) out[i] = m[i];
+    return true;
+}
+
+// Called for draws into the scene buffer until the camera is known for this
+// frame. The engine gives each program combined matrices, never the projection
+// on its own, and which combinations exist depends on the scene (the world map
+// never sets a view-projection, for one). Two that are nearly always there:
+//
+//   projection = (world-view-projection) x inverse(world-view)
+//   view       = (world-view) x inverse(world)
+//
+// Anything that does not come out as a perspective projection is ignored and
+// the next draw is tried.
+void observe_camera(Program &p)
+{
+    double wvp[16], wv[16], w[16], inv[16], m[16];
+    if (!vertex_matrix(p, "matWorldView", wv) || !mat_inverse(wv, inv)) return;
+    if (s_camera.projection_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp)) {
+        mat_mul(wvp, inv, m);
+        // Rows 2 and 3 of a perspective projection are (0, 0, A, B) and (0, 0, C, 0) with C = +-1.
+        double A = m[10], B = m[14], C = m[11], D = m[15];
+        bool perspective = fabs(fabs(C) - 1.0) < 0.01 && fabs(D) < 0.01 && fabs(m[3]) + fabs(m[7]) < 0.01 && fabs(B) > 1e-6 &&
+                           fabs(m[0]) > 1e-3 && fabs(m[5]) > 1e-3;
+        if (perspective) {
+            s_camera.a = A / C;
+            s_camera.b = B - s_camera.a * D;
+            s_camera.p00 = m[0];
+            s_camera.p11 = m[5];
+            s_camera.projection_frame = s_frame_serial;
+            // The third view axis is the direction in which w grows.
+            s_camera.view[2][0] = C;
+        }
+    }
+    if (s_camera.view_frame != s_frame_serial && s_camera.projection_frame == s_frame_serial && vertex_matrix(p, "matWorld", w) &&
+        mat_inverse(w, inv)) {
+        mat_mul(wv, inv, m);
+        double forward_sign = s_camera.view[2][0];
+        for (int r = 0; r < 3; r++) {
+            double x = m[r], y = m[4 + r], z = m[8 + r], len = sqrt(x * x + y * y + z * z);
+            if (len < 1e-9) return;
+            double sign = r == 2 ? forward_sign : 1.0;
+            s_camera.view[r][0] = sign * x / len, s_camera.view[r][1] = sign * y / len, s_camera.view[r][2] = sign * z / len;
+        }
+        s_camera.view_frame = s_frame_serial;
+    }
 }
 
 // Binds a buffer to a vertex (stage 0) or fragment (stage 1) slot, doing only
@@ -1477,6 +1563,7 @@ bool prepare_draw()
     }
     bind_buffer(0, s_constant_attrib, 0, CONSTANT_SLOT);
     s_last.draws++;
+    if (s_pass_scene && (s_ao || s_contact_shadows) && s_camera.view_frame != s_frame_serial) observe_camera(*p);
     return true;
 }
 
