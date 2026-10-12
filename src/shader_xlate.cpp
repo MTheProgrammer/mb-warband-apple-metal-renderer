@@ -579,7 +579,7 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
                  "void wbm_classify()\n{\n"
                  "    float known = " + k_xl_material_uniform + ".w;\n"
                  "    float hi = max(max(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b), lo = min(min(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b);\n"
-                 "    float grey = 1.0 - smoothstep(0.2, 0.5, (hi - lo) / max(hi, 0.08));\n"
+                 "    float grey = 1.0 - smoothstep(0.1, 0.28, (hi - lo) / max(hi, 0.08));\n"
                  "    float shiny = smoothstep(0.12, 0.3, wbm_debug_gloss);\n"
                  "    float most = known > 0.0 ? known - 1.0 : 0.8;\n"
                  "    float factor = known > 0.0 || wbm_metal_map >= 0.0 ? 1.0 : " + k_xl_material_uniform + ".x;\n"
