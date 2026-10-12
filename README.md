@@ -84,7 +84,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_TRACE` | `1` traces the calls in Metal mode too, at a cost in frame rate. Off by default there |
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
 | `WBM_SCALE` | Metal mode: resolution multiplier for the screen and screen-sized render targets. Defaults to the display's scale (2 on Retina); `1` renders at the game's own resolution, as OpenGL does |
-| `WBM_MSAA` | Metal mode: samples per pixel for the screen and screen-sized render targets, `2` or `4`. Smooths geometry edges, and alpha-tested edges (foliage, hair, fur) through a rewrite of the shaders' alpha tests. Default `1`, off |
+| `WBM_MSAA` | Metal mode: samples per pixel for the screen and screen-sized render targets, `2` or `4`. Smooths geometry edges, and alpha-tested edges (foliage, hair, fur) through a rewrite of the shaders' alpha tests. Default `4`; `1` turns it off |
 | `WBM_SHADOWS` | Metal mode: `0` keeps the game's own 4-sample shadow filter. By default shadows are filtered over a 4x4 block of shadow-map texels, for softer edges |
 | `WBM_CACHE` | Directory of the translated-shader cache. Default `~/Library/Caches/warband-metal`; `0` disables it |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |

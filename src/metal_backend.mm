@@ -944,7 +944,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     [s_white replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:white bytesPerRow:4];
     Texture defaults;
     sampler_for(defaults); // guarantees s_samplers is never empty
-    s_msaa = msaa_env ? atoi(msaa_env) : 1;
+    s_msaa = msaa_env ? atoi(msaa_env) : 4;
     if (s_msaa < 1 || ![s_device supportsTextureSampleCount:(NSUInteger)s_msaa]) {
         wb_note("  !! metal: WBM_MSAA=%s is not a sample count this GPU supports; multisampling is off", msaa_env);
         s_msaa = 1;

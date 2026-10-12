@@ -38,3 +38,15 @@ Metal never left the game's own limit, so its real ceiling is not measured yet.
 | Metal, Retina, `WBM_VSYNC=0` | `20261011-233952` | 76 s | 199 fps | 210 fps | 131 fps or less | 109 fps |
 
 OpenGL still stops at 120 fps: its vsync could not be turned off. The two battles were played by hand and are not identical; this OpenGL battle was lighter than the one in the earlier comparison (55-75 fps).
+
+## Rendering options, 2026-10-12
+
+Farmhouse battle on Metal at Retina resolution, `max_framerate = 120`, with a frame captured every 10 s (each capture stalls a frame, which accounts for most of the seconds below the limit):
+
+| Setting | Trace | Length | Seconds below 110 fps | Average in those seconds |
+|---|---|---|---|---|
+| Original shadows (`WBM_SHADOWS=0`) | `20261012-130903` | 93 s | 16 | 75 fps |
+| Soft shadows | `20261012-130456` | 94 s | 11 | 73 fps |
+| Soft shadows, 4x multisampling | `20261012-132700` | 71 s | 9 | 71 fps |
+
+Neither option has a cost that shows below the 120 fps limit. Their cost with the limit lifted has not been measured.
