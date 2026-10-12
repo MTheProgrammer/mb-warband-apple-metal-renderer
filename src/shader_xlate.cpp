@@ -828,6 +828,14 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
     vec2 centre = 0.5 + 0.28 * (vec2(fract(chance * 37.17), fract(chance * 91.73)) - 0.5) * 2.0;
     vec2 within = fract(at) - centre;
+    // A hair of the coat lies along the way the coat is combed, where the map
+    // knows it: seen from above it is longer that way than it is across.
+    vec2 lie = wbm_combed(root).xy;
+    float known = dot(lie, lie);
+    if (known > 0.01) {
+        lie /= sqrt(known);
+        within = vec2(dot(within, lie) / (1.0 + 1.6 * min(sqrt(known), 1.0)), dot(within, vec2(-lie.y, lie.x)));
+    }
     float tufts = 0.6 * wbm_noise(at / 9.0) + 0.4 * wbm_noise(at / 3.5 + 17.0);
     float length_ = (0.3 + 0.35 * chance + 0.35 * tufts) * mix(0.6, 1.0, grows.y);
     if (share > length_) return true;

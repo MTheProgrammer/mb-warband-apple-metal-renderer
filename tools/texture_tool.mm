@@ -437,14 +437,36 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         add_gradients(normal, 0, w, h, xx, xy, yy);
         add_gradients(normal, 1, w, h, xx, xy, yy);
     }
-    for (size_t i = 0; i < count; i++) xx[i] *= mask[i], xy[i] *= mask[i], yy[i] *= mask[i];
+    // The coat has a lie too: the painted strokes of the texture and the relief
+    // of the normal map run along it. So the direction is worked out wherever
+    // anything grows, not only in the long hair. How far it is to be trusted,
+    // which is how much the strokes agree with one another, goes into its length.
+    std::vector<float> grows(count);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            size_t i = (size_t)y * w + x;
+            const uint8_t *c = &base.px[i * 4];
+            float brightest = powf(std::max({c[0], c[1], c[2]}) / 255.0f, 2.2f);
+            float s = has_spec ? sample_luminance(spec, (x + 0.5f) / w, (y + 0.5f) / h) : 0;
+            float coat = coat_at(name, has_spec, s, (x + 0.5f) / w, (y + 0.5f) / h, brightest);
+            if (has_tack && tack_at(x, y) > 0.07f) coat = 0;
+            grows[i] = std::max(mask[i], coat);
+        }
+    }
+    for (size_t i = 0; i < count; i++) xx[i] *= grows[i], xy[i] *= grows[i], yy[i] *= grows[i];
     int radius = std::max(2, w / 110);
     blur(xx, w, h, radius), blur(xy, w, h, radius), blur(yy, w, h, radius);
-    std::vector<float> dx(count), dy(count);
+    std::vector<float> dx(count), dy(count), trust(count);
     for (size_t i = 0; i < count; i++) {
         float angle = 0.5f * atan2f(2 * xy[i], xx[i] - yy[i]) + 1.5707963f; // a right angle from the steepest change
         dx[i] = cosf(angle), dy[i] = sinf(angle);
+        float agree = sqrtf((xx[i] - yy[i]) * (xx[i] - yy[i]) + 4 * xy[i] * xy[i]) / (xx[i] + yy[i] + 1e-9f);
+        trust[i] = std::max(mask[i], std::min(1.0f, agree * 1.6f) * (grows[i] > 0.25f ? 1.0f : 0.0f));
     }
+    // On the coat, where the strokes are short and many, each place is simply
+    // pointed down the picture (or to the right, where it runs level).
+    for (size_t i = 0; i < count; i++)
+        if (mask[i] <= 0.5f && (dy[i] < -0.05f || (fabsf(dy[i]) <= 0.05f && dx[i] < 0))) dx[i] = -dx[i], dy[i] = -dy[i];
     // A strand's run does not say which end is the tip. Within each patch of
     // hair the choice is made the same way throughout, by spreading from one
     // pixel to its neighbours; and for the patch as a whole, the way that goes
@@ -489,8 +511,8 @@ static int hair_map(const std::string &picture, std::string name, const std::str
             if (has_tack && tack_at(x, y) > 0.07f) coat = 0; // saddle, straps and the like, as the second picture shows them
             float kind = std::max(coat * (1 - mask[i]), mask[i]);
             uint8_t *o = &map.px[i * 4];
-            o[0] = (uint8_t)lroundf(127.5f + 127.5f * dx[i] * mask[i]);
-            o[1] = (uint8_t)lroundf(127.5f + 127.5f * dy[i] * mask[i]);
+            o[0] = (uint8_t)lroundf(127.5f + 127.5f * dx[i] * trust[i]);
+            o[1] = (uint8_t)lroundf(127.5f + 127.5f * dy[i] * trust[i]);
             o[2] = (uint8_t)lroundf(kind * 255);
             covered += mask[i] > 0.5f;
         }
