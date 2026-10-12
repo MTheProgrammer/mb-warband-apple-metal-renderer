@@ -827,14 +827,30 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
         float strand = floor(across);
         float run = dot(root, along) * density / 16.0 + fract(sin(strand * 12.9898) * 43758.5453) * 9.0;
         float chance = fract(sin(dot(vec2(strand, floor(run)), vec2(12.9898, 78.233))) * 43758.5453);
-        float length_ = 0.5 + 0.5 * chance;
+        // Hair gathers into locks: several strands side by side share a length
+        // and a thickness, with thin gaps between one lock and the next that
+        // widen towards the tips, and a stray thin hair here and there.
+        float lock = floor(across / 7.0 + 0.6 * wbm_noise(vec2(across / 23.0, run * 0.08)));
+        float lock_chance = fract(sin(lock * 78.233) * 43758.5453);
+        float edge = abs(fract(across / 7.0 + 0.6 * wbm_noise(vec2(across / 23.0, run * 0.08))) - 0.5) * 2.0; // 0 mid-lock, 1 at its edge
+        float length_ = (0.45 + 0.55 * lock_chance) * (0.85 + 0.15 * chance);
         if (share > length_) return true;
-        return abs(fract(across) - 0.5) > 0.5 * (1.0 - 0.6 * share / length_);
+        if (edge > 1.0 - 0.35 * share / length_) return chance > 0.12; // the gap, but for a stray hair
+        float thick = mix(0.25, 0.5, fract(lock_chance * 13.7)) * (1.0 - 0.5 * share / length_);
+        return abs(fract(across) - 0.5) > thick;
     }
     // Hairs on a plain grid make stripes with the layers and with the mesh's
     // own triangles. So each hair stands off the middle of its cell by a
     // chance amount, and how long the hairs are varies smoothly from place to
     // place, in tufts, as well as from hair to hair.
+    // A hair smaller than a pixel is haze. Farther off, where the pixels are
+    // larger on the horse, there are fewer hairs and they are thicker: the
+    // count is halved as often as it takes for a hair's cell to span a pixel
+    // and a half, the two nearest counts being blended by which hairs are let through.
+    float pixel = max(length(dFdx(root)), length(dFdy(root))) * density; // cells to the pixel
+    float halvings = max(0.0, log2(max(pixel * 1.5, 1e-6)));
+    float coarser = floor(halvings), between = halvings - coarser;
+    density /= exp2(coarser);
     vec2 at = root * density;
     vec2 cell = floor(at);
     float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
@@ -851,7 +867,9 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     float tufts = 0.6 * wbm_noise(at / 9.0) + 0.4 * wbm_noise(at / 3.5 + 17.0);
     float length_ = (0.3 + 0.35 * chance + 0.35 * tufts) * mix(0.6, 1.0, grows.y);
     if (share > length_) return true;
-    float thickness = 0.36 * (1.0 - 0.75 * share / length_);
+    // Towards the next halving, the hairs that will not survive it go, and the rest grow to fill in.
+    if (fract(chance * 5.31) < between * 0.75 && (mod(cell.x, 2.0) > 0.5 || mod(cell.y, 2.0) > 0.5)) return true;
+    float thickness = (0.36 + 0.1 * between) * (1.0 - 0.75 * share / length_);
     return dot(within, within) > thickness * thickness;
 }
 
