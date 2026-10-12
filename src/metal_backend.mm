@@ -8,6 +8,7 @@
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CABase.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <atomic>
@@ -270,6 +271,9 @@ bool s_ao_full; // WBM_AO_FULL: compute at the depth buffer's full resolution in
 struct Camera {
     double a = 0, b = 0, p00 = 1, p11 = 1, view[3][3] = {};
     uint64_t projection_frame = 0, view_frame = 0;
+    // World space to clip space, for this frame and the one before (motion blur).
+    double view_proj[16] = {}, last_view_proj[16] = {};
+    uint64_t view_proj_frame = 0, last_view_proj_frame = 0;
 };
 Camera s_camera;
 bool s_pass_scene, s_pass_prepass, s_pass_shadow_map;
@@ -304,6 +308,10 @@ uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
 bool s_sun_valid;
 void apply_ambient_occlusion();
+// Motion blur from the camera's own movement (WBM_MOTION_BLUR=1): see apply_motion_blur.
+bool s_motion_blur;
+float s_motion_blur_strength = 1.0f; // WBM_MOTION_BLUR_STRENGTH: exposure time in units of 1/48 s
+void apply_motion_blur();
 
 void reset_pass_state()
 {
@@ -468,10 +476,11 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     end_pass();
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
-    if ((s_ao || s_contact_shadows || s_light_shafts) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
-        apply_ambient_occlusion();
+        if (s_ao || s_contact_shadows || s_light_shafts) apply_ambient_occlusion();
+        if (s_motion_blur) apply_motion_blur();
     }
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (t.color) {
@@ -1544,6 +1553,13 @@ bool vertex_matrix(Program &p, const char *name, double *out)
 void observe_camera(Program &p)
 {
     double wvp[16], wv[16], w[16], inv[16], m[16];
+    if (s_motion_blur && s_camera.view_proj_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp) &&
+        vertex_matrix(p, "matWorld", w) && mat_inverse(w, inv)) {
+        memcpy(s_camera.last_view_proj, s_camera.view_proj, sizeof s_camera.view_proj);
+        s_camera.last_view_proj_frame = s_camera.view_proj_frame;
+        mat_mul(wvp, inv, s_camera.view_proj);
+        s_camera.view_proj_frame = s_frame_serial;
+    }
     if (!vertex_matrix(p, "matWorldView", wv) || !mat_inverse(wv, inv)) return;
     if (s_camera.projection_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp)) {
         mat_mul(wvp, inv, m);
@@ -1573,6 +1589,200 @@ void observe_camera(Program &p)
         }
         s_camera.view_frame = s_frame_serial;
     }
+}
+
+// ---- motion blur ------------------------------------------------------------------------
+//
+// Blur from the camera's own movement. A pixel's depth gives its place in the
+// world; the previous frame's camera says where on screen that place was a
+// frame ago; the scene is smeared along the line between the two. Things that
+// move by themselves are not known to move, so a sword's swing is not blurred,
+// and whatever travels with the camera (the player's character, a horse) would
+// be blurred as if it stood still in the world. That is avoided by distance:
+// nothing closer than a few metres is blurred or smeared into what is.
+
+const char k_blur_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Params {
+    float4x4 reproject; // this frame's clip space to the previous frame's
+    float4 inverse_w;   // dot with a clip-space point at w = 1: one over its distance from the camera
+    float2 size;        // of the scene, in pixels
+    float reversed;
+    float exposure;     // in frames
+    float near_start, near_end; // distances between which the blur fades in
+    float max_length;   // in screen heights
+    float pad;
+};
+
+#if WBM_MSAA
+typedef depth2d_ms<float> DepthTexture;
+#else
+typedef depth2d<float> DepthTexture;
+#endif
+
+struct VertexOut {
+    float4 position [[position]];
+};
+
+vertex VertexOut blur_vertex(uint id [[vertex_id]])
+{
+    VertexOut out;
+    out.position = float4(float2((id << 1) & 2, id & 2) * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+// The pixel as a point in OpenGL clip space with w = 1. Textures are stored in
+// OpenGL's row order, so v grows with clip-space y.
+static float4 clip_point(DepthTexture depth, float2 pixel, Params p)
+{
+    uint2 c = uint2(clamp(pixel, float2(0.0), p.size - 1.0));
+    float d = depth.read(c, 0);
+    return float4(pixel / p.size * 2.0 - 1.0, p.reversed > 0.5 ? 1.0 - 2.0 * d : 2.0 * d - 1.0, 1.0);
+}
+
+static float blurred(float4 n, Params p)
+{
+    float inverse = dot(p.inverse_w, n);
+    float distance = inverse > 1.0e-9 ? 1.0 / inverse : 1.0e9;
+    return smoothstep(p.near_start, p.near_end, distance);
+}
+
+fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]], DepthTexture depth [[texture(1)]],
+                              constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    float2 uv = in.position.xy / p.size;
+    float4 centre = scene.sample(smooth, uv);
+    float4 n = clip_point(depth, in.position.xy, p);
+    float amount = blurred(n, p);
+    float4 before = p.reproject * n;
+    if (amount <= 0.0 || before.w <= 1.0e-6) return centre;
+    float2 velocity = (n.xy - before.xy / before.w) * 0.5 * p.exposure * amount; // in uv, per exposure
+    float aspect = p.size.x / p.size.y;
+    float length_ = length(velocity * float2(aspect, 1.0));
+    if (length_ * p.size.y < 0.75) return centre;
+    velocity *= min(1.0, p.max_length / length_);
+
+    const int samples = 10;
+    float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+    float3 sum = centre.rgb;
+    float weight = 1.0;
+    for (int i = 0; i < samples; i++) {
+        float t = (float(i) + noise) / float(samples) - 0.5;
+        float2 q = uv + velocity * t;
+        if (any(q < float2(0.0)) || any(q > float2(1.0))) continue;
+        float w = blurred(clip_point(depth, q * p.size, p), p); // near things keep their colour to themselves
+        sum += scene.sample(smooth, q).rgb * w;
+        weight += w;
+    }
+    return float4(sum / weight, centre.a);
+}
+)";
+
+struct BlurParams { // must match Params in k_blur_source
+    float reproject[16];
+    float inverse_w[4];
+    float size[2];
+    float reversed, exposure, near_start, near_end, max_length, pad;
+};
+
+id<MTLLibrary> s_blur_library;
+std::map<int, id<MTLRenderPipelineState>> s_blur_pipelines; // by colour format
+id<MTLTexture> s_blur_texture;
+double s_blur_time;
+uint64_t s_blur_frames;
+
+// Called between render passes, once the engine has finished the scene, after
+// the other effects on it.
+void apply_motion_blur()
+{
+    double now = CACurrentMediaTime(), frame_time = now - s_blur_time;
+    s_blur_time = now;
+    // Needs this frame's camera and the previous frame's; after a gap (a menu,
+    // a loading screen) the two have nothing to do with each other.
+    if (s_camera.view_proj_frame != s_frame_serial || s_camera.last_view_proj_frame + 1 != s_frame_serial || !s_last.depth || !s_last.color) return;
+    if (frame_time <= 0 || frame_time > 0.1) return;
+    double inverse[16], reproject[16];
+    if (!mat_inverse(s_camera.view_proj, inverse)) return;
+    mat_mul(s_camera.last_view_proj, inverse, reproject);
+    // Nothing to do while the camera is still. And a jump (a cut to another
+    // view) is no movement: the far point straight ahead would cross the screen.
+    double change = 0;
+    for (int i = 0; i < 16; i++) change = std::max(change, fabs(reproject[i] - (i % 5 == 0 ? reproject[15] : 0.0)));
+    if (change < 1e-7 * fabs(reproject[15])) return;
+    double qw = reproject[11] + reproject[15];
+    if (qw <= 1e-9) return;
+    double jump = hypot((reproject[8] + reproject[12]) / qw, (reproject[9] + reproject[13]) / qw);
+    if (jump > 0.5) return;
+
+    if (!s_blur_library) {
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        options.preprocessorMacros = @{@"WBM_MSAA" : @(s_last.depth.sampleCount > 1 ? 1 : 0)};
+        NSError *error = nil;
+        s_blur_library = [s_device newLibraryWithSource:@(k_blur_source) options:options error:&error];
+        if (!s_blur_library) {
+            complain("motion blur shaders did not compile: %s", error.localizedDescription.UTF8String);
+            s_motion_blur = false;
+            return;
+        }
+    }
+    id<MTLRenderPipelineState> __strong &pipeline = s_blur_pipelines[(int)s_last.color.pixelFormat];
+    if (!pipeline) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [s_blur_library newFunctionWithName:@"blur_vertex"];
+        d.fragmentFunction = [s_blur_library newFunctionWithName:@"blur_fragment"];
+        d.colorAttachments[0].pixelFormat = s_last.color.pixelFormat;
+        NSError *error = nil;
+        pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!pipeline) {
+            complain("motion blur pipeline failed: %s", error.localizedDescription.UTF8String);
+            s_motion_blur = false;
+            return;
+        }
+    }
+    NSUInteger w = s_last.color.width, h = s_last.color.height;
+    if (s_last.depth.width != w || s_last.depth.height != h) return;
+    if (!s_blur_texture || s_blur_texture.width != w || s_blur_texture.height != h || s_blur_texture.pixelFormat != s_last.color.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s_last.color.pixelFormat width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_blur_texture = [s_device newTextureWithDescriptor:td];
+    }
+
+    BlurParams params;
+    for (int i = 0; i < 16; i++) params.reproject[i] = (float)reproject[i];
+    for (int c = 0; c < 4; c++) params.inverse_w[c] = (float)inverse[c * 4 + 3];
+    params.size[0] = (float)w, params.size[1] = (float)h;
+    params.reversed = s_reverse_depth ? 1.0f : 0.0f;
+    // The exposure is a length of time, not a share of the frame, so that the
+    // blur looks the same at any frame rate.
+    params.exposure = (float)(s_motion_blur_strength / 48.0 / std::max(frame_time, 1.0 / 240.0));
+    // Scenes differ in scale (see apply_ambient_occlusion); distances follow the far plane.
+    double far_inverse = inverse[11] + inverse[15], far = fabs(far_inverse) > 1e-9 ? fabs(1.0 / far_inverse) : 1250.0;
+    float scale = (float)std::min(1.0, std::max(0.15, far / 1250.0));
+    params.near_start = 5.0f * scale;
+    params.near_end = 10.0f * scale;
+    params.max_length = 0.04f;
+    params.pad = 0;
+
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_blur_texture;
+    d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:pipeline];
+    [pass setFragmentTexture:s_last.color atIndex:0];
+    [pass setFragmentTexture:s_last.depth atIndex:1];
+    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+    id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+    [blit copyFromTexture:s_blur_texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                toTexture:s_last.color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    s_blur_frames++;
 }
 
 // Binds a buffer to a vertex (stage 0) or fragment (stage 1) slot, doing only
@@ -1647,8 +1857,9 @@ uint64_t mesh_id(NSUInteger count, NSUInteger index_offset)
 
 // Some of what the pre-pass draws is not part of the world at all: the aiming
 // mark, for one. The main pass gives such things away by drawing them on top of
-// everything, without a depth test or without writing depth, and a mesh seen
-// drawn that way is kept out of the map from the next frame on.
+// everything, without a depth test, and a mesh seen drawn that way is kept out
+// of the map from the next frame on. (Not writing depth is no such sign: grass
+// is drawn that way, and grass should cast.)
 std::unordered_set<uint64_t> s_overlays;
 
 void record_overlay(NSUInteger count, NSUInteger index_offset)
@@ -2109,7 +2320,9 @@ bool prepare_draw()
     s_draw_binding = binding;
     if (s_dyn_shadows && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world)
         render_dynamic_shadows(*p);
-    if (s_pass_scene && (s_ao || s_contact_shadows || s_light_shafts) && s_camera.view_frame != s_frame_serial) observe_camera(*p);
+    if (s_pass_scene && (((s_ao || s_contact_shadows || s_light_shafts) && s_camera.view_frame != s_frame_serial) ||
+                         (s_motion_blur && s_camera.view_proj_frame != s_frame_serial)))
+        observe_camera(*p);
     return true;
 }
 
@@ -2335,6 +2548,9 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_dyn_shadows = s_shader_options.dynamic_shadows = dyn_env && atoi(dyn_env) != 0; // off unless set
     if (const char *v = getenv("WBM_DYN_RANGE")) s_dyn_range = std::max(5.0f, (float)atof(v));
     if (const char *v = getenv("WBM_DYN_BIAS")) s_dyn_bias_m = (float)atof(v);
+    const char *blur_env = getenv("WBM_MOTION_BLUR");
+    s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_MOTION_BLUR_STRENGTH")) s_motion_blur_strength = std::max(0.0f, (float)atof(v));
     const char *shafts_env = getenv("WBM_LIGHT_SHAFTS");
     s_light_shafts = shafts_env && atoi(shafts_env) != 0; // off unless set
     if (const char *v = getenv("WBM_SHAFT_STRENGTH")) s_shaft_strength = (float)atof(v);
@@ -2389,11 +2605,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "contact shadows %s; light shafts %s; per-frame shadow map %s; filmic tone map %s; extended-range output %s",
+            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_sky ? "on, with metalness and sky reflection" : s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off",
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off",
             s_shader_options.filmic_tonemap ? "on" : "off",
             s_hdr ? "on" : "off");
 }
@@ -2413,6 +2629,7 @@ void mtl_dump_stats(FILE *f)
             (unsigned long long)s_call_stats.made, (unsigned long long)s_call_stats.skipped);
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
+    if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
     if (s_dyn_stats.frames)
         fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average, %.0f more left out as scenery\n"
                    "%llu draws left out as overlays, %zu overlay meshes known at exit\n",
@@ -2978,7 +3195,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
         if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset);
         if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);
-        if (s_dyn_shadows && s_pass_scene && (!s_depth_test || !s_depth_mask)) record_overlay((NSUInteger)count, offset);
+        if (s_dyn_shadows && s_pass_scene && !s_depth_test) record_overlay((NSUInteger)count, offset);
         // The engine draws the sky first, with the depth test off. That draw is the one to capture.
         if (s_shader_options.pbr_sky && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
             capture_sky(primitive, (NSUInteger)count, index_type, b->mtl, offset);

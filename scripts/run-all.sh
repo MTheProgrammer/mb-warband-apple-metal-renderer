@@ -10,6 +10,7 @@ export WBM_SRGB=${WBM_SRGB:-1}        # hardware sRGB texture decoding
 export WBM_AO=${WBM_AO:-1}            # ambient occlusion
 export WBM_CONTACT_SHADOWS=${WBM_CONTACT_SHADOWS:-1}  # screen-space contact shadows
 export WBM_LIGHT_SHAFTS=${WBM_LIGHT_SHAFTS:-1}  # light shafts from the sun
+export WBM_MOTION_BLUR=${WBM_MOTION_BLUR:-1}    # blur from the camera's movement
 export WBM_TONEMAP=${WBM_TONEMAP:-1}  # filmic tone map
 export WBM_HDR=${WBM_HDR:-1}          # extended-range output on HDR displays
 exec "$(dirname "$0")/run.sh" "$@"
