@@ -15,13 +15,22 @@ Metal also draws at the display's native resolution, four times the pixels of th
 
 ## Using it
 
-1. Download `warband-metal-<version>.zip` from the Releases page and unzip it.
-2. macOS blocks apps that were downloaded and are not signed by a registered developer, and this one is not. Either run this once in Terminal:
+You do not need to compile anything. A ready-made app is on the Releases page.
 
-       xattr -dr com.apple.quarantine "Warband Metal.app"
+1. Download `warband-metal-<version>.zip` from the Releases page. Safari unzips it for you; otherwise double-click the zip. You get `Warband Metal.app`.
+2. Allow the app to run. macOS blocks apps that were downloaded and are not signed by a registered Apple developer, and this one is not, so the first double-click only shows a warning. Do one of the following, once:
 
-   or try to open the app, then go to System Settings → Privacy & Security and choose "Open Anyway".
-3. Open `Warband Metal.app`. It starts the game on Metal. If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once.
+   **With Terminal** (the route that is known to work). Open Terminal, paste this and press Return:
+
+       xattr -dr com.apple.quarantine ~/Downloads/"Warband Metal.app"
+
+   If the app is not in Downloads, type `xattr -dr com.apple.quarantine ` with a space at the end, drag the app onto the Terminal window, and press Return. The command removes the "downloaded from the internet" mark from the app; it changes nothing else.
+
+   **Without Terminal.** Double-click the app and close the warning. Open System Settings → Privacy & Security, scroll down to Security, and click "Open Anyway" next to the message about Warband Metal. Confirm with your password or Touch ID, then open the app again. This route has not been verified; if the game still does not start afterwards, use the Terminal command.
+
+3. Double-click `Warband Metal.app`. It starts the game on Metal. If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once and remembers it.
+
+You can keep the app anywhere, for example in Applications.
 
 The module and the graphics options are still set in the game's own launcher, the window Steam's Play button opens: the game reads them when it starts, whichever way it is started.
 
