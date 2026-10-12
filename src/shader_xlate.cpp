@@ -795,12 +795,26 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     // layers hang by being moved (see add_shell_push), not by reaching across
     // the texture, where a leg may be painted beside the tail.
     if (long_ && wbm_grows(uv).y < 0.5) return true;
+    if (long_) {
+        // Seen close, a hair cut through by a layer must not show as a dot: in
+        // each layer a long hair is a streak lying the way it is combed, many
+        // times longer than it is wide, so that the layers together make strands.
+        vec2 along = wbm_combed(root).xy;
+        along = dot(along, along) > 0.04 ? normalize(along) : vec2(0.0, -1.0);
+        float across = dot(root, vec2(-along.y, along.x)) * density;
+        float strand = floor(across);
+        float run = dot(root, along) * density / 16.0 + fract(sin(strand * 12.9898) * 43758.5453) * 9.0;
+        float chance = fract(sin(dot(vec2(strand, floor(run)), vec2(12.9898, 78.233))) * 43758.5453);
+        float length_ = 0.5 + 0.5 * chance;
+        if (share > length_) return true;
+        return abs(fract(across) - 0.5) > 0.5 * (1.0 - 0.6 * share / length_);
+    }
     vec2 at = root * density;
     vec2 cell = floor(at), within = fract(at) - 0.5;
     float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
-    float length_ = long_ ? 0.45 + 0.55 * chance : (0.35 + 0.65 * chance) * mix(0.6, 1.0, grows.y);
+    float length_ = (0.35 + 0.65 * chance) * mix(0.6, 1.0, grows.y);
     if (share > length_) return true;
-    float thickness = 0.5 * (1.0 - (long_ ? 0.55 : 0.75) * share / length_);
+    float thickness = 0.5 * (1.0 - 0.75 * share / length_);
     return dot(within, within) > thickness * thickness;
 }
 
