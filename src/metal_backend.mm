@@ -4495,6 +4495,11 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             if (Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr)
                 record_hair_casters(*fp, *coat, (NSUInteger)count, index_type, b->mtl, offset);
         }
+        // The coat's layers are tested against the depth of the body but leave
+        // none of their own: ambient occlusion and contact shadows, which work
+        // from depth, would take the gaps between hairs for pits and speckle the horse.
+        bool depth_mask = s_depth_mask;
+        if (shells) s_depth_mask = false;
         for (int layer = 1; layer <= shells; layer++) {
             float share = (float)layer / (float)shells;
             const float now[4] = {s_fur_length * share, share, s_fur_density, clock};
@@ -4503,6 +4508,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
             s_shell_draws++;
         }
+        s_depth_mask = depth_mask; // mane and tail do leave depth: their layers hang far from the body and must hide one another
         // Mane and tail: layers of their own, reaching much farther out (see wbm_shell_bare).
         for (int layer = 1; long_hair && layer <= shells * 2; layer++) {
             float share = (float)layer / (float)(shells * 2);
