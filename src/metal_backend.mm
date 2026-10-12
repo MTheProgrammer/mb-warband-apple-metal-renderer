@@ -90,6 +90,8 @@ struct UniformLocation {
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
+    bool is_dyn_map = false;                          // the wbm_dyn_map sampler, which gets the per-frame shadow map
+    bool is_sun_matrix = false;                       // matSunViewProj, the engine's shadow-space matrix
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
 
@@ -122,6 +124,12 @@ struct Program {
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
+    int dyn_window_offset = -1, dyn_bias_offset = -1; // fragment stage, see k_xl_dyn_sampler
+    // For the per-frame shadow map (see record_caster). The engine marks a
+    // character's ground shadow, which that map replaces, with one blur constant.
+    const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
+    int alpha_texture_location = -1;
+    bool is_blob_shadow = false;
     uint32_t input_mask = 0; // attribute locations the vertex shader reads
     std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines;
 };
@@ -263,7 +271,22 @@ struct Camera {
     uint64_t projection_frame = 0, view_frame = 0;
 };
 Camera s_camera;
-bool s_pass_scene;
+bool s_pass_scene, s_pass_prepass;
+
+// The per-frame shadow map (WBM_DYNAMIC_SHADOWS=1): see record_caster and render_dynamic_shadows.
+bool s_dyn_shadows;
+float s_dyn_range = 60.0f;     // WBM_DYN_RANGE: half the width of the window, in metres
+float s_dyn_bias_m = 0.05f;    // WBM_DYN_BIAS: metres
+float s_sun_matrix[16];        // matSunViewProj as last set for the scene
+bool s_sun_matrix_valid;
+float s_dyn_window[4];         // what shaders get as wbm_dyn; z = 0 until a map exists
+float s_dyn_bias;
+uint64_t s_dyn_frame;          // the frame the map was last drawn in
+id<MTLTexture> s_dyn_map, s_dyn_depth;
+id<MTLSamplerState> s_dyn_sampler;
+struct {
+    uint64_t frames, casters;
+} s_dyn_stats;
 // Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
 // pass as ambient occlusion. They need the sun: its direction and colour as
 // last given to a shader while the scene was being drawn.
@@ -371,6 +394,7 @@ struct Target {
     id<MTLTexture> ms_color;     // what is rendered into when multisampled
     bool screen = false;
     bool scene = false; // the engine's HDR scene buffer: screen-sized, RGBA16F, with depth
+    bool prepass = false; // the engine's depth pre-pass: screen-sized, R16F, with depth
     int scale = 1, samples = 1;
 };
 
@@ -423,6 +447,8 @@ bool resolve_target(Target &t)
     if (!t.color && t.depth) t.samples = (int)t.depth.sampleCount;
     if (Texture *tex = find(s_textures, fb->color_texture))
         t.scene = tex->screen_sized && tex->format == MTLPixelFormatRGBA16Float && t.depth != nil;
+    if (Texture *tex = find(s_textures, fb->color_texture))
+        t.prepass = tex->screen_sized && tex->format == MTLPixelFormatR16Float && t.depth != nil;
     if (t.color && t.depth && (int)t.depth.sampleCount != t.samples) {
         complain("framebuffer mixes a %d-sample colour target with a %d-sample depth buffer; depth is ignored", t.samples,
                  (int)t.depth.sampleCount);
@@ -473,6 +499,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_samples = t.samples;
     if (t.scene) s_scene_frame = s_frame_serial;
     s_pass_scene = t.scene;
+    s_pass_prepass = t.prepass;
     if (s_last.color != t.color) s_last.draws = 0; // a clear restarts the pass on the same target; keep counting
     s_last.color = t.color;
     s_last.ms_color = t.ms_color;
@@ -693,7 +720,9 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = -1;
+    p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_bias_offset = -1;
+    p.u_wvp = p.u_world = p.u_bones = nullptr;
+    p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
     std::string vs, fs;
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
@@ -741,6 +770,8 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.back().is_sun_dir = name == "vSunDir";
                 p.locations.back().is_sun_color = name == "vSunColor";
                 p.locations.back().is_sky = name == k_xl_sky_sampler;
+                p.locations.back().is_dyn_map = name == k_xl_dyn_sampler;
+                p.locations.back().is_sun_matrix = name == "matSunViewProj";
             }
             return p.locations[(size_t)it->second];
         };
@@ -749,6 +780,8 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
             else if (u.name == k_xl_limit_uniform) p.limit_offset = u.offset;
+            else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
+            else if (u.name == k_xl_dyn_bias_uniform) p.dyn_bias_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -756,6 +789,16 @@ void link_program(GLuint program_id, Program &p)
         p.uniform_dirty[s] = true;
         p.pushed_frame[s] = 0;
     }
+    auto vertex_uniform = [&](const char *name) -> const XlUniform * {
+        auto it = p.location_by_name.find(name);
+        return it == p.location_by_name.end() ? nullptr : p.locations[(size_t)it->second].uniform[0];
+    };
+    p.u_wvp = vertex_uniform("matWorldViewProj");
+    p.u_world = vertex_uniform("matWorld");
+    p.u_bones = vertex_uniform("matWorldArray");
+    auto diffuse = p.location_by_name.find("diffuse_texture");
+    if (diffuse != p.location_by_name.end() && p.locations[(size_t)diffuse->second].texture_index[1] >= 0) p.alpha_texture_location = diffuse->second;
+    p.is_blob_shadow = fs.find("0.0234375") != std::string::npos;
     p.input_mask = 0;
     for (int loc : p.xl.vs.input_locations)
         if (loc >= 0 && loc < MAX_ATTRIBS) p.input_mask |= 1u << loc;
@@ -789,6 +832,10 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (!p || loc < 0 || (size_t)loc >= p->locations.size()) return;
     UniformLocation &l = p->locations[(size_t)loc];
     if ((l.texture_index[0] >= 0 || l.texture_index[1] >= 0) && data_is_int) l.unit = *(const GLint *)data;
+    if (s_dyn_shadows && l.is_sun_matrix && components == 16 && count >= 1) {
+        memcpy(s_sun_matrix, data, sizeof s_sun_matrix); // the same for every program in a scene
+        s_sun_matrix_valid = true;
+    }
     if ((s_contact_shadows || s_light_shafts) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
         // The UI and other passes set these too; only the values in use while the
         // scene buffer is bound describe the scene's sun.
@@ -1544,6 +1591,338 @@ void bind_buffer(int stage, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger 
     }
 }
 
+// ---- the per-frame shadow map -------------------------------------------------------------
+//
+// Before its main pass the engine draws every visible object once into a depth
+// buffer (when "depth effects" are on). Those draws are recorded here, and then
+// drawn again from the sun's direction into a shadow map of the shim's own, so
+// that characters, horses and their gear cast shadows on everything, at any
+// distance, where the engine gives them only a decal on the ground.
+//
+// The map lives in the engine's own shadow space, the one its matSunViewProj
+// maps the world into, restricted to a window around the camera. A shader's
+// existing shadow coordinate therefore indexes it directly (see k_xl_dyn_sampler).
+//
+// To move a recorded draw there, its world-view-projection has to be turned
+// back into a world transform, which needs the camera's view-projection. The
+// pre-pass shaders are never given that, so the map is drawn at the first draw
+// of the main pass whose program has both a world-view-projection and a world
+// matrix (the sky dome, normally the very first): view-projection is then
+// WVP x inverse(W), exact for this frame. It is drawn in a command buffer of
+// its own, committed at once, since a render pass is open on the main one.
+
+struct CasterDraw {
+    PipelineKey key;          // vertex layout; the other fields are zero
+    id<MTLBuffer> vertex[MAX_VERTEX_SLOTS];
+    NSUInteger vertex_offset[MAX_VERTEX_SLOTS];
+    int slots;
+    id<MTLBuffer> indices;
+    NSUInteger index_offset, index_count;
+    MTLIndexType index_type;
+    float wvp[16];
+    int bones;                // index into s_caster_bones of 32 matrices, or -1
+    id<MTLTexture> alpha;     // set for alpha-tested geometry
+    id<MTLSamplerState> alpha_sampler;
+};
+std::vector<CasterDraw> s_casters;
+std::vector<float> s_caster_bones;
+
+const char k_caster_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+// m takes object space to the engine's shadow space: map coordinates in x and
+// y, the depth its shaders compare against in z.
+struct Caster {
+    float4x4 m;
+    float4 window; // xy: centre, zw: 2 / (width, height), all in map coordinates
+};
+struct SkinnedCaster {
+    float4x4 m;
+    float4 window;
+    float4x4 bones[32];
+};
+struct StaticIn {
+    float3 position [[attribute(0)]];
+    float2 uv [[attribute(4)]];
+};
+struct SkinnedIn {
+    float3 position [[attribute(0)]];
+    float2 uv [[attribute(4)]];
+    float4 weights [[attribute(7)]];
+    float4 indices [[attribute(8)]];
+};
+struct Out {
+    float4 position [[position]];
+    float depth;
+    float2 uv;
+};
+
+// Rows of the map are stored in OpenGL's order like every other texture the
+// renderer draws, hence the flipped y. The depth buffer only has to order the
+// casters; the comparison value is written as colour, unscaled.
+static Out finish(float4 s, float2 uv, float4 window)
+{
+    float3 q = s.xyz / s.w;
+    Out out;
+    out.position = float4((q.x - window.x) * window.z, -(q.y - window.y) * window.w, clamp(q.z * 0.25 + 0.5, 0.0, 1.0), 1.0);
+    out.depth = q.z;
+    out.uv = uv;
+    return out;
+}
+
+vertex Out caster_static(StaticIn in [[stage_in]], constant Caster &c [[buffer(0)]])
+{
+    return finish(c.m * float4(in.position, 1.0), in.uv, c.window);
+}
+
+vertex Out caster_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]])
+{
+    float4 p = float4(in.position, 1.0);
+    float4 skinned = c.bones[int(in.indices.x)] * p * in.weights.x + c.bones[int(in.indices.y)] * p * in.weights.y +
+                     c.bones[int(in.indices.z)] * p * in.weights.z + c.bones[int(in.indices.w)] * p * in.weights.w;
+    return finish(c.m * skinned, in.uv, c.window);
+}
+
+fragment float4 caster_opaque(Out in [[stage_in]])
+{
+    return float4(in.depth);
+}
+
+fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[texture(0)]], sampler s [[sampler(0)]])
+{
+    if (diffuse.sample(s, in.uv).a < 0.03137255) discard_fragment(); // the engine's own threshold in its pre-pass
+    return float4(in.depth);
+}
+)";
+
+id<MTLLibrary> s_caster_library;
+id<MTLDepthStencilState> s_caster_depth_state;
+std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[4]; // [skinned * 2 + cutout]
+
+// Called for each draw of the engine's depth pre-pass, after it has been issued.
+void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset)
+{
+    Program *p = find(s_programs, s_program);
+    if (!p || !p->u_wvp || s_casters.size() >= 20000) return;
+    CasterDraw c{};
+    memcpy(c.key.format, s_last_key.format, sizeof c.key.format);
+    memcpy(c.key.slot, s_last_key.slot, sizeof c.key.slot);
+    memcpy(c.key.offset, s_last_key.offset, sizeof c.key.offset);
+    memcpy(c.key.stride, s_last_key.stride, sizeof c.key.stride);
+    if (!c.key.format[0]) return; // no position
+    c.slots = s_draw_binding.slots;
+    for (int i = 0; i < c.slots; i++) {
+        Buffer *b = find(s_buffers, s_draw_binding.buffer[i]);
+        if (!b || !b->mtl) return;
+        c.vertex[i] = b->mtl;
+        c.vertex_offset[i] = s_draw_binding.base[i];
+    }
+    c.indices = indices;
+    c.index_offset = index_offset;
+    c.index_count = count;
+    c.index_type = index_type;
+    memcpy(c.wvp, p->uniform_data[0].data() + p->u_wvp->offset, sizeof c.wvp);
+    c.bones = -1;
+    if (p->u_bones && c.key.format[7] && c.key.format[8]) {
+        c.bones = (int)(s_caster_bones.size() / (32 * 16));
+        size_t at = s_caster_bones.size();
+        s_caster_bones.resize(at + 32 * 16);
+        size_t bytes = std::min<size_t>(32 * 64, p->uniform_data[0].size() - (size_t)p->u_bones->offset);
+        memcpy(&s_caster_bones[at], p->uniform_data[0].data() + p->u_bones->offset, bytes);
+    }
+    if (p->alpha_texture_location >= 0) {
+        UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
+        Texture *t = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+        if (t && t->mtl) {
+            c.alpha = t->mtl;
+            c.alpha_sampler = sampler_for(*t);
+        }
+    }
+    s_casters.push_back(c);
+}
+
+id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout)
+{
+    auto &cache = s_caster_pipelines[skinned * 2 + cutout];
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [s_caster_library newFunctionWithName:skinned ? @"caster_skinned" : @"caster_static"];
+    d.fragmentFunction = [s_caster_library newFunctionWithName:cutout ? @"caster_cutout" : @"caster_opaque"];
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+    const int wanted[4] = {0, 4, 7, 8};
+    bool uses_constant = false;
+    for (int n = 0; n < (skinned ? 4 : 2); n++) {
+        int i = wanted[n];
+        if (key.format[i] && key.slot[i] != CONSTANT_SLOT) {
+            vd.attributes[i].format = (MTLVertexFormat)key.format[i];
+            vd.attributes[i].offset = key.offset[i];
+            vd.attributes[i].bufferIndex = VERTEX_SLOT_BASE + key.slot[i];
+        } else { // the mesh has no such attribute: it reads the constant buffer
+            vd.attributes[i].format = MTLVertexFormatFloat4;
+            vd.attributes[i].offset = 0;
+            vd.attributes[i].bufferIndex = CONSTANT_SLOT;
+            uses_constant = true;
+        }
+    }
+    for (int s = 0; s < MAX_VERTEX_SLOTS; s++) {
+        if (!key.stride[s]) continue;
+        vd.layouts[VERTEX_SLOT_BASE + s].stride = key.stride[s];
+        vd.layouts[VERTEX_SLOT_BASE + s].stepFunction = MTLVertexStepFunctionPerVertex;
+    }
+    if (uses_constant) {
+        vd.layouts[CONSTANT_SLOT].stride = 16;
+        vd.layouts[CONSTANT_SLOT].stepFunction = MTLVertexStepFunctionConstant;
+        vd.layouts[CONSTANT_SLOT].stepRate = 0;
+    }
+    d.vertexDescriptor = vd;
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
+    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    NSError *error = nil;
+    id<MTLRenderPipelineState> state = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!state) complain("shadow caster pipeline failed: %s", error.localizedDescription.UTF8String);
+    cache[key] = state;
+    return state;
+}
+
+// p is the program of a main-pass draw that has both a world-view-projection
+// and a world matrix set, from which the camera is recovered.
+void render_dynamic_shadows(Program &p)
+{
+    s_dyn_frame = s_frame_serial; // one attempt per frame, whatever comes of it
+    std::vector<CasterDraw> casters;
+    casters.swap(s_casters);
+    std::vector<float> bones;
+    bones.swap(s_caster_bones);
+    s_dyn_window[2] = s_dyn_window[3] = 0; // no map, until this succeeds
+    if (!s_sun_matrix_valid) return;
+
+    double wvp[16], world[16], inv[16], view_proj[16], inv_view_proj[16], sun[16];
+    if (!vertex_matrix(p, "matWorldViewProj", wvp) || !vertex_matrix(p, "matWorld", world) || !mat_inverse(world, inv)) return;
+    mat_mul(wvp, inv, view_proj);
+    if (!mat_inverse(view_proj, inv_view_proj)) return;
+    for (int i = 0; i < 16; i++) sun[i] = s_sun_matrix[i];
+
+    if (!s_caster_library) {
+        NSError *error = nil;
+        s_caster_library = [s_device newLibraryWithSource:@(k_caster_source) options:nil error:&error];
+        if (!s_caster_library) {
+            complain("shadow caster shaders did not compile: %s", error.localizedDescription.UTF8String);
+            s_dyn_shadows = false;
+            return;
+        }
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionLess;
+        dd.depthWriteEnabled = YES;
+        s_caster_depth_state = [s_device newDepthStencilStateWithDescriptor:dd];
+        const NSUInteger size = k_xl_dyn_size;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:size height:size mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_dyn_map = [s_device newTextureWithDescriptor:td];
+        td.pixelFormat = MTLPixelFormatDepth32Float;
+        td.usage = MTLTextureUsageRenderTarget;
+        s_dyn_depth = [s_device newTextureWithDescriptor:td];
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; // nearest: the shader compares depths itself
+        sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        s_dyn_sampler = [s_device newSamplerStateWithDescriptor:sd];
+    }
+
+    // Where the camera is and which way it faces, from the two ends of the view axis.
+    auto unproject = [&](double z, double out[3]) {
+        const double *m = inv_view_proj;
+        double w = m[11] * z + m[15];
+        for (int r = 0; r < 3; r++) out[r] = (m[8 + r] * z + m[12 + r]) / w;
+    };
+    double eye[3], ahead[3];
+    unproject(-1.0, eye);
+    unproject(0.5, ahead);
+    double fx = ahead[0] - eye[0], fy = ahead[1] - eye[1], flat = sqrt(fx * fx + fy * fy); // Z is up
+    double reach = s_dyn_range * 0.6;
+    double focus[3] = {eye[0] + (flat > 1e-6 ? fx / flat * reach : 0), eye[1] + (flat > 1e-6 ? fy / flat * reach : 0), eye[2]};
+
+    // The window: centred on that point in map coordinates, s_dyn_range metres to
+    // each side, snapped to its own texel grid so that shadows do not crawl as
+    // the camera moves.
+    auto row_length = [&](int r) { return sqrt(sun[r] * sun[r] + sun[4 + r] * sun[4 + r] + sun[8 + r] * sun[8 + r]); };
+    double half_u = s_dyn_range * row_length(0), half_v = s_dyn_range * row_length(1);
+    if (half_u < 1e-9 || half_v < 1e-9) return;
+    double cu = sun[0] * focus[0] + sun[4] * focus[1] + sun[8] * focus[2] + sun[12];
+    double cv = sun[1] * focus[0] + sun[5] * focus[1] + sun[9] * focus[2] + sun[13];
+    double texel_u = 2 * half_u / k_xl_dyn_size, texel_v = 2 * half_v / k_xl_dyn_size;
+    cu = round(cu / texel_u) * texel_u;
+    cv = round(cv / texel_v) * texel_v;
+    float window[4] = {(float)cu, (float)cv, (float)(1 / half_u), (float)(1 / half_v)};
+
+    double to_shadow[16]; // from the camera's clip space to shadow space
+    mat_mul(sun, inv_view_proj, to_shadow);
+
+    // All the casters' uniforms go into one buffer.
+    const size_t static_size = 256, skinned_size = 2304; // 80 and 2128 bytes, rounded up to the offset alignment
+    size_t total = 0;
+    for (const CasterDraw &c : casters) total += c.bones >= 0 ? skinned_size : static_size;
+    if (!total) return;
+    id<MTLBuffer> uniforms = [s_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+    uint8_t *base = (uint8_t *)uniforms.contents;
+
+    id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_dyn_map;
+    d.colorAttachments[0].loadAction = MTLLoadActionClear;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    d.colorAttachments[0].clearColor = MTLClearColorMake(1e9, 0, 0, 0); // nothing nearer the sun
+    d.depthAttachment.texture = s_dyn_depth;
+    d.depthAttachment.loadAction = MTLLoadActionClear;
+    d.depthAttachment.storeAction = MTLStoreActionDontCare;
+    d.depthAttachment.clearDepth = 1.0;
+    id<MTLRenderCommandEncoder> pass = [cmd renderCommandEncoderWithDescriptor:d];
+    [pass setDepthStencilState:s_caster_depth_state];
+    [pass setCullMode:MTLCullModeNone];
+    [pass setVertexBuffer:s_constant_attrib offset:0 atIndex:CONSTANT_SLOT];
+    size_t at = 0;
+    void *last_pipeline = nullptr;
+    for (const CasterDraw &c : casters) {
+        bool skinned = c.bones >= 0;
+        size_t size = skinned ? skinned_size : static_size;
+        id<MTLRenderPipelineState> pipeline = caster_pipeline(c.key, skinned, c.alpha != nil);
+        if (!pipeline) {
+            at += size;
+            continue;
+        }
+        double m[16], object[16];
+        for (int i = 0; i < 16; i++) object[i] = c.wvp[i];
+        mat_mul(to_shadow, object, m);
+        float m32[16];
+        for (int i = 0; i < 16; i++) m32[i] = (float)m[i];
+        memcpy(base + at, m32, 64);
+        memcpy(base + at + 64, window, 16);
+        if (skinned) memcpy(base + at + 80, &bones[(size_t)c.bones * 32 * 16], 32 * 64);
+        if (last_pipeline != (__bridge void *)pipeline) {
+            [pass setRenderPipelineState:pipeline];
+            last_pipeline = (__bridge void *)pipeline;
+        }
+        [pass setVertexBuffer:uniforms offset:at atIndex:0];
+        for (int i = 0; i < c.slots; i++) [pass setVertexBuffer:c.vertex[i] offset:c.vertex_offset[i] atIndex:(NSUInteger)(VERTEX_SLOT_BASE + i)];
+        if (c.alpha) {
+            [pass setFragmentTexture:c.alpha atIndex:0];
+            [pass setFragmentSamplerState:c.alpha_sampler atIndex:0];
+        }
+        [pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:c.index_count indexType:c.index_type indexBuffer:c.indices indexBufferOffset:c.index_offset];
+        at += size;
+    }
+    [pass endEncoding];
+    [cmd commit];
+
+    s_dyn_window[0] = (float)cu;
+    s_dyn_window[1] = (float)cv;
+    s_dyn_window[2] = (float)(1 / (2 * half_u));
+    s_dyn_window[3] = (float)(1 / (2 * half_v));
+    s_dyn_bias = (float)(s_dyn_bias_m * row_length(2));
+    s_dyn_stats.frames++;
+    s_dyn_stats.casters += casters.size();
+}
+
 // Binds everything a draw needs. Returns false when the draw has to be skipped.
 bool prepare_draw()
 {
@@ -1608,6 +1987,14 @@ bool prepare_draw()
         memcpy(p->uniform_data[1].data() + p->samples_offset, &samples, 4);
         p->uniform_dirty[1] = true;
     }
+    if (p->dyn_window_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_window_offset, s_dyn_window, 16)) {
+        memcpy(p->uniform_data[1].data() + p->dyn_window_offset, s_dyn_window, 16);
+        p->uniform_dirty[1] = true;
+    }
+    if (p->dyn_bias_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_bias_offset, &s_dyn_bias, 4)) {
+        memcpy(p->uniform_data[1].data() + p->dyn_bias_offset, &s_dyn_bias, 4);
+        p->uniform_dirty[1] = true;
+    }
     float limit = s_pass_screen ? 1.0f : 65000.0f;
     if (p->limit_offset >= 0 && memcmp(p->uniform_data[1].data() + p->limit_offset, &limit, 4)) {
         memcpy(p->uniform_data[1].data() + p->limit_offset, &limit, 4);
@@ -1645,6 +2032,9 @@ bool prepare_draw()
             if (l.is_sky) { // not one of the game's textures
                 texture = s_sky_atlas ? s_sky_atlas : s_white;
                 if (s_sky_sampler) sampler = s_sky_sampler;
+            } else if (l.is_dyn_map) {
+                texture = s_dyn_map ? s_dyn_map : s_white;
+                if (s_dyn_sampler) sampler = s_dyn_sampler;
             } else if (l.srgb && t && t->mtl) {
                 // The shader no longer decodes this sampler's colour itself.
                 if (id<MTLTexture> view = srgb_view_for(*t)) texture = view;
@@ -1671,6 +2061,8 @@ bool prepare_draw()
     bind_buffer(0, s_constant_attrib, 0, CONSTANT_SLOT);
     s_last.draws++;
     s_draw_binding = binding;
+    if (s_dyn_shadows && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world)
+        render_dynamic_shadows(*p);
     if (s_pass_scene && (s_ao || s_contact_shadows || s_light_shafts) && s_camera.view_frame != s_frame_serial) observe_camera(*p);
     return true;
 }
@@ -1893,6 +2285,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) >= 1;    // off unless set
     s_shader_options.pbr_environment = pbr_env && atoi(pbr_env) >= 2; // 2: metalness and environment reflection too
     s_shader_options.pbr_sky = pbr_env && atoi(pbr_env) >= 3;         // 3: the environment is the scene's own sky
+    const char *dyn_env = getenv("WBM_DYNAMIC_SHADOWS");
+    s_dyn_shadows = s_shader_options.dynamic_shadows = dyn_env && atoi(dyn_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_DYN_RANGE")) s_dyn_range = std::max(5.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_DYN_BIAS")) s_dyn_bias_m = (float)atof(v);
     const char *shafts_env = getenv("WBM_LIGHT_SHAFTS");
     s_light_shafts = shafts_env && atoi(shafts_env) != 0; // off unless set
     if (const char *v = getenv("WBM_SHAFT_STRENGTH")) s_shaft_strength = (float)atof(v);
@@ -1947,11 +2343,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "contact shadows %s; light shafts %s; filmic tone map %s; extended-range output %s",
+            "contact shadows %s; light shafts %s; per-frame shadow map %s; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_sky ? "on, with metalness and sky reflection" : s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off",
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off",
             s_shader_options.filmic_tonemap ? "on" : "off",
             s_hdr ? "on" : "off");
 }
@@ -1971,6 +2367,9 @@ void mtl_dump_stats(FILE *f)
             (unsigned long long)s_call_stats.made, (unsigned long long)s_call_stats.skipped);
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
+    if (s_dyn_stats.frames)
+        fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average\n",
+                (unsigned long long)s_dyn_stats.frames, (double)s_dyn_stats.casters / (double)s_dyn_stats.frames);
 }
 
 void mtl_set_vsync(bool on)
@@ -2045,6 +2444,11 @@ void mtl_present(bool capture, uint32_t frame)
         s_cmd = nil;
         s_drawable = nil;
         s_frame_serial++;
+        if (!s_casters.empty()) { // recorded, but no main pass followed
+            s_casters.clear();
+            s_caster_bones.clear();
+        }
+        if (s_dyn_shadows && s_dyn_frame + 2 < s_frame_serial) s_dyn_window[2] = s_dyn_window[3] = 0; // the map has gone stale
         if (s_hdr && s_frame_serial % 30 == 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
               CGFloat available = s_window.screen.maximumExtendedDynamicRangeColorComponentValue;
@@ -2511,6 +2915,11 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             complain("glDrawElements without an element buffer is not supported");
             return;
         }
+        // A character's ground decal would double up with its real shadow.
+        if (s_dyn_shadows && s_dyn_window[2] > 0) {
+            Program *p = find(s_programs, s_program);
+            if (p && p->is_blob_shadow && s_pass_scene) return;
+        }
         NSUInteger offset = (NSUInteger)(uintptr_t)indices, index_size = type == GL_UNSIGNED_SHORT ? 2 : 4;
         if (offset + (NSUInteger)count * index_size > b->mtl.length) {
             complain("glDrawElements reads past the end of its element buffer");
@@ -2519,6 +2928,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
+        if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset);
         // The engine draws the sky first, with the depth test off. That draw is the one to capture.
         if (s_shader_options.pbr_sky && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
             capture_sky(primitive, (NSUInteger)count, index_type, b->mtl, offset);

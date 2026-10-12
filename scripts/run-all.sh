@@ -4,6 +4,7 @@
 # depth). Anything set in the environment already is kept, so one option can be
 # turned off for a comparison:   WBM_AO=0 scripts/run-all.sh
 export WBM_SHADOWS=${WBM_SHADOWS:-2}  # shadows that soften with distance (PCSS)
+export WBM_DYNAMIC_SHADOWS=${WBM_DYNAMIC_SHADOWS:-1}  # characters cast shadows on everything
 export WBM_PBR=${WBM_PBR:-3}          # microfacet highlights, metalness, reflection of the scene's sky
 export WBM_SRGB=${WBM_SRGB:-1}        # hardware sRGB texture decoding
 export WBM_AO=${WBM_AO:-1}            # ambient occlusion

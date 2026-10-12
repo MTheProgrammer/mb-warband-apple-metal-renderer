@@ -3,6 +3,7 @@
 //   -v  print the log of failing programs      -d  dump one program's sources
 //   -s  translate with soft shadows; also reports how many programs it changed
 //   -S  with distance-dependent (PCSS) shadows instead
+//   -D  with the backend's own per-frame shadow map sampled too; reports programs that sample it
 //   -a  translate with smoothed alpha tests; likewise
 //   -p  translate with microfacet specular highlights; reports programs changed
 //   -e  also with estimated metalness and environment reflection; likewise
@@ -32,12 +33,13 @@ int main(int argc, char **argv)
     std::string dir = argv[1];
     bool verbose = false;
     XlOptions options;
-    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0, sky = 0;
+    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0, sky = 0, dynamic = 0;
     int dump = -1;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = true;
         if (!strcmp(argv[i], "-s")) options.soft_shadows = true;
         if (!strcmp(argv[i], "-S")) options.pcss_shadows = true;
+        if (!strcmp(argv[i], "-D")) options.dynamic_shadows = true;
         if (!strcmp(argv[i], "-a")) options.smooth_alpha_test = true;
         if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
         if (!strcmp(argv[i], "-p")) options.pbr_specular = true;
@@ -65,6 +67,7 @@ int main(int argc, char **argv)
         pbr += p.fs.msl.find("wbm_specular") != std::string::npos;
         env += p.fs.msl.find("wbm_environment") != std::string::npos;
         sky += p.fs.msl.find("wbm_environment_sky") != std::string::npos;
+        dynamic += p.fs.msl.find("wbm_dynamic_shadow") != std::string::npos;
         final_passes += p.fs.msl.find("wbm_filmic(") != std::string::npos || p.fs.msl.find("wbm_expand(") != std::string::npos;
         srgb_samplers += (int)p.fs.srgb_samplers.size();
         std::string error = p.ok ? p.log : "translation failed:\n" + p.log;
@@ -112,6 +115,7 @@ int main(int argc, char **argv)
     printf("%d programs, %d failed\n", total, failed);
     if (options.soft_shadows || options.pcss_shadows) printf("%d programs use the soft shadow filter\n", softened);
     if (options.smooth_alpha_test) printf("%d programs have smoothed alpha tests\n", smoothed);
+    if (options.dynamic_shadows) printf("%d programs sample the per-frame shadow map\n", dynamic);
     if (options.pbr_sky) printf("%d programs reflect the captured sky\n", sky);
     if (options.pbr_specular || options.pbr_environment || options.pbr_sky) printf("%d programs use microfacet specular highlights\n", pbr);
     if (options.pbr_environment || options.pbr_sky) printf("%d programs add metalness and an environment reflection\n", env);

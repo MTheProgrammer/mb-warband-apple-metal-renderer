@@ -48,6 +48,10 @@ struct XlOptions {
     // Instead of that: shadows whose softness grows with the distance between
     // the surface and whatever shades it (percentage-closer soft shadows).
     bool pcss_shadows = false;
+    // Also sample a second shadow map that the backend draws itself each frame
+    // with everything visible in it, characters included. Adds the sampler and
+    // uniforms described at k_xl_dyn_sampler.
+    bool dynamic_shadows = false;
     // Turn alpha tests (discard below a threshold) into partial coverage of a
     // multisampled pixel, so cut-out edges are smoothed like geometry edges.
     bool smooth_alpha_test = false;
@@ -103,6 +107,19 @@ extern const char *const k_xl_limit_uniform;
 // the face, with right = cross(forward, up) and v = 0 on the texture's first
 // row. Colours are stored as the sky shader wrote them, gamma-encoded.
 extern const char *const k_xl_sky_sampler;
+
+// With dynamic_shadows, shaders that receive shadows get:
+//   wbm_dyn_map   a square map, k_xl_dyn_size texels a side, holding for a window
+//                 of the engine's shadow space the depth nearest the sun, in the
+//                 units of the z the engine's shaders compare against;
+//   wbm_dyn       xy: the window's centre in the engine's shadow-map coordinates,
+//                 zw: 1 / its width and height in the same; z = 0 means no map;
+//   wbm_dyn_bias  the depth by which a surface is moved towards the sun before
+//                 the comparison.
+extern const char *const k_xl_dyn_sampler;
+extern const char *const k_xl_dyn_window_uniform;
+extern const char *const k_xl_dyn_bias_uniform;
+enum { k_xl_dyn_size = 4096 };
 enum { k_xl_sky_face_size = 128 };
 
 // attrib_locations: names given to glBindAttribLocation and their indices.
