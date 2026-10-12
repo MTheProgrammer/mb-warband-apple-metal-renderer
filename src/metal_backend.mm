@@ -1086,7 +1086,7 @@ struct Params {
     float2 depth_size; // of the depth buffer, in pixels
     float2 ao_size;    // of the half-resolution textures
     float radius, strength, reversed, fade_start;
-    float4 sun;        // xyz: direction to the sun in view space
+    float4 sun;        // xyz: direction to the sun in view space; w: distance within which contact shadows are left out, or 0
     float shadow_strength, shadow_length;
     float2 shaft_size; // of the light-shaft textures, in pixels
     float4 shaft;      // xy: the sun's position on screen (0..1), z: how visible it is, w: strength
@@ -1215,7 +1215,10 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
                     break;
                 }
             }
-            ao *= 1.0 - p.shadow_strength * hit * smoothstep(0.05, 0.3, facing);
+            // Where the per-frame shadow map's fine window reaches, things already
+            // cast exact shadows; this estimate next to them reads as a second one.
+            float beyond = p.sun.w > 0.0 ? smoothstep(p.sun.w * 0.6, p.sun.w, P.z) : 1.0;
+            ao *= 1.0 - p.shadow_strength * hit * smoothstep(0.05, 0.3, facing) * beyond;
         }
     }
     return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
@@ -1413,6 +1416,7 @@ void apply_ambient_occlusion()
         for (int r = 0; r < 3; r++)
             params.sun[r] = (float)-(s_camera.view[r][0] * s_sun_dir[0] + s_camera.view[r][1] * s_sun_dir[1] + s_camera.view[r][2] * s_sun_dir[2]);
         if (s_contact_shadows) params.shadow_strength = s_contact_strength;
+        if (s_dyn_shadows && s_dyn_near[2] > 0) params.sun[3] = s_dyn_near_range * 1.5f; // as far ahead as the fine window reaches
         if (s_light_shafts && params.sun[2] > 0.05f) { // the sun is in front of the camera
             float nx = params.sun[0] * params.p00 / params.sun[2], ny = params.sun[1] * params.p11 / params.sun[2];
             float off_screen = std::max(fabsf(nx), fabsf(ny));
