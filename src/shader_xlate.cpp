@@ -651,9 +651,17 @@ bool add_shell_push(std::string &vs)
     static const std::regex skinned(
         R"((\w+) = \(\(\(\s*\(\(matWorldArray\[(\w+)\] \* (\w+)\)\s*\* inBlendWeight\.x\)\s*\+\s*\(\(matWorldArray\[(\w+)\] \* \3\)\s*\* inBlendWeight\.y\)\s*\)\s*\+\s*\(\s*\(matWorldArray\[(\w+)\] \* \3\)\s*\* inBlendWeight\.z\)\)\s*\+\s*\(\(matWorldArray\[(\w+)\] \* \3\)\s*\* inBlendWeight\.w\)\);)");
     if (vs.find("attribute vec3 inNormal;") == std::string::npos || !std::regex_search(vs, skinned)) return false;
+    // Layers of long hair (wbm_shell.z below 0) do not stand straight out: the
+    // farther along the hair, the less it goes outwards and the more it goes
+    // down, whichever way the horse is turned. Down is the world's, brought
+    // into the space the bones leave the vertex in.
+    bool placed = vs.find("uniform mat4 matWorld;") != std::string::npos;
+    const std::string normal = "normalize(mat3(matWorldArray[$2]) * inNormal * inBlendWeight.x + mat3(matWorldArray[$4]) * inNormal * inBlendWeight.y + "
+                               "mat3(matWorldArray[$5]) * inNormal * inBlendWeight.z + mat3(matWorldArray[$6]) * inNormal * inBlendWeight.w)";
+    const std::string down = placed ? "normalize(vec3(0.0, 0.0, -1.0) * mat3(matWorld))" : "vec3(0.0)";
     vs = std::regex_replace(vs, skinned,
-                            "$&\n  if (wbm_shell.x > 0.0) $1.xyz += wbm_shell.x * normalize(mat3(matWorldArray[$2]) * inNormal * inBlendWeight.x + mat3(matWorldArray[$4]) * inNormal * "
-                            "inBlendWeight.y + mat3(matWorldArray[$5]) * inNormal * inBlendWeight.z + mat3(matWorldArray[$6]) * inNormal * inBlendWeight.w);",
+                            "$&\n  if (wbm_shell.x > 0.0) {\n    vec3 wbm_n = " + normal + ";\n    if (wbm_shell.z < 0.0) $1.xyz += wbm_shell.x * (wbm_n * (1.0 - 0.55 * wbm_shell.y) + " + down +
+                                " * (2.2 * wbm_shell.y));\n    else $1.xyz += wbm_shell.x * wbm_n;\n  }",
                             std::regex_constants::format_first_only);
     return true;
 }
@@ -766,7 +774,7 @@ vec2 wbm_shell_root(vec2 uv, vec3 down)
     if (wbm_shell.z < 0.0) {
         float t = wbm_shell.w - 1.0;
         vec2 swing = vec2(sin(t * 1.7 + uv.x * 40.0), cos(t * 1.3 + uv.y * 31.0)) * 0.012;
-        lean = (wbm_combed(uv).xy * 0.05 + down.xy * 0.07 + swing) * share * share + wbm_combed(uv).xy * 0.02 * share;
+        lean = (wbm_combed(uv).xy * 0.02 + swing) * share * share + wbm_combed(uv).xy * 0.01 * share;
     } else {
         lean = wbm_combed(uv).xy * 0.007 * share + down.xy * 0.005 * share * share;
     }
@@ -783,6 +791,10 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     vec2 root = wbm_shell_root(uv, down);
     grows = wbm_grows(root);
     if (long_ ? grows.y < 0.5 : grows.x < 0.5) return true;
+    // Long hair is drawn only over what the map itself marks as long hair. Its
+    // layers hang by being moved (see add_shell_push), not by reaching across
+    // the texture, where a leg may be painted beside the tail.
+    if (long_ && wbm_grows(uv).y < 0.5) return true;
     vec2 at = root * density;
     vec2 cell = floor(at), within = fract(at) - 0.5;
     float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
