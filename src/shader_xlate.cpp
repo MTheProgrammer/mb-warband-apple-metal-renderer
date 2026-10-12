@@ -249,18 +249,35 @@ bool add_pbr_environment(std::string &fs)
         return false;
     }
 
-    // The direction of the sky, in whatever space the shader's normal is in.
-    std::string up = has("uniform vec4 vSkyLightDir;") ? "-vSkyLightDir.xyz" : has("varying vec3 SkyLightDir;") ? "SkyLightDir" : "vec3(0.0)";
-    std::string sky = has("uniform vec4 vSkyLightColor;") ? "(vAmbientColor.xyz + vSkyLightColor.xyz)" : "vAmbientColor.xyz";
-    std::string ground = has("uniform vec4 vGroundAmbientColor;") ? "vGroundAmbientColor.xyz" : "(vAmbientColor.xyz * 0.4)";
-    if (!has("uniform vec4 vAmbientColor;")) return false;
-
+    // Up, in whatever space the shader's normal is in. Shaders that light with a
+    // world-space normal can use the world's up axis (Z in this engine); the
+    // normal-mapped ones work in tangent space and only have the direction of
+    // the sky light there, which leans off vertical but is the best available.
+    std::string up = has("uniform vec4 vSkyLightDir;") ? "vec3(0.0, 0.0, 1.0)" : has("varying vec3 SkyLightDir;") ? "SkyLightDir" : "vec3(0.0)";
+    // The engine's ambient colours are far too dim to stand in for what a
+    // mirror would show: measured in a battle, sky ambient was about 0.1 and
+    // ground ambient a saturated green. The fog colour is the colour of the
+    // horizon, so the environment is built from that, with the ground a darker
+    // blend of it and the ground ambient.
+    if (!has("uniform vec4 vFogColor;") || !has("uniform vec4 vSpecularColor;")) return false;
+    std::string horizon = "pow(vFogColor.xyz, vec3(2.2))";
+    std::string sky = "(" + horizon + " * 1.3)";
+    std::string ground = has("uniform vec4 vGroundAmbientColor;") ? "(mix(vGroundAmbientColor.xyz, " + horizon + ", 0.4) * 0.6)"
+                                                                  : "(" + horizon + " * 0.35)";
     fs = std::regex_replace(fs, encode, "$1.xyz += wbm_environment(ViewDir, " + up + ", " + sky + ", " + ground + ");\n  $&",
                             std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, decode,
-                            "wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  $1.xyz = (wbm_albedo * (1.0 - (0.65 * wbm_metal)));");
+                            "wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  $1.xyz = (wbm_albedo * (1.0 - (0.35 * wbm_metal)));");
     body = fs.find('{', fs.find("void main ()")) + 1; // again: the replacements above moved it
-    fs.insert(body, "\n  wbm_mask = clamp(" + mask + ", 0.0, 1.0);\n  wbm_metal = smoothstep(0.3, 0.7, wbm_mask);");
+    // The mask alone does not say how reflective a material is: on many opaque
+    // textures it is simply 1. The engine scales it by the material's specular
+    // colour, whose brightness runs from under 1 (stone, cloth) through 3-15
+    // (leather, wood, mail) to 50 and more (plate), so that is what separates
+    // metal from non-metal here.
+    fs.insert(body, "\n  float wbm_gloss = dot(vSpecularColor.xyz, vec3(0.3333));"
+                    "\n  float wbm_raw_mask = clamp(" + mask + ", 0.0, 1.0);"
+                    "\n  wbm_mask = wbm_raw_mask * clamp(wbm_gloss / 40.0, 0.0, 1.0);"
+                    "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);");
     return true;
 }
 
