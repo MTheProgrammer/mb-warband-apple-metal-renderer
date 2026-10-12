@@ -1395,6 +1395,52 @@ id<MTLBuffer> quad_indices(int quads)
     return s_quad_indices;
 }
 
+// The game blends translucent UI with one blend function for colour and
+// alpha alike, which leaves the screen's alpha channel below 1 wherever
+// something translucent was drawn. An 8-bit opaque layer ignores that channel.
+// The extended-range layer appears not to: such pixels came out darker, as
+// rectangles around text while it faded. This pass sets alpha to 1 across the
+// finished frame and touches nothing else.
+id<MTLRenderPipelineState> s_opaque_pipeline;
+
+void make_frame_opaque()
+{
+    if (!s_opaque_pipeline) {
+        static const char source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexOut { float4 position [[position]]; };
+vertex VertexOut opaque_vertex(uint id [[vertex_id]])
+{
+    VertexOut out;
+    out.position = float4(float2((id << 1) & 2, id & 2) * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+fragment float4 opaque_fragment() { return float4(0.0, 0.0, 0.0, 1.0); }
+)";
+        NSError *error = nil;
+        id<MTLLibrary> library = [s_device newLibraryWithSource:@(source) options:nil error:&error];
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [library newFunctionWithName:@"opaque_vertex"];
+        d.fragmentFunction = [library newFunctionWithName:@"opaque_fragment"];
+        d.colorAttachments[0].pixelFormat = s_drawable.texture.pixelFormat;
+        d.colorAttachments[0].writeMask = MTLColorWriteMaskAlpha;
+        if (library) s_opaque_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!s_opaque_pipeline) {
+            complain("the pass that makes the frame opaque failed: %s", error.localizedDescription.UTF8String);
+            return;
+        }
+    }
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_drawable.texture;
+    d.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [s_cmd renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:s_opaque_pipeline];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+}
+
 float half_to_float(uint16_t h)
 {
     int exponent = (h >> 10) & 31, mantissa = h & 1023;
@@ -1539,6 +1585,7 @@ void mtl_present(bool capture, uint32_t frame)
     @autoreleasepool {
         end_pass();
         if (!s_cmd) return; // the game issued nothing this frame
+        if (s_hdr && s_drawable) make_frame_opaque();
         id<MTLTexture> copy = nil;
         if (capture && s_drawable) {
             id<MTLTexture> src = s_drawable.texture;
