@@ -126,7 +126,7 @@ struct Program {
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
-    int dyn_window_offset = -1, dyn_bias_offset = -1; // fragment stage, see k_xl_dyn_sampler
+    int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1; // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
     const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
@@ -282,6 +282,8 @@ bool s_pass_scene, s_pass_prepass, s_pass_shadow_map;
 bool s_dyn_shadows;
 float s_dyn_range = 60.0f;     // WBM_DYN_RANGE: half the width of the window, in metres
 float s_dyn_bias_m = 0.05f;    // WBM_DYN_BIAS: metres
+float s_dyn_near_range = 12.0f; // WBM_DYN_NEAR: half the width of the fine window around the camera, in metres; 0 for none
+float s_dyn_near[4];           // the fine window, as the shaders' wbm_dyn_near
 float s_sun_matrix[16];        // matSunViewProj as last set for the scene
 bool s_sun_matrix_valid;
 float s_dyn_window[4];         // what shaders get as wbm_dyn; z = 0 until a map exists
@@ -290,7 +292,7 @@ uint64_t s_dyn_frame;          // the frame the map was last drawn in
 id<MTLTexture> s_dyn_map, s_dyn_depth;
 id<MTLSamplerState> s_dyn_sampler;
 struct {
-    uint64_t frames, casters, scenery, overlays;
+    uint64_t frames, casters, scenery, overlays, late;
 } s_dyn_stats;
 // Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
 // pass as ambient occlusion. They need the sun: its direction and colour as
@@ -734,7 +736,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_bias_offset = -1;
+    p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -795,6 +797,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
             else if (u.name == k_xl_limit_uniform) p.limit_offset = u.offset;
             else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
+            else if (u.name == k_xl_dyn_near_uniform) p.dyn_near_offset = u.offset;
             else if (u.name == k_xl_dyn_bias_uniform) p.dyn_bias_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
@@ -1834,13 +1837,23 @@ struct CasterDraw {
     id<MTLBuffer> indices;
     NSUInteger index_offset, index_count;
     MTLIndexType index_type;
-    float wvp[16];
+    float wvp[16];            // object to clip space; object to world space when `world` is set
+    bool world;
+    float cutoff;             // alpha below which a cut-out texel casts nothing
     int bones;                // index into s_caster_bones of 32 matrices, or -1
     id<MTLTexture> alpha;     // set for alpha-tested geometry
     id<MTLSamplerState> alpha_sampler;
 };
 std::vector<CasterDraw> s_casters;
 std::vector<float> s_caster_bones;
+
+// Grass never reaches the pre-pass: the engine draws it in the main pass only.
+// Cut-out geometry that turns up there without having been in the pre-pass is
+// recorded too, with its world matrix, which the main pass does supply, and
+// goes into the next frame's map. Grass stands still, so a frame's delay does
+// not show.
+std::vector<CasterDraw> s_late_casters, s_late_ready; // from this frame, and from the last for use in this one
+std::unordered_set<uint64_t> s_prepass_meshes;        // everything this frame's pre-pass drew
 
 // Scenery is in the engine's own shadow map already, drawn there once per scene.
 // Drawing it into this one as well would cost a draw and change the look of its
@@ -1883,11 +1896,13 @@ using namespace metal;
 // y, the depth its shaders compare against in z.
 struct Caster {
     float4x4 m;
-    float4 window; // xy: centre, zw: 2 / (width, height), all in map coordinates
+    float4 window[2]; // the wide window and the fine one. xy: centre, zw: 2 / (width, height), all in map coordinates
+    float4 params;    // x: alpha below which a cut-out texel casts nothing
 };
 struct SkinnedCaster {
     float4x4 m;
-    float4 window;
+    float4 window[2];
+    float4 params;
     float4x4 bones[32];
 };
 struct StaticIn {
@@ -1904,32 +1919,36 @@ struct Out {
     float4 position [[position]];
     float depth;
     float2 uv;
+    float cutoff [[flat]];
 };
 
 // Rows of the map are stored in OpenGL's order like every other texture the
 // renderer draws, hence the flipped y. The depth buffer only has to order the
 // casters; the comparison value is written as colour, unscaled.
-static Out finish(float4 s, float2 uv, float4 window)
+static Out finish(float4 s, float2 uv, float4 window, float4 params)
 {
     float3 q = s.xyz / s.w;
     Out out;
     out.position = float4((q.x - window.x) * window.z, -(q.y - window.y) * window.w, clamp(q.z * 0.25 + 0.5, 0.0, 1.0), 1.0);
     out.depth = q.z;
     out.uv = uv;
+    out.cutoff = params.x;
     return out;
 }
 
-vertex Out caster_static(StaticIn in [[stage_in]], constant Caster &c [[buffer(0)]])
+// Each draw is rasterised twice, once into either half of the map (vertex
+// amplification): `side` says which, and only the position depends on it.
+vertex Out caster_static(StaticIn in [[stage_in]], constant Caster &c [[buffer(0)]], ushort side [[amplification_id]])
 {
-    return finish(c.m * float4(in.position, 1.0), in.uv, c.window);
+    return finish(c.m * float4(in.position, 1.0), in.uv, c.window[side], c.params);
 }
 
-vertex Out caster_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]])
+vertex Out caster_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]], ushort side [[amplification_id]])
 {
     float4 p = float4(in.position, 1.0);
     float4 skinned = c.bones[int(in.indices.x)] * p * in.weights.x + c.bones[int(in.indices.y)] * p * in.weights.y +
                      c.bones[int(in.indices.z)] * p * in.weights.z + c.bones[int(in.indices.w)] * p * in.weights.w;
-    return finish(c.m * skinned, in.uv, c.window);
+    return finish(c.m * skinned, in.uv, c.window[side], c.params);
 }
 
 fragment float4 caster_opaque(Out in [[stage_in]])
@@ -1939,26 +1958,35 @@ fragment float4 caster_opaque(Out in [[stage_in]])
 
 fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[texture(0)]], sampler s [[sampler(0)]])
 {
-    if (diffuse.sample(s, in.uv).a < 0.03137255) discard_fragment(); // the engine's own threshold in its pre-pass
+    if (diffuse.sample(s, in.uv).a < in.cutoff) discard_fragment();
     return float4(in.depth);
 }
 )";
 
 id<MTLLibrary> s_caster_library;
 id<MTLDepthStencilState> s_caster_depth_state;
+NSUInteger s_caster_halves = 1; // 2 when the fine window is drawn too
 std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[4]; // [skinned * 2 + cutout]
 
 // Called for each draw of the engine's depth pre-pass, after it has been issued.
-void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset)
+void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset, bool late)
 {
     Program *p = find(s_programs, s_program);
     if (!p || !p->u_wvp || s_casters.size() >= 20000) return;
     uint64_t mesh = mesh_id(count, index_offset);
-    if (s_scenery.count(mesh)) {
+    if (late) {
+        if (!p->u_world || p->u_bones || p->alpha_texture_location < 0 || p->is_blob_shadow || s_late_casters.size() >= 4000) return;
+        if (s_prepass_meshes.count(mesh)) return;
+    } else {
+        s_prepass_meshes.insert(mesh);
+    }
+    // Cut-out scenery (bushes, grass, leaves) is drawn here all the same: the
+    // engine's map is too coarse for twigs, whose shadows all but vanish in it.
+    if (!late && p->alpha_texture_location < 0 && s_scenery.count(mesh)) {
         s_dyn_stats.scenery++;
         return;
     }
-    if (s_overlays.count(mesh)) {
+    if (!late && s_overlays.count(mesh)) {
         s_dyn_stats.overlays++;
         return;
     }
@@ -1979,9 +2007,20 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
     c.index_offset = index_offset;
     c.index_count = count;
     c.index_type = index_type;
-    memcpy(c.wvp, p->uniform_data[0].data() + p->u_wvp->offset, sizeof c.wvp);
+    memcpy(c.wvp, p->uniform_data[0].data() + (late ? p->u_world : p->u_wvp)->offset, sizeof c.wvp);
+    c.world = late;
+    c.cutoff = 0.03137255f; // the engine's own threshold in its pre-pass
+    if (late) {
+        c.cutoff = 0.5f;
+        auto it = p->location_by_name.find("alpha_test_val");
+        const XlUniform *u = it != p->location_by_name.end() ? p->locations[(size_t)it->second].uniform[1] : nullptr;
+        if (u && u->components == 1 && !u->is_int) memcpy(&c.cutoff, p->uniform_data[1].data() + u->offset, 4);
+        // Blended cut-outs test alpha against next to nothing and leave the soft
+        // edge to the blend. A shadow has no such edge; half is where the shape ends.
+        if (s_blend) c.cutoff = std::max(c.cutoff, 0.5f);
+    }
     c.bones = -1;
-    if (p->u_bones && c.key.format[7] && c.key.format[8]) {
+    if (!late && p->u_bones && c.key.format[7] && c.key.format[8]) {
         c.bones = (int)(s_caster_bones.size() / (32 * 16));
         size_t at = s_caster_bones.size();
         s_caster_bones.resize(at + 32 * 16);
@@ -1996,7 +2035,7 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
             c.alpha_sampler = sampler_for(*t);
         }
     }
-    s_casters.push_back(c);
+    (late ? s_late_casters : s_casters).push_back(c);
 }
 
 id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout)
@@ -2036,6 +2075,7 @@ id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned,
     d.vertexDescriptor = vd;
     d.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
     d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    d.maxVertexAmplificationCount = s_caster_halves;
     NSError *error = nil;
     id<MTLRenderPipelineState> state = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
     if (!state) complain("shadow caster pipeline failed: %s", error.localizedDescription.UTF8String);
@@ -2052,7 +2092,10 @@ void render_dynamic_shadows(Program &p)
     casters.swap(s_casters);
     std::vector<float> bones;
     bones.swap(s_caster_bones);
+    size_t from_prepass = casters.size();
+    casters.insert(casters.end(), s_late_ready.begin(), s_late_ready.end());
     s_dyn_window[2] = s_dyn_window[3] = 0; // no map, until this succeeds
+    s_dyn_near[2] = s_dyn_near[3] = 0;
     if (!s_sun_matrix_valid) return;
 
     double wvp[16], world[16], inv[16], view_proj[16], inv_view_proj[16], sun[16];
@@ -2063,7 +2106,11 @@ void render_dynamic_shadows(Program &p)
 
     if (!s_caster_library) {
         NSError *error = nil;
-        s_caster_library = [s_device newLibraryWithSource:@(k_caster_source) options:nil error:&error];
+        // The default language version follows the SDK the game was built with,
+        // which is too old for vertex amplification.
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion2_2;
+        s_caster_library = [s_device newLibraryWithSource:@(k_caster_source) options:options error:&error];
         if (!s_caster_library) {
             complain("shadow caster shaders did not compile: %s", error.localizedDescription.UTF8String);
             s_dyn_shadows = false;
@@ -2073,8 +2120,10 @@ void render_dynamic_shadows(Program &p)
         dd.depthCompareFunction = MTLCompareFunctionLess;
         dd.depthWriteEnabled = YES;
         s_caster_depth_state = [s_device newDepthStencilStateWithDescriptor:dd];
+        // The fine window needs every draw rasterised twice in one go.
+        s_caster_halves = s_dyn_near_range > 0 && [s_device supportsVertexAmplificationCount:2] ? 2 : 1;
         const NSUInteger size = k_xl_dyn_size;
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:size height:size mipmapped:NO];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:size * 2 height:size mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
         s_dyn_map = [s_device newTextureWithDescriptor:td];
@@ -2110,13 +2159,27 @@ void render_dynamic_shadows(Program &p)
     double texel_u = 2 * half_u / k_xl_dyn_size, texel_v = 2 * half_v / k_xl_dyn_size;
     cu = round(cu / texel_u) * texel_u;
     cv = round(cv / texel_v) * texel_v;
-    float window[4] = {(float)cu, (float)cv, (float)(1 / half_u), (float)(1 / half_v)};
+    // The fine window: the same, s_dyn_near_range metres to each side of a point
+    // just ahead of the camera.
+    double near_u = s_dyn_near_range * row_length(0), near_v = s_dyn_near_range * row_length(1), nu = 0, nv = 0;
+    bool fine = s_caster_halves == 2 && near_u > 1e-9 && near_v > 1e-9;
+    if (fine) {
+        double ahead_by = s_dyn_near_range * 0.5;
+        double point[3] = {eye[0] + (flat > 1e-6 ? fx / flat * ahead_by : 0), eye[1] + (flat > 1e-6 ? fy / flat * ahead_by : 0), eye[2]};
+        nu = sun[0] * point[0] + sun[4] * point[1] + sun[8] * point[2] + sun[12];
+        nv = sun[1] * point[0] + sun[5] * point[1] + sun[9] * point[2] + sun[13];
+        double step_u = 2 * near_u / k_xl_dyn_size, step_v = 2 * near_v / k_xl_dyn_size;
+        nu = round(nu / step_u) * step_u;
+        nv = round(nv / step_v) * step_v;
+    }
+    float window[8] = {(float)cu, (float)cv, (float)(1 / half_u), (float)(1 / half_v), 0, 0, 0, 0};
+    if (fine) window[4] = (float)nu, window[5] = (float)nv, window[6] = (float)(1 / near_u), window[7] = (float)(1 / near_v);
 
     double to_shadow[16]; // from the camera's clip space to shadow space
     mat_mul(sun, inv_view_proj, to_shadow);
 
     // All the casters' uniforms go into one buffer.
-    const size_t static_size = 256, skinned_size = 2304; // 80 and 2128 bytes, rounded up to the offset alignment
+    const size_t static_size = 256, skinned_size = 2304; // 112 and 2160 bytes, rounded up to the offset alignment
     size_t total = 0;
     for (const CasterDraw &c : casters) total += c.bones >= 0 ? skinned_size : static_size;
     if (!total) return;
@@ -2137,6 +2200,16 @@ void render_dynamic_shadows(Program &p)
     [pass setDepthStencilState:s_caster_depth_state];
     [pass setCullMode:MTLCullModeNone];
     [pass setVertexBuffer:s_constant_attrib offset:0 atIndex:CONSTANT_SLOT];
+    const double N = k_xl_dyn_size;
+    const MTLViewport viewports[2] = {{0, 0, N, N, 0, 1}, {N, 0, N, N, 0, 1}};
+    const MTLScissorRect scissors[2] = {{0, 0, k_xl_dyn_size, k_xl_dyn_size}, {k_xl_dyn_size, 0, k_xl_dyn_size, k_xl_dyn_size}};
+    NSUInteger halves = fine ? 2 : 1;
+    [pass setViewports:viewports count:halves];
+    [pass setScissorRects:scissors count:halves];
+    if (s_caster_halves == 2) {
+        MTLVertexAmplificationViewMapping mappings[2] = {{0, 0}, {1, 0}};
+        [pass setVertexAmplificationCount:halves viewMappings:mappings];
+    }
     size_t at = 0;
     void *last_pipeline = nullptr;
     for (const CasterDraw &c : casters) {
@@ -2149,12 +2222,14 @@ void render_dynamic_shadows(Program &p)
         }
         double m[16], object[16];
         for (int i = 0; i < 16; i++) object[i] = c.wvp[i];
-        mat_mul(to_shadow, object, m);
+        mat_mul(c.world ? sun : to_shadow, object, m);
         float m32[16];
         for (int i = 0; i < 16; i++) m32[i] = (float)m[i];
         memcpy(base + at, m32, 64);
-        memcpy(base + at + 64, window, 16);
-        if (skinned) memcpy(base + at + 80, &bones[(size_t)c.bones * 32 * 16], 32 * 64);
+        memcpy(base + at + 64, window, 32);
+        const float params[4] = {c.cutoff, 0, 0, 0};
+        memcpy(base + at + 96, params, 16);
+        if (skinned) memcpy(base + at + 112, &bones[(size_t)c.bones * 32 * 16], 32 * 64);
         if (last_pipeline != (__bridge void *)pipeline) {
             [pass setRenderPipelineState:pipeline];
             last_pipeline = (__bridge void *)pipeline;
@@ -2175,9 +2250,16 @@ void render_dynamic_shadows(Program &p)
     s_dyn_window[1] = (float)cv;
     s_dyn_window[2] = (float)(1 / (2 * half_u));
     s_dyn_window[3] = (float)(1 / (2 * half_v));
+    if (fine) {
+        s_dyn_near[0] = (float)nu;
+        s_dyn_near[1] = (float)nv;
+        s_dyn_near[2] = (float)(1 / (2 * near_u));
+        s_dyn_near[3] = (float)(1 / (2 * near_v));
+    }
     s_dyn_bias = (float)(s_dyn_bias_m * row_length(2));
     s_dyn_stats.frames++;
-    s_dyn_stats.casters += casters.size();
+    s_dyn_stats.casters += from_prepass;
+    s_dyn_stats.late += casters.size() - from_prepass;
 }
 
 // Binds everything a draw needs. Returns false when the draw has to be skipped.
@@ -2246,6 +2328,10 @@ bool prepare_draw()
     }
     if (p->dyn_window_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_window_offset, s_dyn_window, 16)) {
         memcpy(p->uniform_data[1].data() + p->dyn_window_offset, s_dyn_window, 16);
+        p->uniform_dirty[1] = true;
+    }
+    if (p->dyn_near_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_near_offset, s_dyn_near, 16)) {
+        memcpy(p->uniform_data[1].data() + p->dyn_near_offset, s_dyn_near, 16);
         p->uniform_dirty[1] = true;
     }
     if (p->dyn_bias_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_bias_offset, &s_dyn_bias, 4)) {
@@ -2548,6 +2634,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_dyn_shadows = s_shader_options.dynamic_shadows = dyn_env && atoi(dyn_env) != 0; // off unless set
     if (const char *v = getenv("WBM_DYN_RANGE")) s_dyn_range = std::max(5.0f, (float)atof(v));
     if (const char *v = getenv("WBM_DYN_BIAS")) s_dyn_bias_m = (float)atof(v);
+    if (const char *v = getenv("WBM_DYN_NEAR")) s_dyn_near_range = std::max(0.0f, (float)atof(v));
     const char *blur_env = getenv("WBM_MOTION_BLUR");
     s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
     if (const char *v = getenv("WBM_MOTION_BLUR_STRENGTH")) s_motion_blur_strength = std::max(0.0f, (float)atof(v));
@@ -2631,10 +2718,11 @@ void mtl_dump_stats(FILE *f)
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
     if (s_dyn_stats.frames)
-        fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average, %.0f more left out as scenery\n"
+        fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average, %.0f more left out as scenery, %.0f added from the main pass\n"
                    "%llu draws left out as overlays, %zu overlay meshes known at exit\n",
                 (unsigned long long)s_dyn_stats.frames, (double)s_dyn_stats.casters / (double)s_dyn_stats.frames,
-                (double)s_dyn_stats.scenery / (double)s_dyn_stats.frames, (unsigned long long)s_dyn_stats.overlays, s_overlays.size());
+                (double)s_dyn_stats.scenery / (double)s_dyn_stats.frames, (double)s_dyn_stats.late / (double)s_dyn_stats.frames,
+                (unsigned long long)s_dyn_stats.overlays, s_overlays.size());
 }
 
 void mtl_set_vsync(bool on)
@@ -2713,7 +2801,13 @@ void mtl_present(bool capture, uint32_t frame)
             s_casters.clear();
             s_caster_bones.clear();
         }
-        if (s_dyn_shadows && s_dyn_frame + 2 < s_frame_serial) s_dyn_window[2] = s_dyn_window[3] = 0; // the map has gone stale
+        if (s_dyn_shadows) {
+            s_late_ready.swap(s_late_casters);
+            s_late_casters.clear();
+            s_prepass_meshes.clear();
+        }
+        if (s_dyn_shadows && s_dyn_frame + 2 < s_frame_serial) // the map has gone stale
+            s_dyn_window[2] = s_dyn_window[3] = s_dyn_near[2] = s_dyn_near[3] = 0;
         if (s_hdr && s_frame_serial % 30 == 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
               CGFloat available = s_window.screen.maximumExtendedDynamicRangeColorComponentValue;
@@ -3193,7 +3287,9 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
-        if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset);
+        if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
+        if (s_dyn_shadows && s_pass_scene && primitive == MTLPrimitiveTypeTriangle && s_depth_test && s_depth_mask)
+            record_caster((NSUInteger)count, index_type, b->mtl, offset, true);
         if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);
         if (s_dyn_shadows && s_pass_scene && !s_depth_test) record_overlay((NSUInteger)count, offset);
         // The engine draws the sky first, with the depth test off. That draw is the one to capture.

@@ -20,6 +20,7 @@ const char *const k_xl_limit_uniform = "wbm_limit";
 const char *const k_xl_sky_sampler = "wbm_sky";
 const char *const k_xl_dyn_sampler = "wbm_dyn_map";
 const char *const k_xl_dyn_window_uniform = "wbm_dyn";
+const char *const k_xl_dyn_near_uniform = "wbm_dyn_near";
 const char *const k_xl_dyn_bias_uniform = "wbm_dyn_bias";
 
 namespace {
@@ -154,33 +155,55 @@ float wbm_shadow_pcss(sampler2D map, vec3 coord, float size, mat4 sun)
 const char k_dynamic_shadow_function[] = R"(
 uniform sampler2D wbm_dyn_map;
 uniform vec4 wbm_dyn;
+uniform vec4 wbm_dyn_near;
 uniform float wbm_dyn_bias;
 const vec2 wbm_dyn_disc[12] = vec2[12](
     vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457), vec2(-0.203, 0.621),
     vec2(0.962, -0.195), vec2(0.473, -0.480), vec2(0.519, 0.767), vec2(0.185, -0.893),
     vec2(0.507, 0.064), vec2(0.896, 0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598));
 
-float wbm_dynamic_shadow(vec3 coord)
+// One of the two windows, which lie side by side in the map: column 0 is the
+// wide one, column 1 the fine one around the camera. `inside` comes back as 0
+// outside the window, rising to 1 a little way in.
+float wbm_dyn_cascade(vec3 coord, vec3 cdx, vec3 cdy, vec4 window, float column, float spread, float bias_scale, out float inside)
 {
-    if (wbm_dyn.z <= 0.0) return 1.0;
-    vec3 q = vec3((coord.xy - wbm_dyn.xy) * wbm_dyn.zw + 0.5, coord.z);
+    vec3 q = vec3((coord.xy - window.xy) * window.zw + 0.5, coord.z);
     vec2 margin = min(q.xy, 1.0 - q.xy);
-    float inside = clamp(min(margin.x, margin.y) * 40.0, 0.0, 1.0);
+    inside = clamp(min(margin.x, margin.y) * 40.0, 0.0, 1.0);
     if (inside <= 0.0) return 1.0;
     const float size = DYN_SIZE;
-    vec3 dx = dFdx(q), dy = dFdy(q);
+    vec3 dx = vec3(cdx.xy * window.zw, cdx.z), dy = vec3(cdy.xy * window.zw, cdy.z);
     float det = dx.x * dy.y - dx.y * dy.x;
-    vec2 slope = vec2(0.0); // change of the surface's depth per texel of this map
+    vec2 slope = vec2(0.0); // change of the surface's depth per texel of this window
     if (abs(det) > 1e-18) slope = vec2(dy.y * dx.z - dx.y * dy.z, dx.x * dy.z - dy.x * dx.z) / (det * size);
     slope = clamp(slope, vec2(-wbm_dyn_bias), vec2(wbm_dyn_bias));
+    // Far away a pixel spans several texels of the map. The filter is widened
+    // to the pixel's footprint there, or the few texels it happened to hit
+    // would change from frame to frame and the shadow would flicker.
+    float footprint = clamp(max(length(dx.xy), length(dy.xy)) * size, 0.0, 12.0);
+    float radius = max(spread, footprint * 0.75);
+    float bias = wbm_dyn_bias * bias_scale * (1.0 + 0.25 * footprint);
     float angle = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
     mat2 rotate = mat2(cos(angle), sin(angle), -sin(angle), cos(angle));
     float lit = 0.0;
     for (int i = 0; i < 12; i++) {
-        vec2 o = rotate * wbm_dyn_disc[i] * 1.8;
-        lit += textureLod(wbm_dyn_map, q.xy + o / size, 0.0).x < q.z - wbm_dyn_bias + dot(slope, o) ? 0.0 : 1.0;
+        vec2 o = rotate * wbm_dyn_disc[i] * radius;
+        vec2 t = clamp(q.xy + o / size, vec2(0.5 / size), vec2(1.0 - 0.5 / size)); // stay in this window's half
+        lit += textureLod(wbm_dyn_map, vec2((t.x + column) * 0.5, t.y), 0.0).x < q.z - bias + dot(slope, o) ? 0.0 : 1.0;
     }
-    return mix(1.0, lit / 12.0, inside);
+    return lit / 12.0;
+}
+
+float wbm_dynamic_shadow(vec3 coord)
+{
+    if (wbm_dyn.z <= 0.0) return 1.0;
+    vec3 cdx = dFdx(coord), cdy = dFdy(coord);
+    float in_near = 0.0, near = 1.0;
+    if (wbm_dyn_near.z > 0.0) near = wbm_dyn_cascade(coord, cdx, cdy, wbm_dyn_near, 1.0, 1.5, 0.4, in_near);
+    if (in_near >= 1.0) return near;
+    float in_far;
+    float far = wbm_dyn_cascade(coord, cdx, cdy, wbm_dyn, 0.0, 1.8, 1.0, in_far);
+    return mix(mix(1.0, far, in_far), near, in_near);
 }
 )";
 
