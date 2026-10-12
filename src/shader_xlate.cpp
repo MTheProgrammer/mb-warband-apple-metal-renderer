@@ -23,6 +23,7 @@ const char *const k_xl_material_uniform = "wbm_material";
 const char *const k_xl_pbr_sampler = "wbm_pbr_map";
 const char *const k_xl_pbr_uniform = "wbm_pbr";
 const char *const k_xl_skin_uniform = "wbm_skin";
+const char *const k_xl_wind_uniform = "wbm_wind";
 const char *const k_xl_dyn_sampler = "wbm_dyn_map";
 const char *const k_xl_dyn_window_uniform = "wbm_dyn";
 const char *const k_xl_dyn_near_uniform = "wbm_dyn_near";
@@ -531,6 +532,10 @@ vec4 wbm_skin_sun(vec3 to_sun, vec3 normal, float shadow, vec3 back)
 {
     float mapped = dot(to_sun, normal);
     float plain = clamp(mapped, 0.0, 1.0) * shadow;
+    if (wbm_skin.w > 0.0) { // a leaf: what falls on its far side comes through, yellower
+        float through = clamp(-mapped, 0.0, 1.0) * wbm_skin.w * shadow;
+        return vec4(max(vec3(plain), through * vec3(0.85, 1.0, 0.35)), plain);
+    }
     if (wbm_skin.x < 0.5) return vec4(vec3(plain), plain);
     return vec4(wbm_skin_core(mapped, normalize(to_sun).z, shadow) + back, plain);
 }
@@ -542,6 +547,75 @@ vec4 wbm_skin_lit(float mapped, float smooth_, float shadow, vec3 back)
 }
 )";
 
+// Wind. Foliage is moved sideways before it is projected: slowly to and fro
+// with a quicker flutter on top, by an amount that grows with height, so that
+// a tree's crown sways while its foot stays put. Grass comes in batches already
+// placed in the world, where height says nothing; there the texture coordinate
+// does: a blade's tip is at one end of the texture and its root at the other.
+// Only the position on screen moves: lighting and shadows are worked out for
+// the plant at rest.
+const char k_wind_function[] = R"(
+uniform vec4 wbm_wind;
+
+vec4 wbm_sway(vec4 p, vec2 uv)
+{
+    if (wbm_wind.y <= 0.0) return p;
+    float t = wbm_wind.x, reach, phase;
+    if (wbm_wind.z < 0.5) {
+        float h = clamp(p.z / 6.0, 0.0, 1.5);
+        reach = 0.14 * h * h;
+        phase = wbm_wind.w + dot(p.xyz, vec3(0.31, 0.27, 0.19));
+    } else {
+        reach = 0.07 * clamp(wbm_wind.z > 1.5 ? uv.y : 1.0 - uv.y, 0.0, 1.0);
+        phase = dot(p.xy, vec2(0.23, 0.17));
+    }
+    float gust = 0.6 + 0.4 * sin(t * 0.5 + phase * 0.11);
+    vec2 push = vec2(sin(t * 1.3 + phase) + 0.35 * sin(t * 3.7 + phase * 2.3), 0.6 * cos(t * 1.1 + phase * 0.8) + 0.35 * sin(t * 4.3 + phase * 1.9));
+    p.xy += push * (reach * gust * wbm_wind.y);
+    return p;
+}
+)";
+
+bool add_wind(std::string &vs)
+{
+    // Rigid geometry only: what is skinned moves by its bones.
+    if (vs.find("matWorldArray") != std::string::npos || vs.find("uniform mat4 matWorldViewProj;") == std::string::npos) return false;
+    static const std::regex project(R"(\(matWorldViewProj \* (\w+)\))");
+    if (!std::regex_search(vs, project)) return false;
+    std::string uv = vs.find("attribute vec2 inTexCoord;") != std::string::npos ? "inTexCoord" : "vec2(0.0)";
+    vs = std::regex_replace(vs, project, "(matWorldViewProj * wbm_sway($1, " + uv + "))");
+    return true;
+}
+
+// The engine's own foliage shaders (grass, bushes, leaves) light without a
+// normal: a fixed share of the sun's colour, whichever way a leaf faces. For
+// those the light coming through is judged by where the viewer stands: looking
+// towards the sun, one sees the far side of the leaves, lit through.
+// wbm_leaf_sun: xyz the direction to the sun in the world, w the strength, 0
+// for what is not foliage. wbm_leaf_eye: the camera's place in the world.
+const char k_leaf_function[] = R"(
+uniform vec4 wbm_leaf_sun;
+uniform vec4 wbm_leaf_eye;
+
+vec4 wbm_leaf_glow(vec3 world)
+{
+    if (wbm_leaf_sun.w <= 0.0) return vec4(1.0);
+    float into = clamp(dot(normalize(world - wbm_leaf_eye.xyz), wbm_leaf_sun.xyz), 0.0, 1.0);
+    return vec4(1.0) + wbm_leaf_sun.w * 2.5 * into * into * vec4(0.85, 1.0, 0.35, 0.0);
+}
+)";
+
+bool add_leaf_glow(std::string &vs)
+{
+    // SunLight = ((sun colour * 0.34) * (vMaterialColor * inColor0.zyxw)), and the world position from matWorld * P
+    static const std::regex flat(R"(SunLight = \(\((tmpvar_\d+) \* (0\.\d+)\) \* \(vMaterialColor \* inColor0\.zyxw\)\);)");
+    static const std::regex placed(R"(\(matWorld \* (tmpvar_\d+)\))");
+    std::smatch m;
+    if (!std::regex_search(vs, flat) || !std::regex_search(vs, m, placed)) return false;
+    vs = std::regex_replace(vs, flat, "SunLight = ((($1 * $2) * wbm_leaf_glow((matWorld * " + std::string(m[1]) + ").xyz)) * (vMaterialColor * inColor0.zyxw));");
+    return true;
+}
+
 // Shaders that light per vertex get the wrap alone, from the vertex normal.
 const char k_skin_vertex_function[] = R"(
 uniform vec4 wbm_skin;
@@ -549,6 +623,7 @@ uniform vec4 wbm_skin;
 vec4 wbm_skin_wrap(float facing)
 {
     float plain = clamp(facing, 0.0, 1.0);
+    if (wbm_skin.w > 0.0) return vec4(max(vec3(plain), clamp(-facing, 0.0, 1.0) * wbm_skin.w * vec3(0.85, 1.0, 0.35)), plain);
     if (wbm_skin.x < 0.5) return vec4(plain);
     const vec3 wrap = vec3(0.38, 0.16, 0.07);
     vec3 lit = clamp((vec3(facing) + wrap) / (1.0 + wrap), 0.0, 1.0) / (1.0 + 0.5 * wrap);
@@ -865,7 +940,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, options.debug_materials, pbr_extra);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
     // After the shadow rewrite, which looks for the sun term's shadow variable by its original shape.
-    bool skin = options.skin_scattering && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl));
+    bool skin = (options.skin_scattering || options.foliage_backlight) && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl));
+    bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
+    bool wind = vertex && options.wind && add_wind(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
@@ -884,6 +961,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
     if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
+    if (leaf) out << k_leaf_function;
+    if (wind) out << k_wind_function;
     if (skin && vertex) out << k_skin_vertex_function;
     if (skin && !vertex) { // with the materials debug view, skin that scatters is painted red
         std::string f = k_skin_function;

@@ -6,8 +6,8 @@
 #include <cctype>
 #include <string>
 
-enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_HAIR, MAT_COUNT };
-static const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin", "wood", "stone and ground", "horse", "hair"};
+enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_HAIR, MAT_FLORA, MAT_COUNT };
+static const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin", "wood", "stone and ground", "horse", "hair", "foliage"};
 
 inline int classify_texture_name(std::string name)
 {
@@ -23,11 +23,14 @@ inline int classify_texture_name(std::string name)
         {MAT_LEATHER, {"leather", "boot", "saddle", "hide", "fur", "nomad", "belt", "glove", "shoe", "pelt"}},
         {MAT_SKIN, {"face", "body", "hand", "skin"}},
         {MAT_HAIR, {"hair", "beard"}},
-        {MAT_WOOD, {"plank", "wood", "bark", "tree", "trunk", "bow", "barrel", "cart", "fence", "palisade", "timber"}},
-        {MAT_STONE, {"stone", "wall", "rock", "stucco", "ground", "terrain", "roof", "building", "village", "brick", "earth", "road", "sand", "snow", "grass", "castle", "town", "floor", "mud", "steppe", "desert", "plaster"}},
+        {MAT_FLORA, {"bush", "grass", "plant", "wheat", "tree", "leaf", "leaves", "flora", "fern", "ivy", "flower", "reed", "foliage", "shrub", "weed"}},
+        {MAT_WOOD, {"plank", "wood", "bark", "trunk", "bow", "barrel", "cart", "fence", "palisade", "timber"}},
+        {MAT_STONE, {"stone", "wall", "rock", "stucco", "ground", "terrain", "roof", "building", "village", "brick", "earth", "road", "sand", "snow", "castle", "town", "floor", "mud", "steppe", "desert", "plaster"}},
         {MAT_HORSE, {"horse", "courser", "hunter", "steed"}},
     };
     if (name.find("warhorse") != std::string::npos) return MAT_UNKNOWN; // a horse in armour
+    if (name.find("terrain") != std::string::npos || name.find("ground") != std::string::npos) return MAT_STONE; // grassy or not
+    if (name.find("bark") != std::string::npos || name.find("trunk") != std::string::npos) return MAT_WOOD;     // of a palm tree, too
     int found = MAT_UNKNOWN, classes = 0;
     for (auto &row : table) {
         for (const char *w : row.words) {

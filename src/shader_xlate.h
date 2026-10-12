@@ -90,6 +90,13 @@ struct XlOptions {
     // pores, and the edge of a shadow tinted the same way. Whether it does is
     // up to the wbm_skin uniform, which the backend sets per draw.
     bool skin_scattering = false;
+    // Leaves lit from behind: where skin_scattering rewrites the sun's diffuse
+    // term, foliage also lets sunlight through to the side turned from the sun.
+    // Either option brings the rewrite and the wbm_skin uniform in.
+    bool foliage_backlight = false;
+    // Wind: vertex shaders move what the backend marks as foliage, more the
+    // higher up it is. Adds the wbm_wind uniform (see k_xl_wind_uniform).
+    bool wind = false;
     // For tuning: shaders with an environment reflection show their estimated
     // metalness in place of their colour, white for metal and black for none.
     bool debug_materials = false;
@@ -143,8 +150,16 @@ extern const char *const k_xl_pbr_uniform;
 // With skin_scattering: wbm_skin. x: 1 when the surface being drawn is skin,
 // 0 otherwise; y: metres per unit of shadow-map depth while the per-frame
 // shadow map's fine window is there to measure thickness with, else 0;
-// z: strength of the light coming through thin parts.
+// z: strength of the light coming through thin parts; w: above 0 when the
+// surface is foliage, and then how much sunlight comes through a leaf.
 extern const char *const k_xl_skin_uniform;
+
+// With wind: wbm_wind, in the vertex stage. x: time in seconds; y: strength, 0
+// for whatever is not foliage; z: 0 when positions are in the object's own
+// space with its base at height 0, 1 when they are in world space (grass,
+// which the engine batches), where the texture coordinate tells tip from
+// root; w: a phase for this object, so that neighbours do not move as one.
+extern const char *const k_xl_wind_uniform;
 
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in
 // the order +X, -X, +Y, -Y, +Z, -Z (Z is up). Face f looks along its axis with

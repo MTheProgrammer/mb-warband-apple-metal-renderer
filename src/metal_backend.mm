@@ -148,7 +148,9 @@ struct Program {
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
     int material_offset = -1;     // fragment stage, see k_xl_material_uniform
     int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler
-    int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform // fragment stage, see k_xl_dyn_sampler
+    int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform
+    int wind_offset = -1;          // vertex stage, see k_xl_wind_uniform
+    int leaf_sun_offset = -1, leaf_eye_offset = -1; // vertex stage, see k_leaf_function in shader_xlate.cpp // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
     const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
@@ -357,9 +359,16 @@ const float k_material_params[MAT_COUNT][4] = {
     {0.0f, 2.5f, 0.4f, 1.0f},   // stone and ground
     {0.0f, 1.2f, 0.9f, 1.0f},   // a horse's coat
     {0.0f, 1.6f, 0.7f, 1.0f},   // hair and beards
+    {0.0f, 2.0f, 0.5f, 1.0f},   // foliage
 };
 bool s_materials;
 bool s_debug_skin = getenv("WBM_DEBUG_SKIN") != nullptr;
+float s_eye[4];            // the camera's place in the world, from render_dynamic_shadows
+uint64_t s_eye_frame;
+float s_foliage_backlight; // WBM_FOLIAGE: how much sunlight comes through leaves, 0 for none
+float s_wind_strength;     // WBM_WIND, 0 for none
+float s_wind_flip;         // WBM_WIND_FLIP=1: a grass blade's tip is where the texture coordinate is 0, not 1
+double s_wind_time;        // the same for every draw of a frame
 float s_skin_backlight = 0.6f; // WBM_SSS_BACKLIGHT: sunlight through thin skin; 0 for none
 // The game's texture files, keyed by content: filled once at start, read-only afterwards.
 struct KnownTexture {
@@ -959,7 +968,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.leaf_eye_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1027,6 +1036,9 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_material_uniform) p.material_offset = u.offset;
             else if (u.name == k_xl_pbr_uniform) p.pbr_offset = u.offset;
             else if (u.name == k_xl_skin_uniform) p.skin_offset[s] = u.offset;
+            else if (u.name == k_xl_wind_uniform) p.wind_offset = u.offset;
+            else if (u.name == "wbm_leaf_sun") p.leaf_sun_offset = u.offset;
+            else if (u.name == "wbm_leaf_eye") p.leaf_eye_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -1081,7 +1093,7 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
         memcpy(s_sun_matrix, data, sizeof s_sun_matrix); // the same for every program in a scene
         s_sun_matrix_valid = true;
     }
-    if ((s_contact_shadows || s_light_shafts || s_sky_ambient) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
+    if ((s_contact_shadows || s_light_shafts || s_sky_ambient || s_foliage_backlight > 0) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
         // The UI and other passes set these too; only the values in use while the
         // scene buffer is bound describe the scene's sun.
         Target t;
@@ -2177,6 +2189,8 @@ void apply_fxaa()
 // Holds the frame rate to a limit by waiting at the end of a frame.
 void limit_frame_rate()
 {
+    static const double start = CACurrentMediaTime();
+    s_wind_time = fmod(CACurrentMediaTime() - start, 3600.0); // for the frame about to begin
     static std::chrono::steady_clock::time_point next;
     double limit = s_scene_frame + 1 >= s_frame_serial ? s_max_fps : (s_menu_fps > 0 ? s_menu_fps : s_max_fps); // s_frame_serial was just advanced
     auto now = std::chrono::steady_clock::now();
@@ -2562,6 +2576,8 @@ void render_dynamic_shadows(Program &p)
 
     // Where the camera is, and which way it faces: the direction in which w grows.
     double eye[3] = {inv_frame[12], inv_frame[13], inv_frame[14]};
+    for (int k = 0; k < 3; k++) s_eye[k] = (float)eye[k];
+    s_eye_frame = s_frame_serial;
     double fx = view_proj[3], fy = view_proj[7], flat = sqrt(fx * fx + fy * fy); // Z is up
     double reach = s_dyn_range * 0.6;
     double focus[3] = {eye[0] + (flat > 1e-6 ? fx / flat * reach : 0), eye[1] + (flat > 1e-6 ? fy / flat * reach : 0), eye[2]};
@@ -2756,10 +2772,13 @@ bool prepare_draw()
         }
     }
     Texture *diffuse = nullptr; // the diffuse texture says what the surface is
-    if ((p->material_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
+    if ((p->material_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->wind_offset >= 0 || p->leaf_sun_offset >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
         UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
         diffuse = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
     }
+    if (s_debug_skin && diffuse && diffuse->material == MAT_FLORA && (p->wind_offset < 0 || (p->skin_offset[0] < 0 && p->skin_offset[1] < 0 && p->leaf_sun_offset < 0)))
+        complain("foliage drawn by program %u: wind %s, light through leaves %s", s_program, p->wind_offset >= 0 ? "yes" : "NO",
+                 p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->leaf_sun_offset >= 0 ? "yes" : "NO");
     if (s_debug_skin && diffuse && diffuse->material == MAT_SKIN && p->skin_offset[0] < 0 && p->skin_offset[1] < 0) {
         // Skin drawn by a shader the scattering rewrite did not recognise: show how it lights.
         for (auto &sh : p->shaders) {
@@ -2779,10 +2798,42 @@ bool prepare_draw()
             complain("skin without scattering, program %u %s: %s", s_program, sh->type == GL_VERTEX_SHADER ? "vs" : "fs", lines.c_str());
         }
     }
+    if (p->leaf_sun_offset >= 0 && p->leaf_eye_offset >= 0) {
+        float sun[4] = {0, 0, 0, 0};
+        // Needs the sun's direction and the camera's place, which the per-frame shadow map works out.
+        if (diffuse && diffuse->material == MAT_FLORA && s_sun_valid && s_eye_frame + 2 >= s_frame_serial) {
+            float len = sqrtf(s_sun_dir[0] * s_sun_dir[0] + s_sun_dir[1] * s_sun_dir[1] + s_sun_dir[2] * s_sun_dir[2]);
+            if (len > 1e-6f) sun[0] = -s_sun_dir[0] / len, sun[1] = -s_sun_dir[1] / len, sun[2] = -s_sun_dir[2] / len, sun[3] = s_foliage_backlight;
+        }
+        if (memcmp(p->uniform_data[0].data() + p->leaf_sun_offset, sun, 16) || memcmp(p->uniform_data[0].data() + p->leaf_eye_offset, s_eye, 16)) {
+            memcpy(p->uniform_data[0].data() + p->leaf_sun_offset, sun, 16);
+            memcpy(p->uniform_data[0].data() + p->leaf_eye_offset, s_eye, 16);
+            p->uniform_dirty[0] = true;
+        }
+    }
+    if (p->wind_offset >= 0) {
+        float wind[4] = {0, 0, 0, 0};
+        if (diffuse && diffuse->material == MAT_FLORA) {
+            // Batches placed in the world (grass) come with no world matrix to speak of.
+            bool placed = true;
+            float phase = 0;
+            if (p->u_world) {
+                const float *w = (const float *)(p->uniform_data[0].data() + p->u_world->offset);
+                placed = fabsf(w[12]) + fabsf(w[13]) + fabsf(w[14]) > 1e-3f;
+                phase = w[12] * 0.37f + w[13] * 0.71f;
+            }
+            wind[0] = (float)s_wind_time, wind[1] = s_wind_strength, wind[2] = placed ? 0.0f : 1.0f + s_wind_flip, wind[3] = fmodf(phase, 6.2831853f);
+        }
+        if (memcmp(p->uniform_data[0].data() + p->wind_offset, wind, 16)) {
+            memcpy(p->uniform_data[0].data() + p->wind_offset, wind, 16);
+            p->uniform_dirty[0] = true;
+        }
+    }
     for (int stage = 0; stage < 2; stage++) {
         if (p->skin_offset[stage] < 0) continue;
-        const float skin[4] = {diffuse && diffuse->material == MAT_SKIN ? 1.0f : 0.0f,
-                               s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f, s_skin_backlight, 0};
+        const float skin[4] = {s_shader_options.skin_scattering && diffuse && diffuse->material == MAT_SKIN ? 1.0f : 0.0f,
+                               s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f, s_skin_backlight,
+                               diffuse && diffuse->material == MAT_FLORA ? s_foliage_backlight : 0.0f};
         if (memcmp(p->uniform_data[stage].data() + p->skin_offset[stage], skin, 16)) {
             memcpy(p->uniform_data[stage].data() + p->skin_offset[stage], skin, 16);
             p->uniform_dirty[stage] = true;
@@ -3174,8 +3225,14 @@ void mtl_attach_window(void *nswindow, int width, int height)
     const char *sss_env = getenv("WBM_SSS");
     s_shader_options.skin_scattering = sss_env && atoi(sss_env) != 0; // off unless set
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_FOLIAGE")) s_foliage_backlight = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_WIND")) s_wind_strength = std::max(0.0f, (float)atof(v));
+    s_wind_flip = getenv("WBM_WIND_FLIP") ? 1.0f : 0.0f;
+    s_shader_options.foliage_backlight = s_foliage_backlight > 0;
+    s_shader_options.wind = s_wind_strength > 0;
     index_texture_packs();
-    if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering) scan_game_textures();
+    if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering || s_shader_options.wind || s_shader_options.foliage_backlight)
+        scan_game_textures();
     const char *fxaa_env = getenv("WBM_FXAA");
     s_fxaa = fxaa_env && atoi(fxaa_env) != 0; // off unless set
     if (const char *v = getenv("WBM_MAX_FPS")) s_max_fps = std::max(0.0, atof(v));
@@ -3237,11 +3294,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; sky ambient %s; material classes %s; skin scattering %s; filmic tone map %s; extended-range output %s",
+            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; sky ambient %s; material classes %s; skin scattering %s; wind %.1f; light through leaves %.1f; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_sky ? "on, with metalness and sky reflection" : s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off", s_sky_ambient ? "on" : "off", s_materials ? "on" : "off", s_shader_options.skin_scattering ? "on" : "off",
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off", s_sky_ambient ? "on" : "off", s_materials ? "on" : "off", s_shader_options.skin_scattering ? "on" : "off", (double)s_wind_strength, (double)s_foliage_backlight,
             s_shader_options.filmic_tonemap ? "on" : "off",
             s_hdr ? "on" : "off");
 }
