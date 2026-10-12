@@ -89,6 +89,7 @@ struct UniformLocation {
     int texture_index[2] = {-1, -1};                  // set for samplers
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
+    bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
 
@@ -268,6 +269,14 @@ bool s_pass_scene;
 // last given to a shader while the scene was being drawn.
 bool s_contact_shadows;
 float s_contact_strength = 0.5f, s_contact_length = 0.4f; // WBM_CONTACT_STRENGTH; WBM_CONTACT_LENGTH in metres
+// Light shafts from the sun (WBM_LIGHT_SHAFTS=1), run after occlusion on the same scene buffer.
+bool s_light_shafts;
+float s_shaft_strength = 0.7f; // WBM_SHAFT_STRENGTH
+// The sky atlas that PBR reflections sample (see k_xl_sky_sampler), redrawn
+// from the engine's sky dome each frame it is seen.
+id<MTLTexture> s_sky_atlas;
+id<MTLSamplerState> s_sky_sampler;
+uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
 bool s_sun_valid;
 void apply_ambient_occlusion();
@@ -429,7 +438,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     end_pass();
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
-    if ((s_ao || s_contact_shadows) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
+    if ((s_ao || s_contact_shadows || s_light_shafts) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         apply_ambient_occlusion();
@@ -731,6 +740,7 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.back().name = name;
                 p.locations.back().is_sun_dir = name == "vSunDir";
                 p.locations.back().is_sun_color = name == "vSunColor";
+                p.locations.back().is_sky = name == k_xl_sky_sampler;
             }
             return p.locations[(size_t)it->second];
         };
@@ -779,7 +789,7 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (!p || loc < 0 || (size_t)loc >= p->locations.size()) return;
     UniformLocation &l = p->locations[(size_t)loc];
     if ((l.texture_index[0] >= 0 || l.texture_index[1] >= 0) && data_is_int) l.unit = *(const GLint *)data;
-    if (s_contact_shadows && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
+    if ((s_contact_shadows || s_light_shafts) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
         // The UI and other passes set these too; only the values in use while the
         // scene buffer is bound describe the scene's sun.
         Target t;
@@ -868,6 +878,7 @@ struct VertexBinding {
     uintptr_t base[MAX_VERTEX_SLOTS];
     int slots = 0;
 };
+VertexBinding s_draw_binding; // of the draw most recently prepared
 
 // Describes the current vertex arrays for the attributes the program reads.
 // Attributes that share a buffer and stride share a Metal buffer slot.
@@ -1013,6 +1024,8 @@ struct Params {
     float radius, strength, reversed, fade_start;
     float4 sun;        // xyz: direction to the sun in view space
     float shadow_strength, shadow_length;
+    float2 shaft_size; // of the light-shaft textures, in pixels
+    float4 shaft;      // xy: the sun's position on screen (0..1), z: how visible it is, w: strength
 };
 
 #if WBM_MSAA
@@ -1172,6 +1185,50 @@ fragment float4 ao_apply(VertexOut in [[stage_in]], texture2d<float> ao [[textur
     float a = ao.sample(smooth, in.position.xy / p.depth_size).x;
     return float4(a, a, a, 1.0);
 }
+
+// Light shafts ("god rays"). Sky near the sun is bright; anything in front of
+// it is not. Smearing that bright-sky mask along lines towards the sun's
+// position on screen makes streaks of light pass the edges of whatever blocks
+// it, which is how shafts through trees and past towers look.
+//
+// shaft_mask, quarter resolution: the scene's colour where the pixel is sky,
+// weighted towards the sun. shaft_blur: 40 steps from each pixel towards the
+// sun, fading with distance, jittered per pixel. shaft_apply: added to the scene.
+fragment float4 shaft_mask(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]], texture2d<float> z [[texture(1)]],
+                           constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    float2 uv = in.position.xy / p.shaft_size;
+    float sky = z.sample(smooth, uv).x > 1.0e5 ? 1.0 : 0.0;
+    float2 ndc = uv * 2.0 - 1.0;
+    float3 dir = normalize(float3(ndc.x / p.p00, ndc.y / p.p11, 1.0));
+    float near_sun = pow(saturate(dot(dir, normalize(p.sun.xyz))), 24.0);
+    return float4(scene.sample(smooth, uv).rgb * sky * (0.1 + 0.9 * near_sun), 1.0);
+}
+
+fragment float4 shaft_blur(VertexOut in [[stage_in]], texture2d<float> mask [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    const int samples = 40;
+    float2 uv = in.position.xy / p.shaft_size;
+    float2 step = (p.shaft.xy - uv) * (0.85 / float(samples));
+    float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+    float2 q = uv + step * noise;
+    float3 sum = float3(0.0);
+    float weight = 1.0;
+    for (int i = 0; i < samples; i++) {
+        sum += mask.sample(smooth, q).rgb * weight;
+        weight *= 0.965;
+        q += step;
+    }
+    return float4(sum * (p.shaft.z * p.shaft.w / float(samples)), 1.0);
+}
+
+fragment float4 shaft_apply(VertexOut in [[stage_in]], texture2d<float> shafts [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    return float4(shafts.sample(smooth, in.position.xy / p.depth_size).rgb, 0.0);
+}
 )";
 
 struct AOParams { // must match Params in k_ao_source
@@ -1179,12 +1236,15 @@ struct AOParams { // must match Params in k_ao_source
     float depth_size[2], ao_size[2];
     float radius, strength, reversed, fade_start;
     float sun[4];
-    float shadow_strength, shadow_length, pad[2];
+    float shadow_strength, shadow_length, shaft_size[2];
+    float shaft[4];
 };
 
 id<MTLLibrary> s_ao_library;
 id<MTLRenderPipelineState> s_ao_linearize_pipeline, s_ao_compute_pipeline, s_ao_blur_pipeline;
 id<MTLTexture> s_ao_z_texture, s_ao_blurred_texture;
+id<MTLRenderPipelineState> s_shaft_mask_pipeline, s_shaft_blur_pipeline, s_shaft_apply_pipeline;
+id<MTLTexture> s_shaft_mask_texture, s_shaft_texture;
 std::map<std::pair<int, int>, id<MTLRenderPipelineState>> s_ao_apply_pipelines; // by colour format and sample count
 id<MTLTexture> s_ao_texture;
 
@@ -1197,7 +1257,7 @@ bool ao_setup()
     s_ao_library = [s_device newLibraryWithSource:@(k_ao_source) options:options error:&error];
     if (!s_ao_library) {
         complain("ambient occlusion shaders did not compile: %s", error.localizedDescription.UTF8String);
-        return s_ao = s_contact_shadows = false;
+        return s_ao = s_contact_shadows = s_light_shafts = false;
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [s_ao_library newFunctionWithName:@"ao_vertex"];
@@ -1209,9 +1269,21 @@ bool ao_setup()
     s_ao_compute_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
     d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_blur"];
     s_ao_blur_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
-    if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline || !s_ao_blur_pipeline) {
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"shaft_mask"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    s_shaft_mask_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"shaft_blur"];
+    s_shaft_blur_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"shaft_apply"];
+    d.colorAttachments[0].blendingEnabled = YES; // added to the scene's colour; alpha untouched
+    d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+    d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+    d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    s_shaft_apply_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline || !s_ao_blur_pipeline || !s_shaft_mask_pipeline ||
+        !s_shaft_blur_pipeline || !s_shaft_apply_pipeline) {
         complain("ambient occlusion pipeline failed: %s", error.localizedDescription.UTF8String);
-        return s_ao = s_contact_shadows = false;
+        return s_ao = s_contact_shadows = s_light_shafts = false;
     }
     return true;
 }
@@ -1263,17 +1335,33 @@ void apply_ambient_occlusion()
     params.radius = s_ao_radius * scale;
     params.strength = s_ao ? s_ao_strength : 0.0f;
     // vSunDir points the way the light travels, so the direction to the sun is
-    // its negative. No sun (night, interiors) means no contact shadows.
+    // its negative. No sun (night, interiors) means no contact shadows or shafts.
     memset(params.sun, 0, sizeof params.sun);
+    memset(params.shaft, 0, sizeof params.shaft);
     params.shadow_strength = 0;
     params.shadow_length = s_contact_length * scale;
-    params.pad[0] = params.pad[1] = 0;
+    NSUInteger sw = std::max<NSUInteger>(1, w / 4), sh = std::max<NSUInteger>(1, h / 4);
+    params.shaft_size[0] = (float)sw, params.shaft_size[1] = (float)sh;
     float sun_brightness = s_sun_color[0] + s_sun_color[1] + s_sun_color[2];
-    if (s_contact_shadows && s_sun_valid && sun_brightness > 0.05f && s_camera.view_frame == s_frame_serial) {
+    bool has_sun = s_sun_valid && sun_brightness > 0.05f && s_camera.view_frame == s_frame_serial;
+    bool shafts = false;
+    if (has_sun) {
         for (int r = 0; r < 3; r++)
             params.sun[r] = (float)-(s_camera.view[r][0] * s_sun_dir[0] + s_camera.view[r][1] * s_sun_dir[1] + s_camera.view[r][2] * s_sun_dir[2]);
-        params.shadow_strength = s_contact_strength;
+        if (s_contact_shadows) params.shadow_strength = s_contact_strength;
+        if (s_light_shafts && params.sun[2] > 0.05f) { // the sun is in front of the camera
+            float nx = params.sun[0] * params.p00 / params.sun[2], ny = params.sun[1] * params.p11 / params.sun[2];
+            float off_screen = std::max(fabsf(nx), fabsf(ny));
+            float visible = 1.0f - std::min(1.0f, std::max(0.0f, (off_screen - 1.0f) / 0.8f)); // fades out as the sun leaves the view
+            params.shaft[0] = nx * 0.5f + 0.5f;
+            params.shaft[1] = ny * 0.5f + 0.5f;
+            params.shaft[2] = visible;
+            params.shaft[3] = s_shaft_strength;
+            shafts = visible > 0.01f;
+        }
     }
+    bool occlude = s_ao || params.shadow_strength > 0;
+    if (!occlude && !shafts) return;
     params.reversed = s_reverse_depth ? 1.0f : 0.0f;
     params.fade_start = 60.0f * scale; // beyond this the effect fades out, and is gone at twice it
 
@@ -1287,6 +1375,13 @@ void apply_ambient_occlusion()
         s_ao_texture = make(MTLPixelFormatR8Unorm);
         s_ao_blurred_texture = make(MTLPixelFormatR8Unorm);
         s_ao_z_texture = make(MTLPixelFormatR32Float);
+    }
+    if (!s_shaft_texture || s_shaft_texture.width != sw || s_shaft_texture.height != sh) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:sw height:sh mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_shaft_mask_texture = [s_device newTextureWithDescriptor:td];
+        s_shaft_texture = [s_device newTextureWithDescriptor:td];
     }
     id<MTLRenderPipelineState> apply = ao_apply_pipeline(s_last.color.pixelFormat, 1);
     if (!apply) return;
@@ -1304,24 +1399,33 @@ void apply_ambient_occlusion()
         [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [pass endEncoding];
     };
+    // Both `onto` passes blend onto the resolved image, which is what
+    // post-processing reads. The multisampled copy is left as it was: writing
+    // there would blend every sample and resolve the whole buffer again, and the
+    // engine does not draw into the scene once post-processing has begun.
+    auto onto_scene = [&](id<MTLRenderPipelineState> pipeline, id<MTLTexture> input) {
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        d.colorAttachments[0].texture = s_last.color;
+        d.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+        [pass setRenderPipelineState:pipeline];
+        [pass setFragmentTexture:input atIndex:0];
+        [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+        [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [pass endEncoding];
+    };
     half_pass(s_ao_z_texture, s_ao_linearize_pipeline, s_last.depth, nil);
-    half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture, nil);
-    half_pass(s_ao_blurred_texture, s_ao_blur_pipeline, s_ao_texture, s_ao_z_texture);
-
-    // Blended onto the resolved image, which is what post-processing reads. The
-    // multisampled copy is left as it was: writing there would blend every
-    // sample and resolve the whole buffer a second time, and the engine does not
-    // draw into the scene again once post-processing has begun.
-    MTLRenderPassDescriptor *onto = [MTLRenderPassDescriptor renderPassDescriptor];
-    onto.colorAttachments[0].texture = s_last.color;
-    onto.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    onto.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:onto];
-    [pass setRenderPipelineState:apply];
-    [pass setFragmentTexture:s_ao_blurred_texture atIndex:0];
-    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
-    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [pass endEncoding];
+    if (occlude) {
+        half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture, nil);
+        half_pass(s_ao_blurred_texture, s_ao_blur_pipeline, s_ao_texture, s_ao_z_texture);
+        onto_scene(apply, s_ao_blurred_texture);
+    }
+    if (shafts) { // after occlusion, so that the light is not darkened by it
+        half_pass(s_shaft_mask_texture, s_shaft_mask_pipeline, s_last.color, s_ao_z_texture);
+        half_pass(s_shaft_texture, s_shaft_blur_pipeline, s_shaft_mask_texture, nil);
+        onto_scene(s_shaft_apply_pipeline, s_shaft_texture);
+    }
 }
 
 // ---- the scene camera ------------------------------------------------------------------
@@ -1538,7 +1642,10 @@ bool prepare_draw()
             Texture *t = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
             id<MTLTexture> texture = t && t->mtl ? t->mtl : s_white;
             id<MTLSamplerState> sampler = t && t->mtl ? sampler_for(*t) : s_samplers.begin()->second;
-            if (l.srgb && t && t->mtl) {
+            if (l.is_sky) { // not one of the game's textures
+                texture = s_sky_atlas ? s_sky_atlas : s_white;
+                if (s_sky_sampler) sampler = s_sky_sampler;
+            } else if (l.srgb && t && t->mtl) {
                 // The shader no longer decodes this sampler's colour itself.
                 if (id<MTLTexture> view = srgb_view_for(*t)) texture = view;
                 else complain("a texture without an sRGB format is bound to %s; it will look too bright", l.name.c_str());
@@ -1563,8 +1670,136 @@ bool prepare_draw()
     }
     bind_buffer(0, s_constant_attrib, 0, CONSTANT_SLOT);
     s_last.draws++;
-    if (s_pass_scene && (s_ao || s_contact_shadows) && s_camera.view_frame != s_frame_serial) observe_camera(*p);
+    s_draw_binding = binding;
+    if (s_pass_scene && (s_ao || s_contact_shadows || s_light_shafts) && s_camera.view_frame != s_frame_serial) observe_camera(*p);
     return true;
+}
+
+// ---- the sky atlas ------------------------------------------------------------------------
+
+// Redraws the draw that was just issued, the engine's sky dome, six more times:
+// once per face of the atlas, each with a 90-degree view along one axis. The
+// dome's own shader, textures and vertex data are reused; only its
+// world-view-projection matrix is replaced. The dome is centred on the camera,
+// so its world matrix with the translation removed puts it around the origin.
+//
+// This runs in a command buffer of its own, committed at once: a render pass is
+// open on the main one, and the atlas has to be finished before the draws that
+// follow in that pass sample it.
+void capture_sky(MTLPrimitiveType primitive, NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset)
+{
+    Program *p = find(s_programs, s_program);
+    double world[16];
+    if (!p || !vertex_matrix(*p, "matWorld", world)) return;
+    auto it = p->location_by_name.find("matWorldViewProj");
+    const XlUniform *wvp = it == p->location_by_name.end() ? nullptr : p->locations[(size_t)it->second].uniform[0];
+    if (!wvp) return;
+    s_sky_frame = s_frame_serial;
+
+    const int N = k_xl_sky_face_size;
+    if (!s_sky_atlas) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:6 * N height:N mipmapped:YES];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_sky_atlas = [s_device newTextureWithDescriptor:td];
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.mipFilter = MTLSamplerMipFilterLinear;
+        s_sky_sampler = [s_device newSamplerStateWithDescriptor:sd];
+    }
+    PipelineKey key = s_last_key; // the dome's vertex layout, onto the atlas instead of the scene
+    key.color_format = (uint16_t)MTLPixelFormatRGBA16Float;
+    key.depth_format = (uint16_t)MTLPixelFormatInvalid;
+    key.samples = 1;
+    key.blend = 0;
+    key.blend_src = key.blend_dst = key.blend_eq = 0;
+    id<MTLRenderPipelineState> pipeline = pipeline_for(*p, key);
+    if (!pipeline) return;
+
+    world[12] = world[13] = world[14] = 0;
+    const double near = 0.1, far = 10000;
+    double projection[16] = {};
+    projection[0] = projection[5] = 1; // 90 degrees, square
+    projection[10] = -(far + near) / (far - near);
+    projection[11] = -1;
+    projection[14] = -2 * far * near / (far - near);
+    static const double faces[6][2][3] = { // forward, up; see k_xl_sky_sampler
+        {{1, 0, 0}, {0, 0, 1}}, {{-1, 0, 0}, {0, 0, 1}}, {{0, 1, 0}, {0, 0, 1}},
+        {{0, -1, 0}, {0, 0, 1}}, {{0, 0, 1}, {0, 1, 0}}, {{0, 0, -1}, {0, 1, 0}}};
+
+    id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
+    for (int f = 0; f < 6; f++) {
+        const double *fw = faces[f][0], *up = faces[f][1];
+        double right[3] = {fw[1] * up[2] - fw[2] * up[1], fw[2] * up[0] - fw[0] * up[2], fw[0] * up[1] - fw[1] * up[0]};
+        double view[16] = {}, vw[16], m[16]; // rows: right, up, -forward
+        for (int c = 0; c < 3; c++) view[c * 4 + 0] = right[c], view[c * 4 + 1] = up[c], view[c * 4 + 2] = -fw[c];
+        view[15] = 1;
+        mat_mul(view, world, vw);
+        mat_mul(projection, vw, m);
+
+        std::vector<uint8_t> vs = p->uniform_data[0], fs = p->uniform_data[1];
+        float m32[16], yflip = -1.0f, limit = 65000.0f; // drawn like any other texture target: rows in OpenGL's order
+        for (int i = 0; i < 16; i++) m32[i] = (float)m[i];
+        memcpy(vs.data() + wvp->offset, m32, sizeof m32);
+        if (p->yflip_offset >= 0) memcpy(vs.data() + p->yflip_offset, &yflip, 4);
+        if (p->limit_offset >= 0) memcpy(fs.data() + p->limit_offset, &limit, 4);
+
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        d.colorAttachments[0].texture = s_sky_atlas;
+        d.colorAttachments[0].loadAction = f == 0 ? MTLLoadActionClear : MTLLoadActionLoad;
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        id<MTLRenderCommandEncoder> pass = [cmd renderCommandEncoderWithDescriptor:d];
+        [pass setViewport:(MTLViewport){(double)(f * N), 0.0, (double)N, (double)N, 0.0, 1.0}];
+        [pass setScissorRect:(MTLScissorRect){(NSUInteger)(f * N), 0, (NSUInteger)N, (NSUInteger)N}];
+        [pass setRenderPipelineState:pipeline];
+        [pass setDepthStencilState:depth_state(false)];
+        [pass setCullMode:MTLCullModeNone];
+        if (p->xl.vs.uniform_buffer_index >= 0 && !vs.empty())
+            [pass setVertexBuffer:[s_device newBufferWithBytes:vs.data() length:vs.size() options:MTLResourceStorageModeShared]
+                           offset:0
+                          atIndex:(NSUInteger)p->xl.vs.uniform_buffer_index];
+        if (p->xl.fs.uniform_buffer_index >= 0 && !fs.empty())
+            [pass setFragmentBuffer:[s_device newBufferWithBytes:fs.data() length:fs.size() options:MTLResourceStorageModeShared]
+                             offset:0
+                            atIndex:(NSUInteger)p->xl.fs.uniform_buffer_index];
+        for (UniformLocation &l : p->locations) {
+            for (int stage = 0; stage < 2; stage++) {
+                int index = l.texture_index[stage];
+                if (index < 0) continue;
+                Texture *t = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+                id<MTLTexture> texture = t && t->mtl ? t->mtl : s_white;
+                id<MTLSamplerState> sampler = t && t->mtl ? sampler_for(*t) : s_samplers.begin()->second;
+                if (l.srgb && t && t->mtl) {
+                    if (id<MTLTexture> srgb = srgb_view_for(*t)) texture = srgb;
+                }
+                if (stage == 0) {
+                    [pass setVertexTexture:texture atIndex:(NSUInteger)index];
+                    [pass setVertexSamplerState:sampler atIndex:(NSUInteger)index];
+                } else {
+                    [pass setFragmentTexture:texture atIndex:(NSUInteger)index];
+                    [pass setFragmentSamplerState:sampler atIndex:(NSUInteger)index];
+                }
+            }
+        }
+        bool complete = true;
+        for (int slot = 0; slot < s_draw_binding.slots; slot++) {
+            Buffer *b = find(s_buffers, s_draw_binding.buffer[slot]);
+            if (!b || !b->mtl) {
+                complete = false;
+                break;
+            }
+            [pass setVertexBuffer:b->mtl offset:s_draw_binding.base[slot] atIndex:(NSUInteger)(VERTEX_SLOT_BASE + slot)];
+        }
+        [pass setVertexBuffer:s_constant_attrib offset:0 atIndex:CONSTANT_SLOT];
+        if (complete)
+            [pass drawIndexedPrimitives:primitive indexCount:count indexType:index_type indexBuffer:indices indexBufferOffset:index_offset];
+        [pass endEncoding];
+    }
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit generateMipmapsForTexture:s_sky_atlas];
+    [blit endEncoding];
+    [cmd commit];
 }
 
 bool primitive_type(GLenum mode, MTLPrimitiveType *type)
@@ -1601,7 +1836,7 @@ float half_to_float(uint16_t h)
     return (h & 0x8000) ? -v : v;
 }
 
-void save_capture(id<MTLTexture> copy, uint32_t frame)
+void save_capture(id<MTLTexture> copy, uint32_t frame, const char *name = "frame")
 {
     int w = (int)copy.width, h = (int)copy.height;
     std::vector<unsigned char> pixels((size_t)w * h * 4);
@@ -1611,11 +1846,11 @@ void save_capture(id<MTLTexture> copy, uint32_t frame)
         [copy getBytes:halves.data() bytesPerRow:(NSUInteger)w * 8 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
         for (size_t i = 0; i < halves.size(); i++)
             pixels[i] = (unsigned char)lrintf(std::min(1.0f, std::max(0.0f, half_to_float(halves[i]))) * 255.0f);
-        wb_save_frame_png(pixels.data(), w, h, frame, false);
+        wb_save_frame_png(pixels.data(), w, h, frame, false, name);
         return;
     }
     [copy getBytes:pixels.data() bytesPerRow:(NSUInteger)w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
-    wb_save_frame_png(pixels.data(), w, h, frame, true);
+    wb_save_frame_png(pixels.data(), w, h, frame, true, name);
 }
 
 } // namespace
@@ -1657,6 +1892,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     const char *pbr_env = getenv("WBM_PBR");
     s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) >= 1;    // off unless set
     s_shader_options.pbr_environment = pbr_env && atoi(pbr_env) >= 2; // 2: metalness and environment reflection too
+    s_shader_options.pbr_sky = pbr_env && atoi(pbr_env) >= 3;         // 3: the environment is the scene's own sky
+    const char *shafts_env = getenv("WBM_LIGHT_SHAFTS");
+    s_light_shafts = shafts_env && atoi(shafts_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_SHAFT_STRENGTH")) s_shaft_strength = (float)atof(v);
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -1708,11 +1947,12 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "contact shadows %s; filmic tone map %s; extended-range output %s",
+            "contact shadows %s; light shafts %s; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
-            s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_shader_options.filmic_tonemap ? "on" : "off",
+            s_shader_options.pbr_sky ? "on, with metalness and sky reflection" : s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off",
+            s_shader_options.filmic_tonemap ? "on" : "off",
             s_hdr ? "on" : "off");
 }
 
@@ -1775,11 +2015,32 @@ void mtl_present(bool capture, uint32_t frame)
             }];
             [s_frame_chunks removeAllObjects];
         }
+        id<MTLTexture> sky_copy = nil;
+        if (capture && s_sky_atlas) { // saved next to the frame, for checking what reflections sample
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s_sky_atlas.pixelFormat
+                                                                                         width:s_sky_atlas.width
+                                                                                        height:s_sky_atlas.height
+                                                                                     mipmapped:NO];
+            d.storageMode = MTLStorageModeShared;
+            sky_copy = [s_device newTextureWithDescriptor:d];
+            id<MTLBlitCommandEncoder> blit = [s_cmd blitCommandEncoder];
+            [blit copyFromTexture:s_sky_atlas
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(s_sky_atlas.width, s_sky_atlas.height, 1)
+                        toTexture:sky_copy
+                 destinationSlice:0
+                 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
         if (s_drawable) [s_cmd presentDrawable:s_drawable];
         [s_cmd commit];
         if (copy) {
             [s_cmd waitUntilCompleted];
             save_capture(copy, frame);
+            if (sky_copy) save_capture(sky_copy, frame, "sky");
         }
         s_cmd = nil;
         s_drawable = nil;
@@ -2256,10 +2517,10 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             return;
         }
         if (!prepare_draw()) return;
-        [s_pass drawIndexedPrimitives:primitive
-                           indexCount:(NSUInteger)count
-                            indexType:type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-                          indexBuffer:b->mtl
-                    indexBufferOffset:offset];
+        MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
+        // The engine draws the sky first, with the depth test off. That draw is the one to capture.
+        if (s_shader_options.pbr_sky && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
+            capture_sky(primitive, (NSUInteger)count, index_type, b->mtl, offset);
     }
 }

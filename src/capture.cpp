@@ -23,11 +23,11 @@ void wb_capture_frame(int w, int h, uint32_t frame)
     wb_save_frame_png(top_down.data(), w, h, frame, false);
 }
 
-void wb_save_frame_png(const unsigned char *pixels, int w, int h, uint32_t frame, bool bgra)
+void wb_save_frame_png(const unsigned char *pixels, int w, int h, uint32_t frame, bool bgra, const char *prefix)
 {
     size_t row = (size_t)w * 4;
-    char name[64];
-    snprintf(name, sizeof name, "/frames/frame_%06u.png", frame);
+    char name[96];
+    snprintf(name, sizeof name, "/frames/%s_%06u.png", prefix, frame);
     std::string path = std::string(g_out_dir) + name;
 
     bool ok = false;

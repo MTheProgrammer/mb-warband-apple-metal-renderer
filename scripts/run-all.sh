@@ -4,10 +4,11 @@
 # depth). Anything set in the environment already is kept, so one option can be
 # turned off for a comparison:   WBM_AO=0 scripts/run-all.sh
 export WBM_SHADOWS=${WBM_SHADOWS:-2}  # shadows that soften with distance (PCSS)
-export WBM_PBR=${WBM_PBR:-2}          # microfacet highlights, metalness, environment reflection
+export WBM_PBR=${WBM_PBR:-3}          # microfacet highlights, metalness, reflection of the scene's sky
 export WBM_SRGB=${WBM_SRGB:-1}        # hardware sRGB texture decoding
 export WBM_AO=${WBM_AO:-1}            # ambient occlusion
 export WBM_CONTACT_SHADOWS=${WBM_CONTACT_SHADOWS:-1}  # screen-space contact shadows
+export WBM_LIGHT_SHAFTS=${WBM_LIGHT_SHAFTS:-1}  # light shafts from the sun
 export WBM_TONEMAP=${WBM_TONEMAP:-1}  # filmic tone map
 export WBM_HDR=${WBM_HDR:-1}          # extended-range output on HDR displays
 exec "$(dirname "$0")/run.sh" "$@"

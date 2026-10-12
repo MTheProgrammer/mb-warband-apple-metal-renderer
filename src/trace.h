@@ -86,4 +86,5 @@ bool wb_gl_read_backbuffer(int w, int h, unsigned char *rgba);
 
 void wb_capture_frame(int w, int h, uint32_t frame); // reads the OpenGL back buffer
 // Writes frames/frame_<n>.png from top-down 32-bit pixels, RGBA or BGRA.
-void wb_save_frame_png(const unsigned char *pixels, int w, int h, uint32_t frame, bool bgra);
+// `name` is the file's prefix: "frame" for the screen, anything else for a debugging image.
+void wb_save_frame_png(const unsigned char *pixels, int w, int h, uint32_t frame, bool bgra, const char *name = "frame");

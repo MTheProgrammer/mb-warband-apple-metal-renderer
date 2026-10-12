@@ -17,6 +17,7 @@ const char *const k_xl_yflip_uniform = "wbm_yflip";
 const char *const k_xl_samples_uniform = "wbm_samples";
 const char *const k_xl_headroom_uniform = "wbm_headroom";
 const char *const k_xl_limit_uniform = "wbm_limit";
+const char *const k_xl_sky_sampler = "wbm_sky";
 
 namespace {
 
@@ -265,6 +266,62 @@ vec3 wbm_environment(vec3 view, vec3 up, vec3 sky, vec3 ground)
 }
 )";
 
+// The same with a real sky. The backend redraws the scene's sky dome into a
+// small atlas of six faces each frame (see k_xl_sky_sampler); a reflection
+// pointing upwards samples it, blurrier for rougher surfaces through the
+// atlas's mip levels, and one pointing down gets the ground colour as before.
+//
+// The reflection has to be in world space to index the atlas. Shaders that
+// light with a world-space normal have it directly. Normal-mapped shaders work
+// in tangent space and are never told how that relates to the world, but they
+// are given two directions in both spaces: to the sun and to the sky light.
+// wbm_to_world builds a frame from that pair in each space and carries the
+// vector across. (Where a mesh's texture mapping is mirrored the tangent frame
+// is left-handed and the result is mirrored too; the sky is smooth enough for
+// that to pass.)
+const char k_pbr_sky_functions[] = R"(
+uniform sampler2D wbm_sky;
+
+vec3 wbm_to_world(vec3 v, vec3 ts, vec3 tk, vec3 ws, vec3 wk)
+{
+    vec3 t1 = normalize(ts), t2 = normalize(cross(ts, tk)), t3 = cross(t1, t2);
+    vec3 w1 = normalize(ws), w2 = normalize(cross(ws, wk)), w3 = cross(w1, w2);
+    return dot(v, t1) * w1 + dot(v, t2) * w2 + dot(v, t3) * w3;
+}
+
+vec3 wbm_sky_sample(vec3 d, float lod)
+{
+    vec3 a = abs(d), forward, up;
+    float face;
+    if (a.x >= a.y && a.x >= a.z) {
+        forward = vec3(sign(d.x), 0.0, 0.0), up = vec3(0.0, 0.0, 1.0), face = d.x > 0.0 ? 0.0 : 1.0;
+    } else if (a.y >= a.z) {
+        forward = vec3(0.0, sign(d.y), 0.0), up = vec3(0.0, 0.0, 1.0), face = d.y > 0.0 ? 2.0 : 3.0;
+    } else {
+        forward = vec3(0.0, 0.0, sign(d.z)), up = vec3(0.0, 1.0, 0.0), face = d.z > 0.0 ? 4.0 : 5.0;
+    }
+    vec2 uv = vec2(dot(d, cross(forward, up)), dot(d, up)) / dot(d, forward) * 0.5 + 0.5;
+    float inset = 0.5 * exp2(ceil(lod)) / FACE_SIZE; // keep the filter inside this face
+    uv = clamp(uv, vec2(inset), vec2(1.0 - inset));
+    return textureLod(wbm_sky, vec2((uv.x + face) / 6.0, uv.y), lod).xyz;
+}
+
+vec3 wbm_environment_sky(vec3 view, vec3 reflection, vec3 ground)
+{
+    vec3 v = normalize(view), n = wbm_n;
+    float nv = clamp(dot(n, v), 0.0, 1.0);
+    vec3 d = normalize(reflection);
+    float rough = sqrt(wbm_a2);
+    vec3 above = normalize(vec3(d.xy, max(d.z, 0.04)));
+    vec3 sky = pow(max(wbm_sky_sample(above, clamp(rough * 7.0, 0.0, 5.0)), vec3(0.0)), vec3(2.2));
+    float blur = 0.04 + 0.3 * rough;
+    vec3 env = mix(ground, sky, smoothstep(-blur, blur, d.z));
+    vec3 f0 = mix(vec3(0.04), wbm_albedo, wbm_metal);
+    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
+    return env * fresnel * wbm_mask;
+}
+)";
+
 // Finds pow(clamp(dot(normalize(V +/- L), N), 0, 1), fMaterialPower) and
 // replaces it with wbm_specular(V, +/-L, N, fMaterialPower).
 bool use_pbr_specular(std::string &fs)
@@ -285,7 +342,9 @@ bool use_pbr_specular(std::string &fs)
 //   - where the base colour is decoded: remember it, and darken it for metals,
 //     which in this model show reflection instead of diffuse colour;
 //   - just before the colour is encoded for display: add the reflection.
-bool add_pbr_environment(std::string &fs)
+// `sky` asks for the captured sky where the shader allows it; `extra` receives
+// declarations the shader then needs in front of it.
+bool add_pbr_environment(std::string &fs, bool sky, std::string &extra)
 {
     static const std::regex decode(R"((\w+)\.xyz = pow \((\w+)\.xyz, vec3\(2\.2, 2\.2, 2\.2\)\);)");
     static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
@@ -326,11 +385,23 @@ bool add_pbr_environment(std::string &fs)
     // blend of it and the ground ambient.
     if (!has("uniform vec4 vFogColor;") || !has("uniform vec4 vSpecularColor;")) return false;
     std::string horizon = "pow(vFogColor.xyz, vec3(2.2))";
-    std::string sky = "(" + horizon + " * 1.3)";
+    std::string sky_colour = "(" + horizon + " * 1.3)";
     std::string ground = has("uniform vec4 vGroundAmbientColor;") ? "(mix(vGroundAmbientColor.xyz, " + horizon + ", 0.4) * 0.6)"
                                                                   : "(" + horizon + " * 0.35)";
-    fs = std::regex_replace(fs, encode, "$1.xyz += wbm_environment(ViewDir, " + up + ", " + sky + ", " + ground + ");\n  $&",
-                            std::regex_constants::format_first_only);
+    std::string call = "wbm_environment(ViewDir, " + up + ", " + sky_colour + ", " + ground + ")";
+    if (sky) {
+        std::string reflection = "reflect(-normalize(ViewDir), wbm_n)";
+        if (has("uniform vec4 vSkyLightDir;")) { // world-space lighting
+            call = "wbm_environment_sky(ViewDir, " + reflection + ", " + ground + ")";
+            extra += k_pbr_sky_functions;
+        } else if (has("varying vec3 SunLightDir;") && has("varying vec3 SkyLightDir;")) { // tangent-space lighting
+            if (!has("uniform vec4 vSunDir;")) extra += "uniform vec4 vSunDir;\n";
+            extra += "uniform vec4 vSkyLightDir;\n";
+            call = "wbm_environment_sky(ViewDir, wbm_to_world(" + reflection + ", SunLightDir, SkyLightDir, -vSunDir.xyz, -vSkyLightDir.xyz), " + ground + ")";
+            extra += k_pbr_sky_functions;
+        }
+    }
+    fs = std::regex_replace(fs, encode, "$1.xyz += " + call + ";\n  $&", std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, decode,
                             "wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  $1.xyz = (wbm_albedo * (1.0 - (0.35 * wbm_metal)));");
     body = fs.find('{', fs.find("void main ()")) + 1; // again: the replacements above moved it
@@ -442,8 +513,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     // The vertex shader has the sun's matrix; the fragment shader needs it too now.
     bool needs_sun_matrix = soft_shadows && options.pcss_shadows && glsl.find("uniform mat4 matSunViewProj;") == std::string::npos;
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
-    bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment) && use_pbr_specular(glsl);
-    bool pbr_environment = pbr_specular && options.pbr_environment && add_pbr_environment(glsl);
+    bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment || options.pbr_sky) && use_pbr_specular(glsl);
+    std::string pbr_extra;
+    bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, pbr_extra);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
@@ -459,6 +531,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (soft_shadows) out << (options.pcss_shadows ? k_pcss_shadow_function : k_soft_shadow_function);
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
+    if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
     if (final_pass) out << k_tonemap_functions;
     if (final_pass && options.hdr_output) out << "uniform float " << k_xl_headroom_uniform << ";\n";
     if (!vertex && !final_pass && options.hdr_output) out << "uniform float " << k_xl_limit_uniform << ";\n";

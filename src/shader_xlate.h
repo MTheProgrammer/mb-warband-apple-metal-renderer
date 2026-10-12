@@ -67,6 +67,10 @@ struct XlOptions {
     // the base colour of metals, and add a reflection of a sky-and-ground
     // environment built from the scene's own light colours.
     bool pbr_environment = false;
+    // On top of pbr_environment: reflect a captured image of the scene's sky
+    // instead of a two-colour gradient. Adds the sampler wbm_sky, which must be
+    // given the atlas described at k_xl_sky_sampler.
+    bool pbr_sky = false;
     // In the engine's final post-processing shader: replace its tone-mapping
     // operator with a filmic curve.
     bool filmic_tonemap = false;
@@ -91,6 +95,15 @@ extern const char *const k_xl_headroom_uniform;
 // largest colour value it may write. The backend sets it to 1 when drawing to
 // the screen and to a very large number otherwise.
 extern const char *const k_xl_limit_uniform;
+
+// With pbr_sky: a sampler for the sky atlas, six square faces side by side in
+// the order +X, -X, +Y, -Y, +Z, -Z (Z is up). Face f looks along its axis with
+// up = +Z for the four side faces and +Y for the top and bottom; a direction d
+// lands at (dot(d, right), dot(d, up)) / dot(d, forward) * 0.5 + 0.5 within
+// the face, with right = cross(forward, up) and v = 0 on the texture's first
+// row. Colours are stored as the sky shader wrote them, gamma-encoded.
+extern const char *const k_xl_sky_sampler;
+enum { k_xl_sky_face_size = 128 };
 
 // attrib_locations: names given to glBindAttribLocation and their indices.
 XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,
