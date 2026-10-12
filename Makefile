@@ -75,11 +75,16 @@ REPLAY_OBJS := build/metal_backend.o build/shader_xlate.o build/shader_cache.o b
 build/replay: tools/replay.mm $(REPLAY_OBJS) $(DEPS)
 	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -Isrc tools/replay.mm $(REPLAY_OBJS) $(DEPS) $(FRAMEWORKS) -o $@
 
+# Exports the game's textures and makes metalness maps for texture packs:
+#   build/texture_tool pbr ~/Library/Application\ Support/warband-metal/textures/pbr
+build/texture_tool: tools/texture_tool.mm src/material_names.h
+	$(CXX) -std=c++17 -O2 -mmacosx-version-min=11.0 -fobjc-arc tools/texture_tool.mm -framework Foundation -framework ImageIO -framework CoreGraphics -o $@
+
 build:
 	mkdir -p build
 
 clean:
-	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/*.zip
+	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/*.zip
 	rm -rf "$(APP)"
 
 distclean:

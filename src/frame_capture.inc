@@ -432,6 +432,7 @@ bool restore_state()
                         if (level == 0 && data.first && !s_material_by_content.empty()) {
                             int alpha = format == MTLPixelFormatBC2_RGBA ? 3 : format == MTLPixelFormatBC3_RGBA ? 5 : format == MTLPixelFormatBC1_RGBA ? 0 : -1;
                             auto it = alpha < 0 ? s_material_by_content.end() : s_material_by_content.find(content_key((uint32_t)w, (uint32_t)h, data.first, data.second, alpha));
+                            if (it != s_material_by_content.end()) attach_pbr_map(t, it->second);
                             if (it != s_material_by_content.end() && replace_from_pack(t, it->second)) {
                                 replaced++;
                                 if (t.mtl.width != w || t.mtl.height != h) resized++;

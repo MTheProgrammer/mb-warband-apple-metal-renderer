@@ -17,7 +17,7 @@ std::unordered_map<std::string, std::string> s_pack_files; // lower-case name wi
 // loaded again from the game's own file, which should change nothing.
 bool s_pack_self_test = getenv("WBM_TEXTURES_SELF") != nullptr;
 struct {
-    std::atomic<int> replaced{0}, failed{0};
+    std::atomic<int> replaced{0}, failed{0}, pbr_maps{0};
     std::mutex mu;
     std::set<std::string> names; // of the textures replaced, for the summary
 } s_pack_stats;
@@ -309,4 +309,26 @@ bool replace_from_pack(Texture &t, const KnownTexture &known)
     std::lock_guard<std::mutex> lock(s_pack_stats.mu);
     s_pack_stats.names.insert(name);
     return true;
+}
+
+// A pack may also hold, for the game's texture `name`, a file name_pbr: red is
+// metalness and green roughness, laid out like the texture itself. It is kept
+// beside the texture and given to shaders that ask for one (k_xl_pbr_sampler).
+void attach_pbr_map(Texture &t, const KnownTexture &known)
+{
+    t.pbr = nil;
+    if (s_pack_files.empty()) return;
+    std::string name = s_texture_names[known.name];
+    const char suffix[] = "_degraded_";
+    size_t n = sizeof suffix - 1;
+    if (name.size() > n && !name.compare(name.size() - n, n, suffix)) name.resize(name.size() - n);
+    auto it = s_pack_files.find(name + "_pbr");
+    if (it == s_pack_files.end()) return;
+    Texture map;
+    if (!load_replacement(map, it->second, known.flipped)) {
+        s_pack_stats.failed++;
+        return;
+    }
+    t.pbr = map.mtl;
+    s_pack_stats.pbr_maps++;
 }

@@ -127,6 +127,13 @@ extern const char *const k_xl_ambient_uniform;
 //      1 + the metalness of the texture's grey parts (so 1 for a non-metal).
 extern const char *const k_xl_material_uniform;
 
+// With materials as well: a sampler, wbm_pbr_map, for a map laid out like the
+// surface's base texture with metalness in red and roughness in green, and a
+// uniform, wbm_pbr, whose x is 1 when the surface has such a map and 0 when it
+// has not (the sampler then holds anything). A map overrides the estimates.
+extern const char *const k_xl_pbr_sampler;
+extern const char *const k_xl_pbr_uniform;
+
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in
 // the order +X, -X, +Y, -Y, +Z, -Z (Z is up). Face f looks along its axis with
 // up = +Z for the four side faces and +Y for the top and bottom; a direction d

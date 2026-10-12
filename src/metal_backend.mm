@@ -4,6 +4,7 @@
 // window setup, which runs on the main thread before rendering starts.
 
 #include "backend.h"
+#include "material_names.h"
 #include "shader_xlate.h"
 
 #import <AppKit/AppKit.h>
@@ -48,6 +49,7 @@ struct Texture {
     id<MTLTexture> mtl;
     uint8_t material = 0; // what the texture shows, when its file was recognised: see MaterialClass
     bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
+    id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
     GLint gl_internal = 0;
     GLenum gl_format = 0, gl_type = 0;
@@ -105,6 +107,7 @@ struct UniformLocation {
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
+    bool is_pbr_map = false;                          // the wbm_pbr_map sampler, which gets the bound texture's metalness map
     bool is_dyn_map = false;                          // the wbm_dyn_map sampler, which gets the per-frame shadow map
     bool is_sun_matrix = false;                       // matSunViewProj, the engine's shadow-space matrix
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
@@ -141,7 +144,8 @@ struct Program {
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
     int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
-    int material_offset = -1;     // fragment stage, see k_xl_material_uniform // fragment stage, see k_xl_dyn_sampler
+    int material_offset = -1;     // fragment stage, see k_xl_material_uniform
+    int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
     const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
@@ -339,8 +343,6 @@ uint64_t s_amb_stats_frames;
 // Material classes (WBM_MATERIALS=1), see k_xl_material_uniform. Textures are
 // recognised by their content, matched against the files in the game's
 // texture folders, and classed by words in the file's name.
-enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_COUNT };
-const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin and hair", "wood", "stone and ground", "horse"};
 // metalness factor, roughness factor, highlight strength, 1 + metalness of grey parts (0: unknown)
 const float k_material_params[MAT_COUNT][4] = {
     {1.0f, 1.0f, 1.0f, 0.0f},   // unknown: the shader's own estimate stands
@@ -411,37 +413,6 @@ uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t s
     const uint8_t *rows[KEY_ROWS];
     for (int i = 0; i < KEY_ROWS; i++) rows[i] = (const uint8_t *)data + key_row(height, i) * row_bytes;
     return content_key_rows(width, height, alpha, rows);
-}
-
-int classify_texture_name(std::string name)
-{
-    for (char &c : name) c = (char)tolower((unsigned char)c);
-    // Words that mark each class. A name with words of more than one class
-    // (a surcoat over mail) is a mixture, and is left to the specular mask.
-    static const struct {
-        int cls;
-        const char *words[32];
-    } table[] = {
-        {MAT_METAL, {"plate", "mail", "helmet", "helm", "lamellar", "scale", "gauntlet", "greave", "sword", "blade", "axe", "mace", "lance", "spear", "metal", "iron", "steel", "brass", "chain", "coif", "bascinet", "cuirass", "weapon"}},
-        {MAT_CLOTH, {"dress", "tunic", "shirt", "cloth", "coat", "surcoat", "vest", "costume", "outfit", "robe", "padded", "ragged", "banner", "heraldic", "gambeson", "hood", "cape", "cloak", "linen", "turban", "veil", "wimple", "blouse", "peasant", "lady", "tabard"}},
-        {MAT_LEATHER, {"leather", "boot", "saddle", "hide", "fur", "nomad", "belt", "glove", "shoe", "pelt"}},
-        {MAT_SKIN, {"face", "body", "hand", "skin", "hair", "beard"}},
-        {MAT_WOOD, {"plank", "wood", "bark", "tree", "trunk", "bow", "barrel", "cart", "fence", "palisade", "timber"}},
-        {MAT_STONE, {"stone", "wall", "rock", "stucco", "ground", "terrain", "roof", "building", "village", "brick", "earth", "road", "sand", "snow", "grass", "castle", "town", "floor", "mud", "steppe", "desert", "plaster"}},
-        {MAT_HORSE, {"horse", "courser", "hunter", "steed"}},
-    };
-    if (name.find("warhorse") != std::string::npos) return MAT_UNKNOWN; // a horse in armour
-    int found = MAT_UNKNOWN, classes = 0;
-    for (auto &row : table) {
-        for (const char *w : row.words) {
-            if (w && name.find(w) != std::string::npos) {
-                found = row.cls;
-                classes++;
-                break;
-            }
-        }
-    }
-    return classes == 1 ? found : MAT_UNKNOWN;
 }
 
 // Reads the headers of the DDS files in one folder and keys their first few
@@ -976,7 +947,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1027,6 +998,7 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.back().is_sun_color = name == "vSunColor";
                 p.locations.back().is_sky = name == k_xl_sky_sampler;
                 p.locations.back().is_dyn_map = name == k_xl_dyn_sampler;
+                p.locations.back().is_pbr_map = name == k_xl_pbr_sampler;
                 p.locations.back().is_sun_matrix = name == "matSunViewProj";
             }
             return p.locations[(size_t)it->second];
@@ -1041,6 +1013,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_dyn_bias_uniform) p.dyn_bias_offset = u.offset;
             else if (u.name == k_xl_ambient_uniform) p.amb_offset[s] = u.offset;
             else if (u.name == k_xl_material_uniform) p.material_offset = u.offset;
+            else if (u.name == k_xl_pbr_uniform) p.pbr_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -2599,13 +2572,20 @@ bool prepare_draw()
             p->uniform_dirty[stage] = true;
         }
     }
-    if (p->material_offset >= 0) {
-        int cls = MAT_UNKNOWN;
-        if (p->alpha_texture_location >= 0) { // the diffuse texture says what the surface is
-            UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
-            Texture *t = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
-            if (t) cls = t->material;
+    Texture *diffuse = nullptr; // the diffuse texture says what the surface is
+    if ((p->material_offset >= 0 || p->pbr_offset >= 0) && p->alpha_texture_location >= 0) {
+        UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
+        diffuse = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+    }
+    if (p->pbr_offset >= 0) {
+        const float has[4] = {diffuse && diffuse->pbr ? 1.0f : 0.0f, 0, 0, 0};
+        if (memcmp(p->uniform_data[1].data() + p->pbr_offset, has, 16)) {
+            memcpy(p->uniform_data[1].data() + p->pbr_offset, has, 16);
+            p->uniform_dirty[1] = true;
         }
+    }
+    if (p->material_offset >= 0) {
+        int cls = diffuse ? diffuse->material : MAT_UNKNOWN;
         if (memcmp(p->uniform_data[1].data() + p->material_offset, k_material_params[cls], 16)) {
             memcpy(p->uniform_data[1].data() + p->material_offset, k_material_params[cls], 16);
             p->uniform_dirty[1] = true;
@@ -2659,6 +2639,9 @@ bool prepare_draw()
             } else if (l.is_dyn_map) {
                 texture = s_dyn_map ? s_dyn_map : s_white;
                 if (s_dyn_sampler) sampler = s_dyn_sampler;
+            } else if (l.is_pbr_map) {
+                texture = diffuse && diffuse->pbr ? diffuse->pbr : s_white;
+                sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
             } else if (l.srgb && t && t->mtl) {
                 // The shader no longer decodes this sampler's colour itself.
                 if (id<MTLTexture> view = srgb_view_for(*t)) texture = view;
@@ -3067,8 +3050,8 @@ void mtl_dump_stats(FILE *f)
                 s_amb[20], s_amb[21], s_amb[22]);
     }
     if (!s_pack_files.empty() || s_pack_stats.replaced.load()) {
-        fprintf(f, "\n== texture packs ==\n%zu files on offer; %d textures replaced, %d could not be loaded\n", s_pack_files.size(), s_pack_stats.replaced.load(),
-                s_pack_stats.failed.load());
+        fprintf(f, "\n== texture packs ==\n%zu files on offer; %d textures replaced, %d given a metalness map, %d could not be loaded\n", s_pack_files.size(),
+                s_pack_stats.replaced.load(), s_pack_stats.pbr_maps.load(), s_pack_stats.failed.load());
         std::lock_guard<std::mutex> lock(s_pack_stats.mu);
         for (const std::string &name : s_pack_stats.names) fprintf(f, "  %s\n", name.c_str());
     }
@@ -3432,8 +3415,10 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
             auto it = s_material_by_content.find(content_key((uint32_t)width, (uint32_t)height, data, (size_t)imageSize, alpha));
             // The game loads some textures small first and in full later; whatever
             // was recognised stays until something else is.
+            if (level == 0) t->pbr = nil;
             if (it != s_material_by_content.end()) {
                 t->material = it->second.cls;
+                attach_pbr_map(*t, it->second);
                 if (replace_from_pack(*t, it->second)) return;
             }
         }

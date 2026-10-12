@@ -20,6 +20,8 @@ const char *const k_xl_limit_uniform = "wbm_limit";
 const char *const k_xl_sky_sampler = "wbm_sky";
 const char *const k_xl_ambient_uniform = "wbm_amb";
 const char *const k_xl_material_uniform = "wbm_material";
+const char *const k_xl_pbr_sampler = "wbm_pbr_map";
+const char *const k_xl_pbr_uniform = "wbm_pbr";
 const char *const k_xl_dyn_sampler = "wbm_dyn_map";
 const char *const k_xl_dyn_window_uniform = "wbm_dyn";
 const char *const k_xl_dyn_near_uniform = "wbm_dyn_near";
@@ -293,7 +295,7 @@ float wbm_specular(vec3 view, vec3 light, vec3 normal, float shininess)
     vec3 h = normalize(v + l);
     float nh = clamp(dot(n, h), 0.0, 1.0), nl = clamp(dot(n, l), 0.0, 1.0);
     float nv = clamp(abs(dot(n, v)), 0.001, 1.0), vh = clamp(dot(v, h), 0.0, 1.0);
-    float a2 = clamp(2.0 / (shininess + 2.0) * wbm_rough, 0.0004, 1.0);
+    float a2 = wbm_a2_fixed >= 0.0 ? wbm_a2_fixed : clamp(2.0 / (shininess + 2.0) * wbm_rough, 0.0004, 1.0);
     float d = nh * nh * (a2 - 1.0) + 1.0;
     float lobe = (a2 * a2) / (d * d);
     float gl = 2.0 * nl / (nl + sqrt(a2 + (1.0 - a2) * nl * nl));
@@ -316,6 +318,7 @@ float wbm_mask = 0.0;
 float wbm_metal = 0.0;
 float wbm_debug_mask = 0.0, wbm_debug_gloss = 0.0;
 float wbm_metal_map = -1.0; // metalness read from a specular map, when the shader has one
+float wbm_a2_fixed = -1.0;  // squared roughness from a metalness map (k_xl_pbr_sampler), when the surface has one
 float wbm_dim = 0.35;  // how far a metal loses its diffuse colour
 float wbm_rough = 1.0; // factors from the material class, see k_xl_material_uniform
 float wbm_gain = 1.0;
@@ -514,6 +517,15 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
         return false;
     }
 
+    // Where the base texture is sampled, for a metalness map laid out like it.
+    std::string map_uv = "vec2(0.0)";
+    {
+        std::smatch d, uv;
+        if (std::regex_search(fs, d, decode)) {
+            std::regex sample("\\b" + std::string(d[2]) + " = texture2D \\(diffuse_texture, ([\\w.]+)\\);");
+            if (std::regex_search(fs, uv, sample)) map_uv = uv[1];
+        }
+    }
     // Up, in whatever space the shader's normal is in. Shaders that light with a
     // world-space normal can use the world's up axis (Z in this engine); the
     // normal-mapped ones work in tangent space and only have the direction of
@@ -545,7 +557,7 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
     fs = std::regex_replace(fs, encode, "$1.xyz += " + call + ";\n  $&" + (debug ? "\n  $1.xyz = vec3(wbm_metal);" : ""),
                             std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, decode,
-                            std::string("wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  ") + (materials ? "wbm_classify();\n  " : "") +
+                            std::string("wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  ") + (materials ? "wbm_classify(" + map_uv + ");\n  " : "") +
                                 "$1.xyz = (wbm_albedo * (1.0 - (wbm_dim * wbm_metal)));");
     body = fs.find('{', fs.find("void main ()")) + 1; // again: the replacements above moved it
     // The mask alone does not say how reflective a material is: on many opaque
@@ -576,7 +588,16 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
         // guess is believed (see k_xl_material_uniform); an unknown texture is
         // believed most of the way.
         extra += std::string("uniform vec4 ") + k_xl_material_uniform + ";\n" +
-                 "void wbm_classify()\n{\n"
+                 "uniform sampler2D " + k_xl_pbr_sampler + ";\nuniform vec4 " + k_xl_pbr_uniform + ";\n"
+                 "void wbm_classify(vec2 uv)\n{\n"
+                 "    if (" + k_xl_pbr_uniform + ".x > 0.5) {\n" // a map made for this texture: no guessing
+                 "        vec4 m = texture2D(" + k_xl_pbr_sampler + ", uv);\n"
+                 "        wbm_metal = m.x;\n"
+                 "        wbm_a2_fixed = clamp(m.y * m.y * m.y * m.y, 0.0004, 1.0);\n"
+                 "        wbm_gain = 1.0;\n"
+                 "        wbm_dim = 0.8;\n"
+                 "        return;\n"
+                 "    }\n"
                  "    float known = " + k_xl_material_uniform + ".w;\n"
                  "    float hi = max(max(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b), lo = min(min(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b);\n"
                  "    float grey = 1.0 - smoothstep(0.1, 0.28, (hi - lo) / max(hi, 0.08));\n"
