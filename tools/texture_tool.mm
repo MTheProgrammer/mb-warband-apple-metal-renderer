@@ -378,7 +378,7 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) mask[(size_t)y * w + x] = picture_at(x, y) > floor_ ? 1.0f : 0.0f;
     blur(mask, w, h, std::max(2, w / 130));
-    for (float &m : mask) m = smoothstep(0.2f, 0.4f, m);
+    for (float &m : mask) m = smoothstep(0.42f, 0.58f, m); // neither wider nor narrower than the picture has it
     // Which way the strands run: across a strand brightness changes fast, along
     // it hardly at all. Summed over a neighbourhood, the squared gradients say
     // which direction that is (the one they vary least in).

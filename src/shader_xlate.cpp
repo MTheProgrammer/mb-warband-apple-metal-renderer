@@ -756,27 +756,31 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
 // wbm_shell.z: fewer, thicker strands that reach several centimetres out,
 // hang much farther along the surface, and swing a little (wbm_shell.w
 // carries the time, as 1 + seconds).
-bool wbm_shell_bare(vec2 uv, vec3 down)
+// Where on the texture the hair passing over uv in this layer is rooted.
+vec2 wbm_shell_root(vec2 uv, vec3 down)
 {
-    if (wbm_shell.y <= 0.0) return false;
-    vec2 grows = wbm_grows(uv);
-    bool long_ = wbm_shell.z < 0.0;
-    // Lengths are in metres and hairs are counted per metre; how much of the
-    // texture a metre covers differs from one horse to the next.
-    float per_metre = max(abs(wbm_fur.w), 0.02);
-    float share = wbm_shell.y, density = abs(wbm_shell.z) / per_metre;
+    if (wbm_shell.y <= 0.0) return uv;
+    // Lengths are in metres; how much of the texture a metre covers differs from one horse to the next.
+    float per_metre = max(abs(wbm_fur.w), 0.02), share = wbm_shell.y;
     vec2 lean;
-    if (long_) {
+    if (wbm_shell.z < 0.0) {
         float t = wbm_shell.w - 1.0;
         vec2 swing = vec2(sin(t * 1.7 + uv.x * 40.0), cos(t * 1.3 + uv.y * 31.0)) * 0.012;
         lean = (wbm_combed(uv).xy * 0.05 + down.xy * 0.07 + swing) * share * share + wbm_combed(uv).xy * 0.02 * share;
-        density *= 0.3;
     } else {
         lean = wbm_combed(uv).xy * 0.007 * share + down.xy * 0.005 * share * share;
     }
-    lean *= per_metre;
+    return uv - lean * per_metre;
+}
+
+bool wbm_shell_bare(vec2 uv, vec3 down)
+{
+    if (wbm_shell.y <= 0.0) return false;
+    bool long_ = wbm_shell.z < 0.0;
+    float share = wbm_shell.y, density = abs(wbm_shell.z) / max(abs(wbm_fur.w), 0.02) * (long_ ? 0.3 : 1.0);
+    vec2 grows;
     // What grows is asked where the hair is rooted, not where it has got to.
-    vec2 root = uv - lean;
+    vec2 root = wbm_shell_root(uv, down);
     grows = wbm_grows(root);
     if (long_ ? grows.y < 0.5 : grows.x < 0.5) return true;
     vec2 at = root * density;
@@ -839,6 +843,8 @@ bool add_fur(std::string &fs)
     size_t body = fs.find("void main ()");
     if (body != std::string::npos) body = fs.find('{', body);
     if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0, " + down + ")) discard;");
+    // A hair has the colour of the place it grows from, not of what it hangs over.
+    fs = std::regex_replace(fs, std::regex(R"(texture2D \(diffuse_texture, Tex0\))"), "texture2D (diffuse_texture, wbm_shell_root(Tex0, " + down + "))");
     if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos)
         fs = std::regex_replace(fs, encode, "$1.xyz += wbm_horse_glint(Tex0, ViewDir, " + normal + ", SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz);\n  $&",
                                 std::regex_constants::format_first_only);
