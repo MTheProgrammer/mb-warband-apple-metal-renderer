@@ -90,6 +90,11 @@ struct XlOptions {
     // pores, and the edge of a shadow tinted the same way. Whether it does is
     // up to the wbm_skin uniform, which the backend sets per draw.
     bool skin_scattering = false;
+    // Eyes that catch the light: faces have their eyes painted on, at the same
+    // place in every face texture, since all heads share one layout. There the
+    // engine's skin shader gets a small sharp highlight from the sun and a
+    // faint reflection of the sky, as from a wet, bulging surface.
+    bool eyes = false;
     // Leaves lit from behind: where skin_scattering rewrites the sun's diffuse
     // term, foliage also lets sunlight through to the side turned from the sun.
     // Either option brings the rewrite and the wbm_skin uniform in.

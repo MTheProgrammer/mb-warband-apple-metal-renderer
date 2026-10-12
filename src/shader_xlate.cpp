@@ -665,6 +665,42 @@ bool add_skin_scattering_vertex(std::string &vs)
     return true;
 }
 
+// Where the eyes are in a face texture (measured on manface_young: the middles
+// of the irises, and the opening of the lids), in the coordinates the head's
+// mesh uses, which run upwards.
+const char k_eye_function[] = R"(
+vec3 wbm_eye(vec2 uv, vec3 view, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
+{
+    const vec2 left = vec2(0.388, 0.558), right = vec2(0.610, 0.558), reach = vec2(0.040, 0.019);
+    vec2 a = (uv - left) / reach, b = (uv - right) / reach;
+    vec2 d = dot(a, a) < dot(b, b) ? a : b;
+    float inside = 1.0 - smoothstep(0.55, 1.0, dot(d, d));
+    if (inside <= 0.0) return vec3(0.0);
+    vec3 n = normalize(vec3(d * vec2(0.8, 0.45), 1.0)); // the ball bulges out of the flat it is painted on
+    vec3 v = normalize(view), h = normalize(v + normalize(to_sun));
+    float glint = pow(max(dot(n, h), 0.0), 220.0) * 2.5 * shadow;
+    float grazing = 0.03 + 0.97 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+    return inside * (glint * sun + grazing * sky * 0.8);
+}
+)";
+
+bool add_eye_glint(std::string &fs)
+{
+    // The engine's skin shader only (see add_skin_scattering), which has all that is needed.
+    if (fs.find("max ((0.2 * (") == std::string::npos || fs.find("varying vec3 ViewDir;") == std::string::npos ||
+        fs.find("varying vec3 SunLightDir;") == std::string::npos || fs.find("varying vec2 Tex0;") == std::string::npos ||
+        fs.find("uniform vec4 vSkyLightColor;") == std::string::npos || fs.find("uniform vec4 vAmbientColor;") == std::string::npos)
+        return false;
+    static const std::regex encode(R"((\w+)\.xyz = clamp \(pow \(\1\.xyz, output_gamma_inv\.xyz\), 0\.0, 1\.0\);)");
+    static const std::regex shadow(R"(\b(sun_amount_\d+)\b)");
+    if (!std::regex_search(fs, encode)) return false;
+    std::smatch m;
+    std::string lit = std::regex_search(fs, m, shadow) ? std::string(m[1]) : "1.0";
+    fs = std::regex_replace(fs, encode, "$1.xyz += wbm_eye(Tex0, ViewDir, SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz + vSkyLightColor.xyz);\n  $&",
+                            std::regex_constants::format_first_only);
+    return true;
+}
+
 // skin: scattering in skin is wanted, and not just the light through leaves that shares the rewrite.
 bool add_skin_scattering(std::string &fs, bool skin)
 {
@@ -979,6 +1015,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
     // After the shadow rewrite, which looks for the sun term's shadow variable by its original shape.
     bool skin = (options.skin_scattering || options.foliage_backlight) && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl, options.skin_scattering));
+    bool eyes = !vertex && options.eyes && add_eye_glint(glsl);
     bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
     bool wind = vertex && options.wind && add_wind(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
@@ -999,6 +1036,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
     if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
+    if (eyes) out << k_eye_function;
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
     if (skin && vertex) out << k_skin_vertex_function;

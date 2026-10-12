@@ -20,6 +20,7 @@ export WBM_SKY_AMBIENT=${WBM_SKY_AMBIENT:-1}    # ambient light tinted by the sk
 export WBM_MATERIALS=${WBM_MATERIALS:-1}        # metalness and roughness by material class
 export WBM_WIND=${WBM_WIND:-1}                  # trees, bushes and grass sway (a strength; 0 for none)
 export WBM_FOLIAGE=${WBM_FOLIAGE:-0.6}          # sunlight through leaves seen from their far side
+export WBM_EYES=${WBM_EYES:-1}                  # a highlight and a reflection in the eyes of faces
 export WBM_SSS=${WBM_SSS:-1}                    # light scattering in the skin of faces
 export WBM_TONEMAP=${WBM_TONEMAP:-1}  # filmic tone map
 export WBM_HDR=${WBM_HDR:-1}          # extended-range output on HDR displays
