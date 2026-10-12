@@ -13,6 +13,8 @@
 //   r                    back to the view as captured
 //   n and p              with --model: the next and previous mesh of the same resource file
 //   l                    with --model: the mesh's simpler versions in turn
+//   a                    with --model of a horse: stand, walk, trot, canter, gallop, rear, jump, turn and the rest pose in turn
+// (--anim walk starts with one; --pose 0.3 holds it at that point of the action, for stills)
 // The same from the command line, for stills: --yaw and --pitch (degrees),
 // --pan x y, --forward and --pivot (metres), --no-ui.
 //
@@ -65,7 +67,7 @@ void wb_gl_take_screen_extent(int *w, int *h) { *w = *h = 0; }
 struct View {
     std::atomic<double> yaw{0}, pitch{0}, pan_x{0}, pan_y{0}, forward{0}, pivot{5};
     std::atomic<bool> interface{true};
-    std::atomic<int> step{0}, lod_step{0}; // asked for with n, p and l
+    std::atomic<int> step{0}, lod_step{0}, action_step{0}; // asked for with n, p, l and a
 };
 static View s_view;
 
@@ -75,6 +77,8 @@ int main(int argc, char **argv)
     static std::string model;
     static int lod = 0;
     static bool keep_scene = false;
+    static std::string action;
+    static double held = -1;
     bool pivot_given = false;
     int frames = 8;
     const double degrees = M_PI / 180.0;
@@ -88,6 +92,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--lod") && i + 1 < argc) lod = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--material") && i + 1 < argc) mtl_preview_material(argv[++i]);
+        else if (!strcmp(argv[i], "--anim") && i + 1 < argc) action = argv[++i];
+        else if (!strcmp(argv[i], "--pose") && i + 1 < argc) held = atof(argv[++i]);
         else if (!strcmp(argv[i], "--keep-scene")) keep_scene = true;
         else if (!strcmp(argv[i], "--list") && i + 1 < argc) list = argv[++i];
         else if (!strcmp(argv[i], "--no-ui")) s_view.interface = false;
@@ -117,7 +123,7 @@ int main(int argc, char **argv)
     if (!path || !mtl_replay_open(path, &width, &height)) {
         fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet] [--stats]\n"
                         "              [--yaw deg] [--pitch deg] [--pan x y] [--forward m] [--pivot m] [--no-ui]\n"
-                        "              [--model mesh [--material name] [--lod n] [--keep-scene]]\n       replay --list word\n%s\n",
+                        "              [--model mesh [--material name] [--lod n] [--keep-scene] [--anim action [--pose 0..1]]]\n       replay --list word\n%s\n",
                 path ? "that file is not a frame capture" : "");
         return 2;
     }
@@ -153,6 +159,7 @@ int main(int argc, char **argv)
               else if ([key isEqualToString:@"n"]) s_view.step = 1;
               else if ([key isEqualToString:@"p"]) s_view.step = -1;
               else if ([key isEqualToString:@"l"]) s_view.lod_step = 1;
+              else if ([key isEqualToString:@"a"]) s_view.action_step = 1;
               else if ([key isEqualToString:@"q"]) exit(0);
               else return e;
               return nil;
@@ -190,10 +197,16 @@ int main(int argc, char **argv)
                 return true;
             };
             if (!model.empty() && !show() && png) exit(1);
+            if (!action.empty() && !mtl_preview_action(action.c_str(), held)) fprintf(stderr, "no action or animation named %s\n", action.c_str());
             // Some of what a frame shows comes from the frame before it (the sky's
             // colours, grass in the shadow map), so a still needs a few runs.
             for (uint32_t n = 1; png ? n <= (uint32_t)frames : !closed.load(); n++) {
                 g_frame = n;
+                if (s_view.action_step.exchange(0)) {
+                    action = mtl_preview_next_action(action.c_str());
+                    mtl_preview_action(action.c_str(), -1);
+                    fprintf(stderr, "%s\n", action.empty() ? "rest pose" : action.c_str());
+                }
                 if (!model.empty() && (s_view.step.load() || s_view.lod_step.load())) {
                     int step = s_view.step.exchange(0);
                     if (s_view.lod_step.exchange(0)) lod++;

@@ -3818,6 +3818,20 @@ bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *dista
     return ok;
 }
 
+bool mtl_preview_action(const char *action, double held)
+{
+    s_preview.held = held;
+    return preview_set_action(action ? action : "");
+}
+
+const char *mtl_preview_next_action(const char *action)
+{
+    size_t n = sizeof k_horse_actions / sizeof k_horse_actions[0];
+    for (size_t i = 0; i < n; i++)
+        if (action && !strcmp(action, k_horse_actions[i].name)) return i + 1 < n ? k_horse_actions[i + 1].name : "";
+    return k_horse_actions[0].name;
+}
+
 void mtl_preview_material(const char *name) { s_preview.material = name ? name : ""; }
 
 // The mesh a name stands for: itself if it is a mesh; the first mesh of a

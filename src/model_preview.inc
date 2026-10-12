@@ -27,6 +27,12 @@ struct Preview {
     bool active = false, keep_scene = false, library_read = false;
     BrfLibrary library;
     std::string root, name;
+    // An action to play on a skinned model: frames `from` to `to` of an animation, taking `seconds`, over and over.
+    const BrfAnimation *animation = nullptr;
+    const BrfSkeleton *skeleton = nullptr;
+    std::string action;
+    double from = 0, to = 0, seconds = 1, held = -1; // held: a fixed place in the action, 0 to 1, or below 0 to let it run
+    int most_bones = 0;   // one more than the highest bone any vertex of the model hangs on
     std::string material; // when set, used in place of the one the mesh names (heads name none: the game picks a face's by its own rules)
     std::vector<PreviewPart> parts;
     float centre[3] = {0, 0, 0}, radius = 1;
@@ -221,6 +227,8 @@ bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
         o.binormal[1] = (n[2] * t[0] - n[0] * t[2]) * v.handedness;
         o.binormal[2] = (n[0] * t[1] - n[1] * t[0]) * v.handedness;
         memcpy(o.weight, v.weight, 16), memcpy(o.bone, v.bone, 16);
+        for (int k = 0; k < 4; k++)
+            if (v.weight[k] > 0) pv.most_bones = std::max(pv.most_bones, (int)v.bone[k] + 1);
         if (!mesh.skinned) o.weight[0] = 1;
         for (int k = 0; k < 3; k++) lo[k] = std::min(lo[k], v.position[k]), hi[k] = std::max(hi[k], v.position[k]);
     }
@@ -273,6 +281,7 @@ bool preview_load(const std::string &mesh_name, int lod)
         for (PreviewPart &part : pv.parts) s_buffers.erase(part.vertices), s_buffers.erase(part.indices);
         pv.parts.clear();
         pv.active = false;
+        pv.most_bones = 0;
         std::string base = lower_case(mesh_name), suffix = lod > 0 ? ".lod" + std::to_string(lod) : std::string();
         float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
         if (!preview_add_part(base + suffix, lo, hi)) return false;
@@ -284,6 +293,100 @@ bool preview_load(const std::string &mesh_name, int lod)
         pv.active = true;
         return true;
     }
+}
+
+// The actions of a horse, which all lie in one animation (Native's actions.txt).
+const struct {
+    const char *name;
+    int from, to;
+    double seconds;
+} k_horse_actions[] = {{"stand", 600, 644, 1.5}, {"walk", 0, 31, 1.0}, {"trot", 50, 69, 0.8}, {"canter", 100, 116, 0.6}, {"gallop", 150, 165, 0.5},
+                       {"rear", 265, 297, 1.7}, {"jump", 205, 222, 1.6}, {"turn", 450, 483, 1.0}};
+
+// Chooses the action by name, or none for an empty name. "name:from:to:seconds" plays any animation of the game's files.
+bool preview_set_action(const std::string &action)
+{
+    Preview &pv = s_preview;
+    preview_read_library();
+    pv.animation = nullptr, pv.skeleton = nullptr, pv.action = action;
+    if (action.empty() || action == "none") return true;
+    std::string animation = "anim_horse";
+    bool found = false;
+    for (auto &a : k_horse_actions)
+        if (action == a.name) pv.from = a.from, pv.to = a.to, pv.seconds = a.seconds, found = true;
+    if (!found) {
+        char name[200];
+        double from, to, seconds;
+        if (sscanf(action.c_str(), "%199[^:]:%lf:%lf:%lf", name, &from, &to, &seconds) != 4 || seconds <= 0) return false;
+        animation = lower_case(name), pv.from = from, pv.to = to, pv.seconds = seconds;
+    }
+    auto it = pv.library.animations.find(animation);
+    if (it == pv.library.animations.end()) return false;
+    for (auto &sk : pv.library.skeletons) // the skeleton it was made for has as many bones
+        if (sk.second.bones.size() == it->second.bones.size()) pv.skeleton = &sk.second;
+    if (!pv.skeleton) return false;
+    pv.animation = &it->second;
+    return true;
+}
+
+// Where each bone carries the vertices that hang on it, for the action at this
+// moment: the bone's place in the pose, undone by its place at rest, which is
+// where the mesh was made. False when nothing is playing or it does not fit the model.
+bool preview_pose(double time, std::vector<double> *out)
+{
+    Preview &pv = s_preview;
+    if (!pv.animation || !pv.skeleton || pv.most_bones > (int)pv.skeleton->bones.size()) return false;
+    const BrfSkeleton &sk = *pv.skeleton;
+    const BrfAnimation &an = *pv.animation;
+    double phase = pv.held >= 0 ? pv.held : fmod(time / pv.seconds, 1.0);
+    double frame = pv.from + (pv.to - pv.from) * phase;
+    size_t n = sk.bones.size();
+    std::vector<double> rest(n * 16), posed(n * 16);
+    for (size_t b = 0; b < n; b++) {
+        const BrfSkeleton::Bone &bone = sk.bones[b];
+        double local[16] = {bone.axes[0], bone.axes[1], bone.axes[2], 0, bone.axes[3], bone.axes[4], bone.axes[5], 0,
+                            bone.axes[6], bone.axes[7], bone.axes[8], 0, bone.place[0], bone.place[1], bone.place[2], 1};
+        double turned[16];
+        memcpy(turned, local, sizeof turned);
+        const std::vector<BrfAnimation::Turn> &keys = an.bones[b];
+        if (!keys.empty()) {
+            size_t k = 0;
+            while (k + 1 < keys.size() && keys[k + 1].frame <= frame) k++;
+            size_t k1 = std::min(k + 1, keys.size() - 1);
+            double span = keys[k1].frame - keys[k].frame, t = span > 0 ? std::min(1.0, std::max(0.0, (frame - keys[k].frame) / span)) : 0;
+            double q[4], dot = 0, len = 0;
+            for (int i = 0; i < 4; i++) dot += keys[k].q[i] * keys[k1].q[i];
+            for (int i = 0; i < 4; i++) q[i] = keys[k].q[i] * (1 - t) + keys[k1].q[i] * (dot < 0 ? -t : t), len += q[i] * q[i];
+            len = sqrt(std::max(len, 1e-12));
+            double x = q[0] / len, y = q[1] / len, z = q[2] / len, w = q[3] / len;
+            const double r[9] = {1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 2 * (x * y - z * w), 1 - 2 * (x * x + z * z),
+                                 2 * (y * z + x * w),     2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)}; // by columns
+            for (int c = 0; c < 3; c++)
+                for (int row = 0; row < 3; row++) turned[c * 4 + row] = r[c * 3 + row];
+        }
+        if (bone.parent < 0 && !an.root.empty()) { // the root is also moved
+            size_t k = 0;
+            while (k + 1 < an.root.size() && an.root[k + 1].frame <= frame) k++;
+            size_t k1 = std::min(k + 1, an.root.size() - 1);
+            double span = an.root[k1].frame - an.root[k].frame, t = span > 0 ? std::min(1.0, std::max(0.0, (frame - an.root[k].frame) / span)) : 0;
+            for (int i = 0; i < 3; i++) turned[12 + i] = bone.place[i] + an.root[k].by[i] * (1 - t) + an.root[k1].by[i] * t; // on top of its place at rest
+        }
+        if (bone.parent >= 0 && (size_t)bone.parent < b) {
+            mat_mul(&rest[(size_t)bone.parent * 16], local, &rest[b * 16]);
+            mat_mul(&posed[(size_t)bone.parent * 16], turned, &posed[b * 16]);
+        } else {
+            memcpy(&rest[b * 16], local, sizeof local);
+            memcpy(&posed[b * 16], turned, sizeof turned);
+        }
+    }
+    const double identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    out->assign(32 * 16, 0.0);
+    for (size_t b = 0; b < 32; b++) {
+        double inverse[16];
+        if (b < n && mat_inverse(&rest[b * 16], inverse)) mat_mul(&posed[b * 16], inverse, &(*out)[b * 16]);
+        else memcpy(&(*out)[b * 16], identity, sizeof identity);
+    }
+    return true;
 }
 
 void preview_matrix(GLuint program, const char *name, const double *m, int count = 1)
@@ -341,6 +444,8 @@ void preview_draw(bool prepass)
     GLenum depth_func = s_depth_func;
     Program *stand_in = find(s_programs, program);
 
+    std::vector<double> pose;
+    bool posed = preview_pose(s_wind_time, &pose);
     s_depth_test = true, s_depth_mask = true, s_depth_func = GL_LEQUAL, s_cull = false, s_blend = false;
     for (PreviewPart &part : pv.parts) {
         GLuint id = part.program[prepass ? 1 : 0];
@@ -351,7 +456,14 @@ void preview_draw(bool prepass)
         preview_matrix(id, "matWorldView", world_view);
         preview_matrix(id, "matWorldViewProj", world_view_projection);
         preview_matrix(id, "matViewProj", view_projection);
-        preview_matrix(id, "matWorldArray", identity, 32); // every bone at rest
+        if (posed) {
+            GLint bones = mtl_glGetUniformLocation(id, "matWorldArray");
+            std::vector<float> values(32 * 16);
+            for (size_t k = 0; k < values.size(); k++) values[k] = (float)pose[k];
+            if (bones >= 0) mtl_glUniformMatrix4fv(bones, 32, GL_FALSE, values.data());
+        } else {
+            preview_matrix(id, "matWorldArray", identity, 32); // every bone at rest
+        }
         preview_vector(id, "vCameraPos", eye[0], eye[1], eye[2], 0);
         preview_vector(id, "vMaterialColor", 1, 1, 1, 1);
         preview_vector(id, "vSpecularColor", part.material.specular_colour[0], part.material.specular_colour[1], part.material.specular_colour[2], 1);

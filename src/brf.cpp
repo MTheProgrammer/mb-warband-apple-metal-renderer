@@ -258,16 +258,35 @@ void BrfLibrary::scan(const std::string &folder)
                         r.skip((size_t)r.u32() * 16);
                         techniques[lower(shader)] = technique;
                     } else if (section == "skeleton") {
-                        r.str();
+                        BrfSkeleton skeleton;
+                        skeleton.name = r.str();
                         for (uint32_t n = r.u32(); n; n--) {
+                            BrfSkeleton::Bone bone;
+                            bone.parent = (int)r.u32();
+                            bone.name = r.str();
                             r.skip(4);
-                            r.str();
-                            r.skip(52);
+                            for (float &v : bone.axes) v = r.f32();
+                            for (float &v : bone.place) v = r.f32();
+                            skeleton.bones.push_back(bone);
                         }
+                        skeletons[lower(skeleton.name)] = skeleton;
                     } else if (section == "skeleton_anim") {
-                        r.str();
-                        for (uint32_t bones = r.u32(); bones; bones--) r.skip((size_t)r.u32() * 20);
-                        r.skip((size_t)r.u32() * 16);
+                        BrfAnimation animation;
+                        animation.name = r.str();
+                        for (uint32_t bones = r.u32(); bones; bones--) {
+                            std::vector<BrfAnimation::Turn> turns(r.u32());
+                            for (BrfAnimation::Turn &t : turns) {
+                                t.frame = (int)r.u32();
+                                for (float &v : t.q) v = r.f32();
+                            }
+                            animation.bones.push_back(std::move(turns));
+                        }
+                        animation.root.resize(r.u32());
+                        for (BrfAnimation::Move &m : animation.root) {
+                            m.frame = (int)r.u32();
+                            for (float &v : m.by) v = r.f32();
+                        }
+                        animations[lower(animation.name)] = std::move(animation);
                     } else if (section == "body") {
                         r.str();
                         std::string type = r.str();

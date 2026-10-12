@@ -2,6 +2,7 @@
 # Shows one of the game's models through the renderer, lit as in a captured
 # frame (see scripts/capture.sh), with every optional feature on.
 #   scripts/preview.sh sword_medieval_a [options of build/replay]
+#   scripts/preview.sh courser --anim gallop      (a horse in motion; key a for the next action)
 #   scripts/preview.sh --list helmet
 # The newest capture under traces/ is the stage, or the file named in WBM_STAGE.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

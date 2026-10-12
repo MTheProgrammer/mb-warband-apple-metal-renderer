@@ -33,6 +33,34 @@ struct BrfMaterial {
     float shininess = 0, specular_colour[3] = {0, 0, 0};
 };
 
+struct BrfSkeleton {
+    struct Bone {
+        int parent; // -1 for the root
+        std::string name;
+        float axes[9];  // the bone's x, y and z axes in its parent's space, at rest
+        float place[3]; // and its place there
+    };
+    std::string name;
+    std::vector<Bone> bones;
+};
+
+// Rotations of each bone in its parent's space at numbered frames, and where
+// the root is moved to. One animation usually holds many actions end to end;
+// which frames make up an action is the module's business (actions.txt).
+struct BrfAnimation {
+    struct Turn {
+        int frame;
+        float q[4]; // x, y, z, w
+    };
+    struct Move {
+        int frame;
+        float by[3];
+    };
+    std::string name;
+    std::vector<std::vector<Turn>> bones;
+    std::vector<Move> root;
+};
+
 struct BrfLibrary {
     // Names are lower case. A mesh name maps to the file and place it was found at.
     struct MeshRef {
@@ -44,6 +72,8 @@ struct BrfLibrary {
     std::map<std::string, MeshRef> meshes;
     std::map<std::string, BrfMaterial> materials;
     std::map<std::string, std::string> techniques; // shader name -> technique name
+    std::map<std::string, BrfSkeleton> skeletons;
+    std::map<std::string, BrfAnimation> animations;
     std::vector<std::string> problems;            // files that could not be read to their end
 
     // Reads every .brf file in the folder; meshes are indexed, not kept.
