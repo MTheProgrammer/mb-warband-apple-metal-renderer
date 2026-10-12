@@ -59,7 +59,7 @@ app: $(LIB) launcher/warband-metal.sh launcher/Info.plist
 # The file to attach to a release.
 dist: app
 	rm -f "build/warband-metal-$(VERSION).zip"
-	cd build && ditto -c -k --keepParent "Warband Metal.app" "warband-metal-$(VERSION).zip"
+	cd build && ditto -c -k --norsrc --noextattr --keepParent "Warband Metal.app" "warband-metal-$(VERSION).zip"
 	@echo "build/warband-metal-$(VERSION).zip"
 
 # glslang and SPIRV-Cross, fetched into third_party/ and compiled without cmake.
