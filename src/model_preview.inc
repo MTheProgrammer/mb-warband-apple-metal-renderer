@@ -398,6 +398,7 @@ void preview_draw(bool prepass)
         }
         mtl_glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT, nullptr);
     }
+    if (!prepass) s_preview_in_scene = true;
     memcpy(s_attribs, attribs, sizeof attribs);
     memcpy(s_bound_texture, bound, sizeof bound);
     s_array_buffer = array_buffer, s_element_buffer = element_buffer, s_program = program, s_unit = unit;

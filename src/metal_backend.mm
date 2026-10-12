@@ -547,6 +547,7 @@ void apply_motion_blur();
 bool s_replaying;  // a captured frame is being played back (frame_capture.inc)
 bool s_previewing; // the frame player is showing a model (model_preview.inc)
 bool s_preview_keeps_scene;
+bool s_preview_in_scene; // the model has been drawn into the scene buffer this frame: what follows may be post-processed
 bool s_fxaa;
 void apply_fxaa();
 // Frame-rate limits (WBM_MAX_FPS, and WBM_MENU_FPS for frames without a 3D scene); 0 for none.
@@ -716,7 +717,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
     // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_previewing) &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         if (s_ao || s_contact_shadows || s_light_shafts) apply_ambient_occlusion();
@@ -3528,6 +3529,7 @@ void mtl_present(bool capture, uint32_t frame)
             });
         }
         capture_at_frame_end();
+        s_preview_in_scene = false;
     }
     limit_frame_rate();
 }

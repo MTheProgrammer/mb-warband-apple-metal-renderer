@@ -187,6 +187,10 @@ float wbm_dyn_cascade(vec3 coord, vec3 cdx, vec3 cdy, vec4 window, float column,
     // to the pixel's footprint there, or the few texels it happened to hit
     // would change from frame to frame and the shadow would flicker.
     float footprint = clamp(max(length(dx.xy), length(dy.xy)) * size, 0.0, 12.0);
+    // Very close up it is the other way about: a pixel is a small fraction of a
+    // texel, the differences the slope is worked out from are a few of the
+    // coordinate's last bits, and the slope is noise that shows as speckles.
+    slope *= smoothstep(0.04, 0.15, footprint);
     float radius = max(spread, footprint * 0.75);
     float bias = wbm_dyn_bias * bias_scale * (1.0 + 0.25 * footprint);
     float angle = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
@@ -661,10 +665,11 @@ bool add_skin_scattering_vertex(std::string &vs)
     return true;
 }
 
-bool add_skin_scattering(std::string &fs)
+// skin: scattering in skin is wanted, and not just the light through leaves that shares the rewrite.
+bool add_skin_scattering(std::string &fs, bool skin)
 {
     // The back-light needs the view direction and, for thickness, the per-frame shadow map.
-    bool can_back = fs.find("varying vec3 ViewDir;") != std::string::npos && fs.find("wbm_dynamic_shadow(") != std::string::npos;
+    bool can_back = skin && fs.find("varying vec3 ViewDir;") != std::string::npos && fs.find("wbm_dynamic_shadow(") != std::string::npos;
     const std::string back = can_back ? "wbm_skin_back(ViewDir, SunLightDir, wbm_dyn_thickness(ShadowTexCoord.xyz))" : "vec3(0.0)";
     // The sun's diffuse term, in the four shapes the engine's shaders have it:
     // with and without a shadow, as a vec3 times the sun's colour or (the two
@@ -680,7 +685,7 @@ bool add_skin_scattering(std::string &fs)
     static const std::regex own_shadowed(
         R"(\(\(\s*clamp \(max \(\(0\.2 \* \((\w+) \+ 0\.9\)\), \1\), 0\.0, 1\.0\)\s*\* (sun_amount_\d+)\) \* (tmpvar_\d+)\))");
     static const std::regex own_plain(R"(\(clamp \(\s*max \(\(0\.2 \* \((\w+) \+ 0\.9\)\), \1\)\s*, 0\.0, 1\.0\) \* (tmpvar_\d+)\))");
-    if (fs.find("varying vec3 SunLightDir;") != std::string::npos) {
+    if (skin && fs.find("varying vec3 SunLightDir;") != std::string::npos) {
         if (std::regex_search(fs, own_shadowed)) {
             fs = std::regex_replace(fs, own_shadowed, "(wbm_skin_lit($1, normalize(SunLightDir).z, $2, " + back + ") * $3)", std::regex_constants::format_first_only);
             return true;
@@ -973,7 +978,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, options.debug_materials, pbr_extra);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
     // After the shadow rewrite, which looks for the sun term's shadow variable by its original shape.
-    bool skin = (options.skin_scattering || options.foliage_backlight) && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl));
+    bool skin = (options.skin_scattering || options.foliage_backlight) && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl, options.skin_scattering));
     bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
     bool wind = vertex && options.wind && add_wind(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
