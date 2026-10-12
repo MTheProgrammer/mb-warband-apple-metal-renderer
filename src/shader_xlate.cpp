@@ -288,9 +288,12 @@ bool add_pbr_environment(std::string &fs)
 // the module (none, exponential, Reinhard, extended Reinhard), and encodes the
 // result for display. Two optional changes are made just before the encode:
 //
-//   - filmic: ignore the engine's operator and map the exposed colour with the
-//     ACES filmic fit (Narkowicz), which keeps more contrast in mid-tones and
-//     rolls highlights off more gently than Reinhard.
+//   - filmic: ignore the engine's operator and keep the exposed colour as it is
+//     up to 0.6, then roll the rest off smoothly towards 1. The Native module
+//     uses no operator at all (measured: postfx_editor_vector[0].x = 0.1), so
+//     its highlights clip hard at white; this only changes that. An ACES curve
+//     was tried first and made the whole image darker, because it also
+//     compresses shadows and mid-tones that the module leaves linear.
 //   - HDR: the operators all end at 1.0, display white. For an extended-range
 //     drawable the top of that range is stretched towards the display's
 //     headroom: colour * (1 + (headroom - 1) * peak^6). Mid-tones barely move
@@ -299,8 +302,9 @@ bool add_pbr_environment(std::string &fs)
 const char k_tonemap_functions[] = R"(
 vec3 wbm_filmic(vec3 x)
 {
-    x *= 0.6;
-    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    const float knee = 0.6;
+    vec3 over = max(x - knee, vec3(0.0));
+    return min(x, vec3(knee)) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
 }
 vec3 wbm_expand(vec3 c, float headroom)
 {
