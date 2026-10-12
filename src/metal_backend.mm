@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <map>
 #include <memory>
@@ -86,6 +87,7 @@ struct UniformLocation {
     const XlUniform *uniform[2] = {nullptr, nullptr}; // per stage: vertex, fragment
     int texture_index[2] = {-1, -1};                  // set for samplers
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
+    bool is_view_proj = false;                        // the uniform named matViewProj, which ambient occlusion reads
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
 
@@ -221,6 +223,24 @@ struct {
     uint64_t made, skipped, uniform_copies, uniform_reuses;
 } s_call_stats;
 
+// The pass most recently rendered into, remembered after it has ended so that
+// work can be appended to its target (see apply_ambient_occlusion).
+struct LastPass {
+    id<MTLTexture> color, ms_color, depth;
+    bool scene = false;
+    int samples = 1, draws = 0;
+    uint64_t occluded_in_frame = 0;
+};
+LastPass s_last;
+
+// Ambient occlusion (WBM_AO=1), applied to the engine's HDR scene buffer when
+// the engine moves on from it to post-processing.
+bool s_ao;
+float s_ao_radius = 0.6f, s_ao_strength = 1.0f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
+float s_view_proj[16];                          // the camera's matViewProj, as last set while drawing the scene
+bool s_view_proj_valid;
+void apply_ambient_occlusion();
+
 void reset_pass_state()
 {
     memset(&s_set, 0, sizeof s_set);
@@ -292,7 +312,7 @@ void end_pass()
 id<MTLTexture> new_render_texture(MTLPixelFormat format, NSUInteger width, NSUInteger height, int samples)
 {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
-    d.usage = MTLTextureUsageRenderTarget;
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; // ambient occlusion reads the depth buffer
     d.storageMode = MTLStorageModePrivate;
     if (samples > 1) {
         d.textureType = MTLTextureType2DMultisample;
@@ -310,6 +330,7 @@ struct Target {
     id<MTLTexture> color, depth; // color is what later passes sample; with multisampling it receives the resolve
     id<MTLTexture> ms_color;     // what is rendered into when multisampled
     bool screen = false;
+    bool scene = false; // the engine's HDR scene buffer: screen-sized, RGBA16F, with depth
     int scale = 1, samples = 1;
 };
 
@@ -354,6 +375,8 @@ bool resolve_target(Target &t)
         if (!t.color) t.scale = tex->scale;
     }
     if (!t.color && t.depth) t.samples = (int)t.depth.sampleCount;
+    if (Texture *tex = find(s_textures, fb->color_texture))
+        t.scene = tex->screen_sized && tex->format == MTLPixelFormatRGBA16Float && t.depth != nil;
     if (t.color && t.depth && (int)t.depth.sampleCount != t.samples) {
         complain("framebuffer mixes a %d-sample colour target with a %d-sample depth buffer; depth is ignored", t.samples,
                  (int)t.depth.sampleCount);
@@ -367,6 +390,12 @@ bool resolve_target(Target &t)
 void start_pass(const Target &t, GLbitfield clear_mask)
 {
     end_pass();
+    // The engine has drawn the scene and is moving to another target: this is
+    // where post-processing starts, and the point to darken the scene first.
+    if (s_ao && s_last.scene && s_last.color != t.color && s_last.draws > 100 && s_last.occluded_in_frame != s_frame_serial) {
+        s_last.occluded_in_frame = s_frame_serial;
+        apply_ambient_occlusion();
+    }
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (t.color) {
         bool clear = clear_mask & GL_COLOR_BUFFER_BIT;
@@ -395,6 +424,12 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_screen = t.screen;
     s_pass_scale = t.scale;
     s_pass_samples = t.samples;
+    if (s_last.color != t.color) s_last.draws = 0; // a clear restarts the pass on the same target; keep counting
+    s_last.color = t.color;
+    s_last.ms_color = t.ms_color;
+    s_last.depth = t.depth;
+    s_last.scene = t.scene;
+    s_last.samples = t.samples;
 }
 
 bool ensure_pass()
@@ -651,6 +686,7 @@ void link_program(GLuint program_id, Program &p)
                 it = p.location_by_name.emplace(name, (GLint)p.locations.size()).first;
                 p.locations.emplace_back();
                 p.locations.back().name = name;
+                p.locations.back().is_view_proj = name == "matViewProj";
             }
             return p.locations[(size_t)it->second];
         };
@@ -697,6 +733,15 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (!p || loc < 0 || (size_t)loc >= p->locations.size()) return;
     UniformLocation &l = p->locations[(size_t)loc];
     if ((l.texture_index[0] >= 0 || l.texture_index[1] >= 0) && data_is_int) l.unit = *(const GLint *)data;
+    if (s_ao && l.is_view_proj && components == 16 && count >= 1) {
+        // Other cameras (shadows, water reflection) set this uniform too; only the
+        // one in use while the scene buffer is bound is the player's view.
+        Target t;
+        if (s_fbo != 0 && resolve_target(t) && t.scene) {
+            memcpy(s_view_proj, data, sizeof s_view_proj);
+            s_view_proj_valid = true;
+        }
+    }
     for (int s = 0; s < 2; s++) {
         const XlUniform *u = l.uniform[s];
         if (!u) continue;
@@ -886,6 +931,259 @@ id<MTLDepthStencilState> depth_state(bool has_depth)
     return state;
 }
 
+// ---- ambient occlusion ---------------------------------------------------------------
+
+// Two full-screen passes written directly in Metal's shading language.
+//
+// ao_compute, at half resolution: for each pixel, rebuild its position in view
+// space from the depth buffer, estimate the surface normal from neighbouring
+// depths, and look at 16 nearby points on a rotated spiral. Points that rise
+// above the surface's tangent plane within the radius occlude it; the closer,
+// the more. This is the "Alchemy" estimator, a horizon-based method that needs
+// only depth.
+//
+// ao_apply, at full resolution: blur the result over 3x3 half-resolution
+// texels, ignoring texels at a different depth so that occlusion does not
+// leak across silhouettes, and multiply the scene's colour by it.
+const char k_ao_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Params {
+    float a, b;        // clip z = a * w + b, from the camera's projection
+    float p00, p11;    // projection scale in x and y
+    float2 depth_size; // of the depth buffer, in pixels
+    float2 ao_size;    // of the half-resolution occlusion texture
+    float radius, strength, reversed, fade_start;
+};
+
+#if WBM_MSAA
+typedef depth2d_ms<float> DepthTexture;
+#else
+typedef depth2d<float> DepthTexture;
+#endif
+
+static float load_depth(DepthTexture t, int2 c, float2 size)
+{
+    c = clamp(c, int2(0), int2(size) - 1);
+    return t.read(uint2(c), 0);
+}
+
+// Distance in front of the camera, from a stored depth value.
+static float view_z(float d, Params p)
+{
+    float ndc = p.reversed > 0.5 ? 1.0 - 2.0 * d : 2.0 * d - 1.0;
+    return p.b / (ndc - p.a);
+}
+
+static float3 view_position(DepthTexture t, int2 c, Params p)
+{
+    float w = view_z(load_depth(t, c, p.depth_size), p);
+    float2 ndc = (float2(c) + 0.5) / p.depth_size * 2.0 - 1.0;
+    return float3(ndc.x * w / p.p00, ndc.y * w / p.p11, w);
+}
+
+struct VertexOut {
+    float4 position [[position]];
+};
+
+vertex VertexOut ao_vertex(uint id [[vertex_id]])
+{
+    float2 corner = float2((id << 1) & 2, id & 2); // one triangle that covers the screen
+    VertexOut out;
+    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 ao_compute(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    int2 c = int2(in.position.xy) * 2 + 1;
+    float d = load_depth(depth, c, p.depth_size);
+    bool sky = p.reversed > 0.5 ? d <= 0.0 : d >= 1.0;
+    if (sky) return float4(1.0);
+    float3 P = view_position(depth, c, p);
+    if (P.z > p.fade_start * 2.0) return float4(1.0);
+
+    // The normal, from whichever neighbour on each axis is closer in depth, so
+    // that it is not taken across an edge.
+    float3 right = view_position(depth, c + int2(1, 0), p) - P, left = P - view_position(depth, c - int2(1, 0), p);
+    float3 down = view_position(depth, c + int2(0, 1), p) - P, up = P - view_position(depth, c - int2(0, 1), p);
+    float3 dx = abs(right.z) < abs(left.z) ? right : left;
+    float3 dy = abs(down.z) < abs(up.z) ? down : up;
+    float3 n = normalize(cross(dy, dx));
+    if (dot(n, P) > 0.0) n = -n; // towards the camera
+
+    float radius_px = clamp(p.radius * p.p00 / P.z * 0.5 * p.depth_size.x, 3.0, 96.0);
+    float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+    float bias = 0.02 + 0.004 * P.z;
+    float sum = 0.0;
+    const int directions = 4, steps = 4;
+    for (int i = 0; i < directions; i++) {
+        float angle = (float(i) + noise) * (6.2831853 / float(directions));
+        float2 dir = float2(cos(angle), sin(angle));
+        for (int s = 0; s < steps; s++) {
+            float t = (float(s) + fract(noise * 7.0 + 0.37 * float(i)) + 0.2) / float(steps);
+            float3 v = view_position(depth, c + int2(dir * radius_px * t), p) - P;
+            float dd = dot(v, v);
+            sum += max(0.0, dot(v, n) - bias) / (dd + 0.0001) * saturate(1.0 - dd / (p.radius * p.radius));
+        }
+    }
+    float occlusion = sum * p.radius * 2.0 / float(directions * steps);
+    float ao = saturate(1.0 - p.strength * occlusion);
+    return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
+}
+
+fragment float4 ao_apply(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], texture2d<float> ao [[texture(1)]],
+                         constant Params &p [[buffer(0)]])
+{
+    int2 c = int2(in.position.xy);
+    float zc = view_z(load_depth(depth, c, p.depth_size), p);
+    int2 h = c / 2;
+    float total = 0.0, weight = 0.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            int2 t = clamp(h + int2(i, j), int2(0), int2(p.ao_size) - 1);
+            float zs = view_z(load_depth(depth, t * 2 + 1, p.depth_size), p);
+            float w = exp(-abs(zs - zc) / (0.03 * zc + 0.02)) / (1.0 + abs(float(i)) + abs(float(j)));
+            total += ao.read(uint2(t)).x * w;
+            weight += w;
+        }
+    }
+    float a = weight > 0.0001 ? total / weight : 1.0;
+    return float4(a, a, a, 1.0);
+}
+)";
+
+struct AOParams {
+    float a, b, p00, p11;
+    float depth_size[2], ao_size[2];
+    float radius, strength, reversed, fade_start;
+};
+
+id<MTLLibrary> s_ao_library;
+id<MTLRenderPipelineState> s_ao_compute_pipeline;
+std::map<std::pair<int, int>, id<MTLRenderPipelineState>> s_ao_apply_pipelines; // by colour format and sample count
+id<MTLTexture> s_ao_texture;
+
+bool ao_setup()
+{
+    if (s_ao_library) return true;
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.preprocessorMacros = @{@"WBM_MSAA" : @(s_msaa > 1 ? 1 : 0)};
+    NSError *error = nil;
+    s_ao_library = [s_device newLibraryWithSource:@(k_ao_source) options:options error:&error];
+    if (!s_ao_library) {
+        complain("ambient occlusion shaders did not compile: %s", error.localizedDescription.UTF8String);
+        return s_ao = false;
+    }
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [s_ao_library newFunctionWithName:@"ao_vertex"];
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_compute"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
+    s_ao_compute_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!s_ao_compute_pipeline) {
+        complain("ambient occlusion pipeline failed: %s", error.localizedDescription.UTF8String);
+        return s_ao = false;
+    }
+    return true;
+}
+
+id<MTLRenderPipelineState> ao_apply_pipeline(MTLPixelFormat format, int samples)
+{
+    id<MTLRenderPipelineState> __strong &state = s_ao_apply_pipelines[{(int)format, samples}];
+    if (!state) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [s_ao_library newFunctionWithName:@"ao_vertex"];
+        d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_apply"];
+        d.rasterSampleCount = (NSUInteger)samples;
+        MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[0];
+        c.pixelFormat = format;
+        c.blendingEnabled = YES; // colour = colour already there * occlusion; alpha untouched
+        c.sourceRGBBlendFactor = MTLBlendFactorDestinationColor;
+        c.destinationRGBBlendFactor = MTLBlendFactorZero;
+        c.sourceAlphaBlendFactor = MTLBlendFactorZero;
+        c.destinationAlphaBlendFactor = MTLBlendFactorOne;
+        NSError *error = nil;
+        state = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!state) complain("ambient occlusion apply pipeline failed: %s", error.localizedDescription.UTF8String);
+    }
+    return state;
+}
+
+// Runs the two passes on the scene buffer described by s_last. Called between
+// render passes, with none open.
+void apply_ambient_occlusion()
+{
+    if (!s_view_proj_valid || !s_last.depth || !ao_setup()) return;
+
+    // The projection's depth terms and scales, read out of view-projection. With
+    // rows r0..r3 of that matrix: r3.xyz is the camera's forward direction, clip
+    // w is distance along it, and clip z = a * w + b.
+    const float *m = s_view_proj; // column-major: row r is m[r], m[4 + r], m[8 + r], m[12 + r]
+    auto row = [&](int r, float out[4]) {
+        for (int c = 0; c < 4; c++) out[c] = m[c * 4 + r];
+    };
+    float r0[4], r1[4], r2[4], r3[4];
+    row(0, r0), row(1, r1), row(2, r2), row(3, r3);
+    auto dot3 = [](const float *x, const float *y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+    float forward2 = dot3(r3, r3);
+    if (forward2 < 1e-12f) return;
+    AOParams params;
+    params.a = dot3(r2, r3) / forward2;
+    params.b = r2[3] - params.a * r3[3];
+    params.p00 = sqrtf(dot3(r0, r0) / forward2);
+    params.p11 = sqrtf(dot3(r1, r1) / forward2);
+    if (!(fabsf(params.b) > 1e-6f) || !(params.p00 > 1e-4f)) {
+        complain("ambient occlusion: the camera matrix is not a perspective projection it understands");
+        return;
+    }
+    NSUInteger w = s_last.depth.width, h = s_last.depth.height, aw = (w + 1) / 2, ah = (h + 1) / 2;
+    params.depth_size[0] = (float)w, params.depth_size[1] = (float)h;
+    params.ao_size[0] = (float)aw, params.ao_size[1] = (float)ah;
+    params.radius = s_ao_radius;
+    params.strength = s_ao_strength;
+    params.reversed = s_reverse_depth ? 1.0f : 0.0f;
+    params.fade_start = 60.0f; // metres: beyond this the effect fades out, and is gone at twice it
+
+    if (!s_ao_texture || s_ao_texture.width != aw || s_ao_texture.height != ah) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:aw height:ah mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_ao_texture = [s_device newTextureWithDescriptor:td];
+    }
+    id<MTLRenderPipelineState> apply = ao_apply_pipeline(s_last.color.pixelFormat, s_last.samples);
+    if (!apply) return;
+
+    MTLRenderPassDescriptor *compute = [MTLRenderPassDescriptor renderPassDescriptor];
+    compute.colorAttachments[0].texture = s_ao_texture;
+    compute.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    compute.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:compute];
+    [pass setRenderPipelineState:s_ao_compute_pipeline];
+    [pass setFragmentTexture:s_last.depth atIndex:0];
+    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+
+    MTLRenderPassDescriptor *onto = [MTLRenderPassDescriptor renderPassDescriptor];
+    onto.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    if (s_last.ms_color) {
+        onto.colorAttachments[0].texture = s_last.ms_color;
+        onto.colorAttachments[0].resolveTexture = s_last.color;
+        onto.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+    } else {
+        onto.colorAttachments[0].texture = s_last.color;
+        onto.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    pass = [command_buffer() renderCommandEncoderWithDescriptor:onto];
+    [pass setRenderPipelineState:apply];
+    [pass setFragmentTexture:s_last.depth atIndex:0];
+    [pass setFragmentTexture:s_ao_texture atIndex:1];
+    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+}
+
 // Binds a buffer to a vertex (stage 0) or fragment (stage 1) slot, doing only
 // as much as changed: nothing, the offset alone, or the whole binding.
 void bind_buffer(int stage, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index)
@@ -1019,6 +1317,7 @@ bool prepare_draw()
         bind_buffer(0, b->mtl, binding.base[slot], (NSUInteger)(VERTEX_SLOT_BASE + slot));
     }
     bind_buffer(0, s_constant_attrib, 0, CONSTANT_SLOT);
+    s_last.draws++;
     return true;
 }
 
@@ -1077,6 +1376,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_reverse_depth = s_shader_options.reverse_depth = !(reverse_env && atoi(reverse_env) == 0); // on unless set to 0
     s_shader_options.srgb_textures = srgb_env && atoi(srgb_env) != 0;                            // off unless set
     s_state_cache = !(cache_env && atoi(cache_env) == 0);
+    const char *ao_env = getenv("WBM_AO");
+    s_ao = ao_env && atoi(ao_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_AO_RADIUS")) s_ao_radius = (float)atof(v);
+    if (const char *v = getenv("WBM_AO_STRENGTH")) s_ao_strength = (float)atof(v);
     const char *pbr_env = getenv("WBM_PBR");
     s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) >= 1;    // off unless set
     s_shader_options.pbr_environment = pbr_env && atoi(pbr_env) >= 2; // 2: metalness and environment reflection too
@@ -1122,10 +1425,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
-            "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s",
+            "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
-            s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off");
+            s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
+            s_ao ? "on" : "off");
 }
 
 const char *mtl_device_name()
