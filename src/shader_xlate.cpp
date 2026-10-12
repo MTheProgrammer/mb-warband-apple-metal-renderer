@@ -74,10 +74,72 @@ float wbm_shadow(sampler2D map, vec3 coord, float size)
 }
 )";
 
+// Percentage-closer soft shadows. A real shadow is sharp where the object
+// casting it touches the ground and blurs with distance, because the sun is a
+// disc and not a point. Three steps per pixel:
+//
+//   1. Look around in the shadow map for anything nearer to the sun than this
+//      surface, and average how near it is.
+//   2. The further away that is, the wider the penumbra. The sun's projection
+//      is orthographic, so the width is simply the gap times the tangent of the
+//      sun's angular radius; the matrix gives the map's size in world units,
+//      which turns that into texels. The radius used (about 2.3 degrees) is
+//      several times the real sun's, as is usual, so that the effect reads.
+//   3. Filter the shadow over a disc of that width.
+//
+// Pixels where step 1 finds nothing, or nothing but occluders, are fully lit
+// or fully shadowed and skip step 3. The sample pattern is rotated per pixel,
+// which trades banding for fine noise.
+const char k_pcss_shadow_function[] = R"(
+const vec2 wbm_disc[16] = vec2[16](
+    vec2(-0.9420, -0.3991), vec2(0.9456, -0.7689), vec2(-0.0942, -0.9294), vec2(0.3450, 0.2939),
+    vec2(-0.9159, 0.4577), vec2(-0.8154, -0.8791), vec2(-0.3828, 0.2768), vec2(0.9748, 0.7565),
+    vec2(0.4432, -0.9751), vec2(0.5374, -0.4737), vec2(-0.2650, -0.4189), vec2(0.7920, 0.1909),
+    vec2(-0.2419, 0.9971), vec2(-0.8141, 0.9144), vec2(0.1998, 0.7864), vec2(0.1438, -0.1410));
+
+float wbm_shadow_pcss(sampler2D map, vec3 coord, float size, mat4 sun)
+{
+    vec3 dx = dFdx(coord), dy = dFdy(coord);
+    float det = dx.x * dy.y - dx.y * dy.x;
+    vec2 slope = vec2(0.0); // change of the surface's depth per shadow-map texel
+    if (abs(det) > 1e-14) slope = vec2(dy.y * dx.z - dx.y * dy.z, dx.x * dy.z - dy.x * dx.z) / (det * size);
+    slope = clamp(slope, vec2(-0.002), vec2(0.002));
+
+    float angle = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    mat2 rotate = mat2(cos(angle), sin(angle), -sin(angle), cos(angle));
+
+    const float search = 8.0; // texels
+    float blockers = 0.0, blocker_depth = 0.0;
+    for (int i = 0; i < 16; i++) {
+        vec2 o = rotate * wbm_disc[i] * search;
+        float nearest = textureLod(map, coord.xy + o / size, 0.0).x;
+        if (nearest < coord.z + dot(slope, o)) {
+            blockers += 1.0;
+            blocker_depth += nearest;
+        }
+    }
+    if (blockers < 0.5) return 1.0;
+
+    // Texels of penumbra per unit of depth: (depth range / 2) * tan(sun radius) / (texel size).
+    float texels_per_depth = 0.04 * size * 0.5 * length(vec3(sun[0][0], sun[1][0], sun[2][0])) /
+                             max(length(vec3(sun[0][2], sun[1][2], sun[2][2])), 1e-6);
+    float gap = max(coord.z - blocker_depth / blockers, 0.0);
+    float radius = clamp(gap * texels_per_depth, 1.5, 12.0);
+    if (blockers > 15.5 && radius < search * 0.5) return 0.0;
+
+    float lit = 0.0;
+    for (int i = 0; i < 16; i++) {
+        vec2 o = rotate * wbm_disc[i].yx * radius;
+        lit += textureLod(map, coord.xy + o / size, 0.0).x < coord.z + dot(slope, o) ? 0.0 : 1.0;
+    }
+    return lit / 16.0;
+}
+)";
+
 // Swaps the engine's shadow filter for wbm_shadow. The block is generated code
 // and has one shape in every shader that has it; a shader where the shape is
 // not found is left as it is.
-bool soften_shadows(std::string &fs)
+bool soften_shadows(std::string &fs, bool pcss)
 {
     static const std::regex blend(
         R"((\w+) = clamp \(mix \(mix \(\w+, \w+, \w+\.x\), mix \(\w+, \w+, \w+\.x\), \w+\.y\), 0\.0, 1\.0\);)");
@@ -85,8 +147,9 @@ bool soften_shadows(std::string &fs)
         if (fs.find(name) == std::string::npos) return false;
     std::smatch m;
     if (!std::regex_search(fs, m, blend)) return false;
-    fs = std::string(m.prefix()) + std::string(m[1]) + " = wbm_shadow(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize);" +
-         std::string(m.suffix());
+    std::string call = pcss ? "wbm_shadow_pcss(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize, matSunViewProj)"
+                            : "wbm_shadow(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize)";
+    fs = std::string(m.prefix()) + std::string(m[1]) + " = " + call + ";" + std::string(m.suffix());
     return true;
 }
 
@@ -375,7 +438,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
                       const XlOptions &options, std::vector<std::string> &srgb_samplers, std::string &log)
 {
     std::string glsl = source;
-    bool soft_shadows = !vertex && options.soft_shadows && soften_shadows(glsl);
+    bool soft_shadows = !vertex && (options.soft_shadows || options.pcss_shadows) && soften_shadows(glsl, options.pcss_shadows);
+    // The vertex shader has the sun's matrix; the fragment shader needs it too now.
+    bool needs_sun_matrix = soft_shadows && options.pcss_shadows && glsl.find("uniform mat4 matSunViewProj;") == std::string::npos;
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
     bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment) && use_pbr_specular(glsl);
     bool pbr_environment = pbr_specular && options.pbr_environment && add_pbr_environment(glsl);
@@ -390,7 +455,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     out << "#version 450\n";
     if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
-    if (soft_shadows) out << k_soft_shadow_function;
+    if (needs_sun_matrix) out << "uniform mat4 matSunViewProj;\n";
+    if (soft_shadows) out << (options.pcss_shadows ? k_pcss_shadow_function : k_soft_shadow_function);
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
     if (final_pass) out << k_tonemap_functions;

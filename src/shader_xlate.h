@@ -45,6 +45,9 @@ struct XlProgram {
 struct XlOptions {
     // Replace the engine's 2x2-texel shadow filter with a 4x4-texel one.
     bool soft_shadows = false;
+    // Instead of that: shadows whose softness grows with the distance between
+    // the surface and whatever shades it (percentage-closer soft shadows).
+    bool pcss_shadows = false;
     // Turn alpha tests (discard below a threshold) into partial coverage of a
     // multisampled pixel, so cut-out edges are smoothed like geometry edges.
     bool smooth_alpha_test = false;

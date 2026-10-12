@@ -94,7 +94,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_PBR` | Metal mode: `1` replaces the engine's Blinn-Phong highlights with microfacet ones (GGX, Smith shadowing, Schlick Fresnel), keeping each material's highlight strength and deriving roughness from its shininess. `2` also estimates metalness from the specular mask, darkens the base colour of metals and adds a reflection of a sky-and-ground environment built from the scene's light colours. Off by default: it changes how armour and weapons look |
 | `WBM_SRGB` | Metal mode: `1` removes the shaders' own `pow(colour, 2.2)` on texture samples and binds sRGB views of the textures instead, for an exact decode before filtering. Off by default: it shifts dark tones slightly |
 | `WBM_STATE_CACHE` | Metal mode: `0` issues every state-setting Metal call on every draw, as a baseline for measuring the saving. By default calls whose value is unchanged within a render pass are skipped |
-| `WBM_SHADOWS` | Metal mode: `0` keeps the game's own 4-sample shadow filter. By default shadows are filtered over a 4x4 block of shadow-map texels, for softer edges |
+| `WBM_SHADOWS` | Metal mode: `0` keeps the game's own 4-sample shadow filter. `1`, the default, filters over a 4x4 block of shadow-map texels for softer edges. `2` uses percentage-closer soft shadows: sharp where an object meets the ground, wider with distance from it |
 | `WBM_CACHE` | Directory of the translated-shader cache. Default `~/Library/Caches/warband-metal`; `0` disables it |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
 | `WBM_OUT` | Output directory. `run.sh` sets it to `traces/<timestamp>`; otherwise `~/Library/Logs/warband-metal` |

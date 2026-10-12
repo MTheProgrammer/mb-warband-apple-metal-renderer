@@ -2,6 +2,7 @@
 // result with Metal. Usage: xlate_test <trace-dir> [-v] [-s] [-a] [-z] [-g] [-p] [-e] [-t] [-r] [-d program-id]
 //   -v  print the log of failing programs      -d  dump one program's sources
 //   -s  translate with soft shadows; also reports how many programs it changed
+//   -S  with distance-dependent (PCSS) shadows instead
 //   -a  translate with smoothed alpha tests; likewise
 //   -p  translate with microfacet specular highlights; reports programs changed
 //   -e  also with estimated metalness and environment reflection; likewise
@@ -35,6 +36,7 @@ int main(int argc, char **argv)
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = true;
         if (!strcmp(argv[i], "-s")) options.soft_shadows = true;
+        if (!strcmp(argv[i], "-S")) options.pcss_shadows = true;
         if (!strcmp(argv[i], "-a")) options.smooth_alpha_test = true;
         if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
         if (!strcmp(argv[i], "-p")) options.pbr_specular = true;
@@ -105,7 +107,7 @@ int main(int argc, char **argv)
     }
     finish();
     printf("%d programs, %d failed\n", total, failed);
-    if (options.soft_shadows) printf("%d programs use the soft shadow filter\n", softened);
+    if (options.soft_shadows || options.pcss_shadows) printf("%d programs use the soft shadow filter\n", softened);
     if (options.smooth_alpha_test) printf("%d programs have smoothed alpha tests\n", smoothed);
     if (options.pbr_specular || options.pbr_environment) printf("%d programs use microfacet specular highlights\n", pbr);
     if (options.pbr_environment) printf("%d programs add metalness and an environment reflection\n", env);

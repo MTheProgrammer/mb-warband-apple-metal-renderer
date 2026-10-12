@@ -1632,7 +1632,9 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_screen_h = height;
     const char *scale_env = getenv("WBM_SCALE");
     const char *shadows_env = getenv("WBM_SHADOWS"); // on unless set to 0
+    // WBM_SHADOWS: 0 the engine's filter, 1 (default) a wider one, 2 softness that grows with distance.
     s_shader_options.soft_shadows = !(shadows_env && atoi(shadows_env) == 0);
+    s_shader_options.pcss_shadows = shadows_env && atoi(shadows_env) >= 2;
     const char *msaa_env = getenv("WBM_MSAA");
     const char *reverse_env = getenv("WBM_REVERSE_Z"), *srgb_env = getenv("WBM_SRGB"), *cache_env = getenv("WBM_STATE_CACHE");
     s_reverse_depth = s_shader_options.reverse_depth = !(reverse_env && atoi(reverse_env) == 0); // on unless set to 0
@@ -1707,7 +1709,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
             "contact shadows %s; filmic tone map %s; extended-range output %s",
-            width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
+            width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
             s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_shader_options.filmic_tonemap ? "on" : "off",
