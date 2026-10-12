@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -271,7 +272,7 @@ struct Camera {
     uint64_t projection_frame = 0, view_frame = 0;
 };
 Camera s_camera;
-bool s_pass_scene, s_pass_prepass;
+bool s_pass_scene, s_pass_prepass, s_pass_shadow_map;
 
 // The per-frame shadow map (WBM_DYNAMIC_SHADOWS=1): see record_caster and render_dynamic_shadows.
 bool s_dyn_shadows;
@@ -285,7 +286,7 @@ uint64_t s_dyn_frame;          // the frame the map was last drawn in
 id<MTLTexture> s_dyn_map, s_dyn_depth;
 id<MTLSamplerState> s_dyn_sampler;
 struct {
-    uint64_t frames, casters;
+    uint64_t frames, casters, scenery, overlays;
 } s_dyn_stats;
 // Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
 // pass as ambient occlusion. They need the sun: its direction and colour as
@@ -395,6 +396,7 @@ struct Target {
     bool screen = false;
     bool scene = false; // the engine's HDR scene buffer: screen-sized, RGBA16F, with depth
     bool prepass = false; // the engine's depth pre-pass: screen-sized, R16F, with depth
+    bool shadow_map = false; // the engine's own shadow map of the scenery: large, square, R32F
     int scale = 1, samples = 1;
 };
 
@@ -449,6 +451,8 @@ bool resolve_target(Target &t)
         t.scene = tex->screen_sized && tex->format == MTLPixelFormatRGBA16Float && t.depth != nil;
     if (Texture *tex = find(s_textures, fb->color_texture))
         t.prepass = tex->screen_sized && tex->format == MTLPixelFormatR16Float && t.depth != nil;
+    if (Texture *tex = find(s_textures, fb->color_texture))
+        t.shadow_map = !tex->screen_sized && tex->format == MTLPixelFormatR32Float && tex->mtl.width >= 2048 && tex->mtl.width == tex->mtl.height;
     if (t.color && t.depth && (int)t.depth.sampleCount != t.samples) {
         complain("framebuffer mixes a %d-sample colour target with a %d-sample depth buffer; depth is ignored", t.samples,
                  (int)t.depth.sampleCount);
@@ -500,6 +504,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     if (t.scene) s_scene_frame = s_frame_serial;
     s_pass_scene = t.scene;
     s_pass_prepass = t.prepass;
+    s_pass_shadow_map = t.shadow_map;
     if (s_last.color != t.color) s_last.draws = 0; // a clear restarts the pass on the same target; keep counting
     s_last.color = t.color;
     s_last.ms_color = t.ms_color;
@@ -1627,6 +1632,38 @@ struct CasterDraw {
 std::vector<CasterDraw> s_casters;
 std::vector<float> s_caster_bones;
 
+// Scenery is in the engine's own shadow map already, drawn there once per scene.
+// Drawing it into this one as well would cost a draw and change the look of its
+// shadow wherever the window happens to reach, so the meshes the engine drew
+// into its map are remembered and passed over.
+std::unordered_set<uint64_t> s_scenery;
+uint64_t s_scenery_frame;
+
+uint64_t mesh_id(NSUInteger count, NSUInteger index_offset)
+{
+    return ((uint64_t)s_element_buffer * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)s_draw_binding.buffer[0] * 0xC2B2AE3D27D4EB4Full) ^
+           ((uint64_t)index_offset * 0x165667B19E3779F9ull) ^ (uint64_t)count;
+}
+
+// Some of what the pre-pass draws is not part of the world at all: the aiming
+// mark, for one. The main pass gives such things away by drawing them on top of
+// everything, without a depth test or without writing depth, and a mesh seen
+// drawn that way is kept out of the map from the next frame on.
+std::unordered_set<uint64_t> s_overlays;
+
+void record_overlay(NSUInteger count, NSUInteger index_offset)
+{
+    if (s_overlays.size() > 4096) s_overlays.clear();
+    s_overlays.insert(mesh_id(count, index_offset));
+}
+
+void record_scenery(NSUInteger count, NSUInteger index_offset)
+{
+    if (s_scenery_frame + 1 < s_frame_serial) s_scenery.clear(); // the engine is drawing its map afresh
+    s_scenery_frame = s_frame_serial;
+    s_scenery.insert(mesh_id(count, index_offset));
+}
+
 const char k_caster_source[] = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -1705,6 +1742,15 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
 {
     Program *p = find(s_programs, s_program);
     if (!p || !p->u_wvp || s_casters.size() >= 20000) return;
+    uint64_t mesh = mesh_id(count, index_offset);
+    if (s_scenery.count(mesh)) {
+        s_dyn_stats.scenery++;
+        return;
+    }
+    if (s_overlays.count(mesh)) {
+        s_dyn_stats.overlays++;
+        return;
+    }
     CasterDraw c{};
     memcpy(c.key.format, s_last_key.format, sizeof c.key.format);
     memcpy(c.key.slot, s_last_key.slot, sizeof c.key.slot);
@@ -2368,8 +2414,10 @@ void mtl_dump_stats(FILE *f)
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_dyn_stats.frames)
-        fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average\n",
-                (unsigned long long)s_dyn_stats.frames, (double)s_dyn_stats.casters / (double)s_dyn_stats.frames);
+        fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average, %.0f more left out as scenery\n"
+                   "%llu draws left out as overlays, %zu overlay meshes known at exit\n",
+                (unsigned long long)s_dyn_stats.frames, (double)s_dyn_stats.casters / (double)s_dyn_stats.frames,
+                (double)s_dyn_stats.scenery / (double)s_dyn_stats.frames, (unsigned long long)s_dyn_stats.overlays, s_overlays.size());
 }
 
 void mtl_set_vsync(bool on)
@@ -2929,6 +2977,8 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
         if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset);
+        if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);
+        if (s_dyn_shadows && s_pass_scene && (!s_depth_test || !s_depth_mask)) record_overlay((NSUInteger)count, offset);
         // The engine draws the sky first, with the depth test off. That draw is the one to capture.
         if (s_shader_options.pbr_sky && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
             capture_sky(primitive, (NSUInteger)count, index_type, b->mtl, offset);

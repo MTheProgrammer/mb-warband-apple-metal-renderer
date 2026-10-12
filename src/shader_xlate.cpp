@@ -187,7 +187,7 @@ float wbm_dynamic_shadow(vec3 coord)
 // Rewrites the engine's shadow filter. The block is generated code and has one
 // shape in every shader that has it; a shader where the shape is not found is
 // left as it is. filter: 0 keeps the engine's four samples, 1 uses wbm_shadow,
-// 2 wbm_shadow_pcss. dynamic: also multiply by wbm_dynamic_shadow.
+// 2 wbm_shadow_pcss. dynamic: also take the darker of that and wbm_dynamic_shadow.
 bool rewrite_shadows(std::string &fs, int filter, bool dynamic)
 {
     static const std::regex blend(
@@ -199,7 +199,7 @@ bool rewrite_shadows(std::string &fs, int filter, bool dynamic)
     std::string var = m[1], statement = m.str();
     if (filter == 1) statement = var + " = wbm_shadow(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize);";
     if (filter == 2) statement = var + " = wbm_shadow_pcss(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize, matSunViewProj);";
-    if (dynamic) statement += " " + var + " *= wbm_dynamic_shadow(ShadowTexCoord.xyz);";
+    if (dynamic) statement += " " + var + " = min(" + var + ", wbm_dynamic_shadow(ShadowTexCoord.xyz));";
     fs = std::string(m.prefix()) + statement + std::string(m.suffix());
     return true;
 }
