@@ -503,6 +503,9 @@ uniform vec4 wbm_skin;
 // surface and to the smooth one.
 vec3 wbm_skin_core(float mapped, float smooth_, float shadow)
 {
+    // Where the light only grazes, a sharp shadow map draws the head's own
+    // polygons on it as steps. Light there is nearly gone anyway; the shadow is let go.
+    shadow = mix(1.0, shadow, smoothstep(0.0, 0.3, smooth_));
     const vec3 wrap = vec3(0.38, 0.16, 0.07);       // how far round each colour reaches
     const vec3 relief = vec3(0.25, 0.7, 1.0);       // how much of the normal map each colour sees
     vec3 facing = mix(vec3(smooth_), vec3(mapped), relief);
@@ -557,22 +560,34 @@ vec4 wbm_skin_lit(float mapped, float smooth_, float shadow, vec3 back)
 const char k_wind_function[] = R"(
 uniform vec4 wbm_wind;
 
-vec4 wbm_sway(vec4 p, vec2 uv)
+// height: for batches, the vertex colour's alpha, which the backend has made
+// the height above the plant's foot in units of 25.5 m; below 0 when the
+// shader has no vertex colour, and then a batch is left still.
+vec4 wbm_sway(vec4 p, float height)
 {
     if (wbm_wind.y <= 0.0) return p;
-    float t = wbm_wind.x, reach, phase;
+    float t = wbm_wind.x, metres, phase;
     if (wbm_wind.z < 0.5) {
-        float h = clamp(p.z / 6.0, 0.0, 1.5);
-        reach = 0.14 * h * h;
+        metres = p.z;
         phase = wbm_wind.w + dot(p.xyz, vec3(0.31, 0.27, 0.19));
     } else {
-        reach = 0.07 * clamp(wbm_wind.z > 1.5 ? uv.y : 1.0 - uv.y, 0.0, 1.0);
-        phase = dot(p.xy, vec2(0.23, 0.17));
+        if (height < 0.0) return p;
+        metres = height * 25.5;
+        phase = dot(p.xy, vec2(0.23, 0.17)) + p.z * 0.19;
     }
+    float h = clamp(metres / 6.0, 0.0, 1.5);
+    float reach = 0.11 * h * h + 0.035 * smoothstep(0.0, 1.5, metres); // the second part is for bushes and grass
     float gust = 0.6 + 0.4 * sin(t * 0.5 + phase * 0.11);
     vec2 push = vec2(sin(t * 1.3 + phase) + 0.35 * sin(t * 3.7 + phase * 2.3), 0.6 * cos(t * 1.1 + phase * 0.8) + 0.35 * sin(t * 4.3 + phase * 1.9));
     p.xy += push * (reach * gust * wbm_wind.y);
     return p;
+}
+
+// The vertex colour as the shader should see it: with its alpha full where
+// that alpha has been taken over for heights.
+vec4 wbm_tint(vec4 colour)
+{
+    return wbm_wind.z > 0.5 ? vec4(colour.xyz, 1.0) : colour;
 }
 )";
 
@@ -582,8 +597,13 @@ bool add_wind(std::string &vs)
     if (vs.find("matWorldArray") != std::string::npos || vs.find("uniform mat4 matWorldViewProj;") == std::string::npos) return false;
     static const std::regex project(R"(\(matWorldViewProj \* (\w+)\))");
     if (!std::regex_search(vs, project)) return false;
-    std::string uv = vs.find("attribute vec2 inTexCoord;") != std::string::npos ? "inTexCoord" : "vec2(0.0)";
-    vs = std::regex_replace(vs, project, "(matWorldViewProj * wbm_sway($1, " + uv + "))");
+    static const std::regex declaration(R"(attribute vec4 inColor0;)");
+    bool coloured = std::regex_search(vs, declaration);
+    if (coloured) {
+        vs = std::regex_replace(vs, std::regex(R"(\binColor0\b)"), "wbm_tint(inColor0)");
+        vs = std::regex_replace(vs, std::regex(R"(attribute vec4 wbm_tint\(inColor0\);)"), "attribute vec4 inColor0;");
+    }
+    vs = std::regex_replace(vs, project, std::string("(matWorldViewProj * wbm_sway($1, ") + (coloured ? "inColor0.w" : "-1.0") + "))");
     return true;
 }
 

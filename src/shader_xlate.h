@@ -155,10 +155,11 @@ extern const char *const k_xl_pbr_uniform;
 extern const char *const k_xl_skin_uniform;
 
 // With wind: wbm_wind, in the vertex stage. x: time in seconds; y: strength, 0
-// for whatever is not foliage; z: 0 when positions are in the object's own
-// space with its base at height 0, 1 when they are in world space (grass,
-// which the engine batches), where the texture coordinate tells tip from
-// root; w: a phase for this object, so that neighbours do not move as one.
+// for whatever is not to move; z: 0 when positions are in the object's own
+// space with its foot at height 0, 1 when the vertex colour's alpha holds the
+// height above the plant's foot instead (batches placed in the world), and is
+// to be read as full by the rest of the shader; w: a phase for this object, so
+// that neighbours do not move as one.
 extern const char *const k_xl_wind_uniform;
 
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in

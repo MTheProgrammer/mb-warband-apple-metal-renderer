@@ -45,6 +45,7 @@ enum {
 
 struct Buffer {
     id<MTLBuffer> mtl;
+    void *wind_weights = nullptr; // the MTLBuffer whose vertices have been given heights for the wind (see weigh_foliage)
 };
 
 struct Texture {
@@ -368,7 +369,6 @@ float s_eye[4];            // the camera's place in the world, from render_dynam
 uint64_t s_eye_frame;
 float s_foliage_backlight; // WBM_FOLIAGE: how much sunlight comes through leaves, 0 for none
 float s_wind_strength;     // WBM_WIND, 0 for none
-float s_wind_flip;         // WBM_WIND_FLIP=1: a grass blade's tip is where the texture coordinate is 0, not 1
 double s_wind_time;        // the same for every draw of a frame
 float s_skin_backlight = 0.6f; // WBM_SSS_BACKLIGHT: sunlight through thin skin; 0 for none
 // The game's texture files, keyed by content: filled once at start, read-only afterwards.
@@ -2187,6 +2187,51 @@ void apply_fxaa()
     s_fxaa_frames++;
 }
 
+// Foliage that the engine hands over in batches, many plants in one buffer and
+// already placed in the world, carries nothing that says how high above its
+// own foot a vertex is, which is what the wind needs. It is worked out here,
+// once per buffer: a batch repeats one mesh, so the texture coordinates repeat
+// with the mesh's vertex count, which gives the plants; a vertex's height above
+// the lowest point of its plant, in decimetres, is then written into the alpha
+// of its colour, which foliage leaves at full. The vertex shaders read it from
+// there and take the alpha as full (see k_wind_function).
+bool weigh_foliage(Buffer &b)
+{
+    if (b.wind_weights == (__bridge void *)b.mtl) return true;
+    const Attrib &pos = s_attribs[0], &col = s_attribs[2], &tex = s_attribs[4];
+    if (!b.mtl || !pos.enabled || !col.enabled || !tex.enabled || pos.stride <= 0 || col.buffer != pos.buffer || tex.buffer != pos.buffer ||
+        pos.type != GL_FLOAT || col.type != GL_UNSIGNED_BYTE || tex.type != GL_FLOAT)
+        return false;
+    size_t stride = (size_t)pos.stride, n = b.mtl.length / stride;
+    if (n < 3 || std::max({pos.offset + 12, col.offset + 4, tex.offset + 8}) > stride) return false;
+    uint8_t *base = (uint8_t *)b.mtl.contents;
+    auto uv = [&](size_t i) { return base + i * stride + tex.offset; };
+    auto z = [&](size_t i) {
+        float v;
+        memcpy(&v, base + i * stride + pos.offset + 8, 4);
+        return v;
+    };
+    // The shortest period of the texture coordinates, tried only where the first vertex's recur.
+    size_t period = n;
+    for (size_t c = 3; c <= n / 2; c++) {
+        if (n % c || memcmp(uv(0), uv(c), 8)) continue;
+        bool repeats = true;
+        for (size_t i = c; i < n && repeats; i++) repeats = !memcmp(uv(i), uv(i - c), 8);
+        if (repeats) {
+            period = c;
+            break;
+        }
+    }
+    for (size_t first = 0; first < n; first += period) {
+        float lowest = 1e30f;
+        for (size_t i = first; i < first + period; i++) lowest = std::min(lowest, z(i));
+        for (size_t i = first; i < first + period; i++)
+            base[i * stride + col.offset + 3] = (uint8_t)std::min(255.0f, std::max(0.0f, (z(i) - lowest) * 10.0f + 0.5f));
+    }
+    b.wind_weights = (__bridge void *)b.mtl;
+    return true;
+}
+
 // Holds the frame rate to a limit by waiting at the end of a frame.
 void limit_frame_rate()
 {
@@ -2821,16 +2866,25 @@ bool prepare_draw()
     }
     if (p->wind_offset >= 0) {
         float wind[4] = {0, 0, 0, 0};
-        if (diffuse && diffuse->material == MAT_FLORA) {
-            // Batches placed in the world (grass) come with no world matrix to speak of.
-            bool placed = true;
+        if (diffuse && diffuse->material == MAT_FLORA && s_wind_strength > 0) {
+            // A mesh in its own space has its foot at height 0. A batch placed in the
+            // world (its vertices far from the origin) needs heights worked out for it.
+            Buffer *vb = s_attribs[0].enabled ? find(s_buffers, s_attribs[0].buffer) : nullptr;
+            bool batch = false;
+            if (vb && vb->mtl && s_attribs[0].stride > 0 && s_attribs[0].type == GL_FLOAT && vb->mtl.length >= (NSUInteger)s_attribs[0].offset + 12) {
+                float first[3];
+                memcpy(first, (const uint8_t *)vb->mtl.contents + s_attribs[0].offset, 12);
+                batch = fabsf(first[0]) + fabsf(first[1]) > 40.0f;
+            }
             float phase = 0;
             if (p->u_world) {
                 const float *w = (const float *)(p->uniform_data[0].data() + p->u_world->offset);
-                placed = fabsf(w[12]) + fabsf(w[13]) + fabsf(w[14]) > 1e-3f;
                 phase = w[12] * 0.37f + w[13] * 0.71f;
             }
-            wind[0] = (float)s_wind_time, wind[1] = s_wind_strength, wind[2] = placed ? 0.0f : 1.0f + s_wind_flip, wind[3] = fmodf(phase, 6.2831853f);
+            bool ready = !batch || weigh_foliage(*vb);
+            wind[0] = (float)s_wind_time, wind[1] = ready ? s_wind_strength : 0.0f, wind[2] = batch ? 1.0f : 0.0f, wind[3] = fmodf(phase, 6.2831853f);
+            // Once a buffer's alpha holds heights, every shader has to be told, sway or not.
+            if (vb && vb->wind_weights == (__bridge void *)vb->mtl) wind[2] = 1.0f;
         }
         if (memcmp(p->uniform_data[0].data() + p->wind_offset, wind, 16)) {
             memcpy(p->uniform_data[0].data() + p->wind_offset, wind, 16);
@@ -3235,7 +3289,6 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FOLIAGE")) s_foliage_backlight = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_WIND")) s_wind_strength = std::max(0.0f, (float)atof(v));
-    s_wind_flip = getenv("WBM_WIND_FLIP") ? 1.0f : 0.0f;
     s_shader_options.foliage_backlight = s_foliage_backlight > 0;
     s_shader_options.wind = s_wind_strength > 0;
     index_texture_packs();
