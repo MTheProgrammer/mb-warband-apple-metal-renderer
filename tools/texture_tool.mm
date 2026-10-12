@@ -7,7 +7,8 @@
 //       writes <name>_pbr.png for textures that have metal on them: metalness
 //       in red and roughness in green, worked out from the texture's specular
 //       map (bright there means metal) and, for textures the name says are
-//       metal, from which parts are grey.
+//       metal, from which parts are grey; and, for horses, in blue how much of
+//       the surface is coat (not armour, cloth or saddle).
 //
 // The game's folder is taken from WBM_GAME, or from where Steam puts it.
 
@@ -230,7 +231,10 @@ int main(int argc, char **argv)
             }
         }
         bool metal_class = classify_texture_name(name) == MAT_METAL;
-        if (!has_spec && !metal_class) {
+        bool horse = false;
+        for (const char *word : {"horse", "charger", "courser", "hunter", "steed"}) horse = horse || name.find(word) != std::string::npos;
+        if (name.compare(0, 4, "pic_") == 0 || name.find("boot") != std::string::npos || name.find("horseman") != std::string::npos) horse = false; // pictures and riders' gear
+        if (!has_spec && !metal_class && !horse) {
             skipped++;
             continue;
         }
@@ -255,8 +259,22 @@ int main(int argc, char **argv)
                 // Brighter in the specular map is smoother; bare metal with no map is fairly smooth.
                 float rough = has_spec ? 0.85f - 0.5f * smoothstep(0.05f, 0.6f, s) : 0.75f - 0.3f * metal;
                 uint8_t *o = &map.px[((size_t)y * base.w + x) * 4];
-                o[0] = (uint8_t)lroundf(metal * 255), o[1] = (uint8_t)lroundf(rough * 255), o[2] = 0, o[3] = 255;
-                most = std::max(most, metal);
+                // Blue: how much of the surface is a horse's coat. With a specular map,
+                // what is neither metal (bright) nor cloth (black). Without one, all that
+                // is painted, less the saddle, which every plain horse has at the same place.
+                float fur = 0;
+                if (horse) {
+                    float u = (x + 0.5f) / base.w, v = (y + 0.5f) / base.h;
+                    if (has_spec) {
+                        fur = smoothstep(0.03f, 0.10f, s) * (1 - smoothstep(0.24f, 0.36f, s));
+                    } else {
+                        bool saddle = (u > 0.485f && u < 0.755f && v > 0.02f && v < 0.335f) || (u > 0.195f && u < 0.315f && v > 0.455f && v < 0.715f) ||
+                                      (u > 0.03f && u < 0.10f && v > 0.44f && v < 0.60f);
+                        fur = saddle ? 0.0f : smoothstep(0.0002f, 0.0012f, hi); // a black coat is dark, but not as black as the unused parts
+                    }
+                }
+                o[0] = (uint8_t)lroundf(metal * 255), o[1] = (uint8_t)lroundf(rough * 255), o[2] = (uint8_t)lroundf(fur * 255), o[3] = 255;
+                most = std::max(most, std::max(metal, fur));
             }
         }
         if (most < 0.5f) { // nothing on it is metal: the renderer's own estimate will do

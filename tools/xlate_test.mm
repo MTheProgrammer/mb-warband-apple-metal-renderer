@@ -44,7 +44,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-A")) options.sky_ambient = true;
         if (!strcmp(argv[i], "-M")) options.materials = true;
         if (!strcmp(argv[i], "-K")) options.skin_scattering = true;
-        if (!strcmp(argv[i], "-W")) options.wind = options.foliage_backlight = options.eyes = true;
+        if (!strcmp(argv[i], "-W")) options.wind = options.foliage_backlight = options.eyes = options.fur = true;
         if (!strcmp(argv[i], "-a")) options.smooth_alpha_test = true;
         if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
         if (!strcmp(argv[i], "-p")) options.pbr_specular = true;

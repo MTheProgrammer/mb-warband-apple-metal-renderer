@@ -665,6 +665,45 @@ bool add_skin_scattering_vertex(std::string &vs)
     return true;
 }
 
+// Fur. See XlOptions::fur.
+const char k_fur_function[] = R"(
+uniform sampler2D wbm_fur_map;
+uniform vec4 wbm_fur;
+
+// facing: the cosine of the sun's angle to the surface; highlight: the engine's own; fur: 0 to 1.
+vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_sun, float fur)
+{
+    vec4 plain = vec4(clamp(facing, 0.0, 1.0)) + highlight;
+    if (fur <= 0.0) return plain;
+    float wrapped = clamp((facing + 0.3) / 1.3, 0.0, 1.0) / 1.12;
+    // Hairs standing off the surface catch light when seen along it: brightest
+    // at the outline, on the side the sun is on.
+    float edge = 1.0 - clamp(dot(normalize(view), normalize(normal)), 0.0, 1.0);
+    float rim = edge * edge * edge * clamp(facing * 0.5 + 0.5, 0.0, 1.0) * 0.55;
+    vec4 coat = vec4(vec3(wrapped + rim), plain.w) + vec4(highlight.xyz * 0.45, 0.0);
+    return mix(plain, coat, fur);
+}
+)";
+
+bool add_fur(std::string &fs)
+{
+    // total = (... + (((clamp(dot(SunLightDir, N), 0, 1) + fSpecular) * sun_amount) * colour)), shadowed or not
+    static const std::regex shadowed(
+        R"(\(\(\s*\(clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\) \+ (fSpecular_\d+)\)\s*\* (sun_amount_\d+)\) \* (tmpvar_\d+)\))");
+    static const std::regex plain(R"(\(\(\s*clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\)\s*\+ (fSpecular_\d+)\) \* (tmpvar_\d+)\))");
+    if (fs.find("0.800118") == std::string::npos || fs.find("varying vec3 ViewDir;") == std::string::npos) return false; // the engine's hair-like highlight marks the shaders
+    const std::string fur = "(texture2D(wbm_fur_map, Tex0).z * wbm_fur.x)";
+    if (std::regex_search(fs, shadowed)) {
+        fs = std::regex_replace(fs, shadowed, "((wbm_fur_lit(dot(SunLightDir, $1), $2, ViewDir, $1, SunLightDir, " + fur + ") * $3) * $4)", std::regex_constants::format_first_only);
+        return true;
+    }
+    if (std::regex_search(fs, plain)) {
+        fs = std::regex_replace(fs, plain, "(wbm_fur_lit(dot(SunLightDir, $1), $2, ViewDir, $1, SunLightDir, " + fur + ") * $3)", std::regex_constants::format_first_only);
+        return true;
+    }
+    return false;
+}
+
 // Eyes. Where they are in a face texture is the same for every face of a sex
 // (see wbm_eye_place), in the coordinates the head's mesh uses, which run upwards.
 const char k_eye_function[] = R"(
@@ -1048,6 +1087,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     // After the shadow rewrite, which looks for the sun term's shadow variable by its original shape.
     bool skin = (options.skin_scattering || options.foliage_backlight) && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl, options.skin_scattering));
     bool eyes = !vertex && options.eyes && add_eye_glint(glsl);
+    bool fur = !vertex && options.fur && add_fur(glsl);
     bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
     bool wind = vertex && options.wind && add_wind(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
@@ -1069,6 +1109,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_environment) out << k_pbr_environment_function;
     if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
     if (eyes) out << k_eye_function;
+    if (fur) out << k_fur_function;
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
     if (skin && vertex) out << k_skin_vertex_function;

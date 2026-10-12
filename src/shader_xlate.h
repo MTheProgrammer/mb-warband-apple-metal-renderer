@@ -90,6 +90,13 @@ struct XlOptions {
     // pores, and the edge of a shadow tinted the same way. Whether it does is
     // up to the wbm_skin uniform, which the backend sets per draw.
     bool skin_scattering = false;
+    // A horse's coat: in the engine's shaders for horses, where a map says the
+    // surface is coat (the blue channel of the texture's _pbr map, see
+    // k_xl_pbr_sampler), light wraps softly round the body, a velvety rim shows
+    // where the coat is seen edge-on, and the engine's two hard streaks of
+    // highlight are toned down. Adds the wbm_fur_map sampler and wbm_fur
+    // uniform (x: strength, 0 without a map).
+    bool fur = false;
     // Eyes that catch the light: faces have their eyes painted on, at the same
     // place in every face texture, since all heads share one layout. There the
     // engine's skin shader gets a small sharp highlight from the sun and a
