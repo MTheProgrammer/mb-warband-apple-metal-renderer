@@ -53,6 +53,7 @@ struct Buffer {
 struct Texture {
     id<MTLTexture> mtl;
     uint8_t material = 0; // what the texture shows, when its file was recognised: see MaterialClass
+    bool woman = false;       // a woman's face, whose eyes are elsewhere in the texture than a man's (see k_eye_function)
     bool radial_wind = false; // foliage that hangs from a crown (a palm's leaves): the wind takes hold by distance from the middle, not by height
     bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
     id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
@@ -367,6 +368,7 @@ const float k_material_params[MAT_COUNT][4] = {
     {0.0f, 1.6f, 0.7f, 1.0f},   // hair and beards
     {0.0f, 2.0f, 0.5f, 1.0f},   // foliage
 };
+bool is_womans_face(const std::string &name) { return name.find("woman") != std::string::npos || name.find("female") != std::string::npos || name.find("lady") != std::string::npos; }
 bool s_materials;
 bool s_debug_skin = getenv("WBM_DEBUG_SKIN") != nullptr;
 float s_eye[4];            // the camera's place in the world, from render_dynamic_shadows
@@ -2872,7 +2874,7 @@ bool prepare_draw()
         }
     }
     Texture *diffuse = nullptr; // the diffuse texture says what the surface is
-    if ((p->material_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->wind_offset >= 0 || p->leaf_sun_offset >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
+    if ((p->material_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->wind_offset >= 0 || p->leaf_sun_offset >= 0 || p->gaze_offset >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
         UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
         diffuse = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
     }
@@ -2907,6 +2909,7 @@ bool prepare_draw()
             phase = floorf(w[12] * 3.0f) * 12.9898f + floorf(w[13] * 3.0f) * 78.233f;
         }
         eye_gaze(s_wind_time, phase, gaze);
+        gaze[2] = diffuse && diffuse->woman ? 1.0f : 0.0f;
         if (memcmp(p->uniform_data[1].data() + p->gaze_offset, gaze, 16)) {
             memcpy(p->uniform_data[1].data() + p->gaze_offset, gaze, 16);
             p->uniform_dirty[1] = true;
@@ -3368,7 +3371,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.foliage_backlight = s_foliage_backlight > 0;
     s_shader_options.wind = s_wind_strength > 0;
     index_texture_packs();
-    if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering || s_shader_options.wind || s_shader_options.foliage_backlight)
+    if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering || s_shader_options.wind || s_shader_options.foliage_backlight || s_shader_options.eyes)
         scan_game_textures();
     const char *fxaa_env = getenv("WBM_FXAA");
     s_fxaa = fxaa_env && atoi(fxaa_env) != 0; // off unless set
@@ -3914,6 +3917,7 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
             if (it != s_material_by_content.end()) {
                 t->material = it->second.cls;
                 t->radial_wind = s_texture_names[it->second.name].find("palm") != std::string::npos;
+                t->woman = is_womans_face(s_texture_names[it->second.name]);
                 attach_pbr_map(*t, it->second);
                 if (replace_from_pack(*t, it->second)) return;
             }

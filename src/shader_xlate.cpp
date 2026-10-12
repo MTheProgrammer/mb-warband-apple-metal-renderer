@@ -665,28 +665,35 @@ bool add_skin_scattering_vertex(std::string &vs)
     return true;
 }
 
-// Where the eyes are in a face texture (measured on manface_young: the middles
-// of the irises, and the opening of the lids), in the coordinates the head's
-// mesh uses, which run upwards.
+// Eyes. Where they are in a face texture is the same for every face of a sex
+// (see wbm_eye_place), in the coordinates the head's mesh uses, which run upwards.
 const char k_eye_function[] = R"(
-uniform vec4 wbm_gaze; // xy: how far the eyes are turned, in the texture's coordinates
+uniform vec4 wbm_gaze; // xy: how far the eyes are turned, in the texture's coordinates; z: 1 for a woman's face
+
+// Where uv is relative to the nearer eye: 0 at the middle of the iris, length
+// 1 at the lids. Men's and women's heads are laid out differently in their
+// textures (measured on manface_young and womanface_young).
+vec2 wbm_eye_place(vec2 uv)
+{
+    bool woman = wbm_gaze.z > 0.5;
+    vec2 left = woman ? vec2(0.375, 0.645) : vec2(0.388, 0.558), right = woman ? vec2(0.625, 0.645) : vec2(0.610, 0.558);
+    vec2 reach = woman ? vec2(0.046, 0.023) : vec2(0.040, 0.019);
+    vec2 a = (uv - left) / reach, b = (uv - right) / reach;
+    return dot(a, a) < dot(b, b) ? a : b;
+}
 
 // Where to read the face's texture so that the iris sits wbm_gaze.xy off its
 // painted place: all of the shift at the middle of the eye, none at the lids.
 vec2 wbm_eye_uv(vec2 uv)
 {
-    const vec2 left = vec2(0.388, 0.558), right = vec2(0.610, 0.558), reach = vec2(0.040, 0.019);
-    vec2 a = (uv - left) / reach, b = (uv - right) / reach;
-    vec2 d = dot(a, a) < dot(b, b) ? a : b;
+    vec2 d = wbm_eye_place(uv);
     float hold = 1.0 - smoothstep(0.15, 1.0, dot(d, d));
     return uv - wbm_gaze.xy * hold;
 }
 
 vec3 wbm_eye(vec2 uv, vec3 view, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
 {
-    const vec2 left = vec2(0.388, 0.558), right = vec2(0.610, 0.558), reach = vec2(0.040, 0.019);
-    vec2 a = (uv - left) / reach, b = (uv - right) / reach;
-    vec2 d = dot(a, a) < dot(b, b) ? a : b;
+    vec2 d = wbm_eye_place(uv);
     float inside = 1.0 - smoothstep(0.55, 1.0, dot(d, d));
     if (inside <= 0.0) return vec3(0.0);
     vec3 n = normalize(vec3(d * vec2(0.8, 0.45), 1.0)); // the ball bulges out of the flat it is painted on
