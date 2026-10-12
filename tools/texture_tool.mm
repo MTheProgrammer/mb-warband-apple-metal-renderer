@@ -453,6 +453,21 @@ static int hair_map(const std::string &picture, std::string name, const std::str
             grows[i] = std::max(mask[i], coat);
         }
     }
+    // For the long hair, only what lies well inside it is read: at its edge the
+    // step from dark mane to light coat is far stronger than any strand, and
+    // runs along the mane, which would turn the hair to lie along the neck.
+    std::vector<float> inner = mask;
+    blur(inner, w, h, std::max(2, w / 150));
+    std::vector<float> lxx(count), lxy(count), lyy(count);
+    double inner_strength = 0, inner_area = 0;
+    for (size_t i = 0; i < count; i++) {
+        float in = smoothstep(0.8f, 0.97f, inner[i]) * mask[i];
+        lxx[i] = xx[i] * in, lxy[i] = xy[i] * in, lyy[i] = yy[i] * in;
+        inner_strength += (double)(lxx[i] + lyy[i]), inner_area += in;
+    }
+    // And a little of "hanging down the picture", which decides where a strip of hair is too thin to have an inside.
+    float hang = inner_area > 0 ? (float)(0.08 * inner_strength / inner_area) : 1.0f;
+    for (size_t i = 0; i < count; i++) lxx[i] += hang * mask[i];
     for (size_t i = 0; i < count; i++) xx[i] *= grows[i], xy[i] *= grows[i], yy[i] *= grows[i];
     int radius = std::max(2, w / 110);
     // The coat's strokes are short and point every way, so there the reading
@@ -468,10 +483,10 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         for (size_t i = 0; i < count; i++) cxx[i] += lean * grows[i];
         int wide = std::max(4, w / 22);
         blur(cxx, w, h, wide), blur(cxy, w, h, wide), blur(cyy, w, h, wide);
-        blur(xx, w, h, radius), blur(xy, w, h, radius), blur(yy, w, h, radius);
+        blur(lxx, w, h, radius), blur(lxy, w, h, radius), blur(lyy, w, h, radius);
         for (size_t i = 0; i < count; i++) {
             float m = mask[i]; // long hair keeps its own, finer reading
-            xx[i] = xx[i] * m + cxx[i] * (1 - m), xy[i] = xy[i] * m + cxy[i] * (1 - m), yy[i] = yy[i] * m + cyy[i] * (1 - m);
+            xx[i] = lxx[i] * m + cxx[i] * (1 - m), xy[i] = lxy[i] * m + cxy[i] * (1 - m), yy[i] = lyy[i] * m + cyy[i] * (1 - m);
         }
     }
     std::vector<float> dx(count), dy(count), trust(count);
@@ -481,9 +496,17 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         float agree = sqrtf((xx[i] - yy[i]) * (xx[i] - yy[i]) + 4 * xy[i] * xy[i]) / (xx[i] + yy[i] + 1e-9f);
         trust[i] = std::max(mask[i], std::min(1.0f, agree * 1.6f) * (grows[i] > 0.25f ? 1.0f : 0.0f));
     }
+    // For telling a fault of the map from one of the renderer: WBM_HAIR_DIR="x y"
+    // gives every place that direction (x to the right, y down the picture).
+    if (const char *forced = getenv("WBM_HAIR_DIR")) {
+        float fx = 0, fy = 1;
+        sscanf(forced, "%f %f", &fx, &fy);
+        float len = std::max(1e-6f, sqrtf(fx * fx + fy * fy));
+        for (size_t i = 0; i < count; i++) dx[i] = fx / len, dy[i] = fy / len, trust[i] = grows[i] > 0.25f ? 1.0f : 0.0f;
+    }
     // On the coat, where the strokes are short and many, each place is simply
     // pointed down the picture (or to the right, where it runs level).
-    for (size_t i = 0; i < count; i++)
+    for (size_t i = 0; i < count && !getenv("WBM_HAIR_DIR"); i++)
         if (mask[i] <= 0.5f && (dy[i] < -0.05f || (fabsf(dy[i]) <= 0.05f && dx[i] < 0))) dx[i] = -dx[i], dy[i] = -dy[i];
     // A strand's run does not say which end is the tip. Within each patch of
     // hair the choice is made the same way throughout, by spreading from one
@@ -491,7 +514,7 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     // down the picture, or failing that to the right, since hair hangs.
     std::vector<int> patch(count, -1);
     std::vector<size_t> queue;
-    for (size_t seed = 0; seed < count; seed++) {
+    for (size_t seed = 0; seed < count && !getenv("WBM_HAIR_DIR"); seed++) {
         if (mask[seed] <= 0.5f || patch[seed] >= 0) continue;
         size_t first = queue.size();
         patch[seed] = 1;
