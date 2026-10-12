@@ -84,6 +84,10 @@ struct XlOptions {
     // strength per material class from the backend, which knows what each
     // texture is. Adds the wbm_material uniform (see k_xl_material_uniform).
     bool materials = false;
+    // For tuning: shaders with an environment reflection show, in place of
+    // their colour, red = estimated metalness, green = the specular mask,
+    // blue = the material's specular brightness / 40.
+    bool debug_materials = false;
     // In the engine's final post-processing shader: replace its tone-mapping
     // operator with a filmic curve.
     bool filmic_tonemap = false;
@@ -120,7 +124,8 @@ extern const char *const k_xl_ambient_uniform;
 //   x  factor on the estimated metalness (0: never a metal);
 //   y  factor on the squared roughness derived from the material's shininess;
 //   z  factor on the highlight and reflection strength;
-//   w  above 0 when the material is known; otherwise the rest is ignored.
+//   w  0 when the material is unknown, and the rest is then ignored; otherwise
+//      1 + the metalness of the texture's grey parts (so 1 for a non-metal).
 extern const char *const k_xl_material_uniform;
 
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in

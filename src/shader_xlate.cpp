@@ -314,6 +314,8 @@ float wbm_a2 = 0.25;
 vec3 wbm_albedo = vec3(0.5);
 float wbm_mask = 0.0;
 float wbm_metal = 0.0;
+float wbm_debug_mask = 0.0, wbm_debug_gloss = 0.0;
+float wbm_dim = 0.35;  // how far a metal loses its diffuse colour
 float wbm_rough = 1.0; // factors from the material class, see k_xl_material_uniform
 float wbm_gain = 1.0;
 )";
@@ -339,7 +341,7 @@ vec3 wbm_environment(vec3 view, vec3 up, vec3 sky, vec3 ground)
     vec3 env = mix(ground, sky, smoothstep(0.5 - blur, 0.5 + blur, t));
     vec3 f0 = mix(vec3(0.04), wbm_albedo, wbm_metal);
     vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
-    return env * fresnel * wbm_mask;
+    return env * fresnel * mix(wbm_mask, 1.0, wbm_metal * wbm_metal); // a metal reflects whatever its highlight map says
 }
 )";
 
@@ -395,7 +397,7 @@ vec3 wbm_environment_sky(vec3 view, vec3 reflection, vec3 ground)
     vec3 env = mix(ground, sky, smoothstep(-blur, blur, d.z));
     vec3 f0 = mix(vec3(0.04), wbm_albedo, wbm_metal);
     vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
-    return env * fresnel * wbm_mask;
+    return env * fresnel * mix(wbm_mask, 1.0, wbm_metal * wbm_metal); // a metal reflects whatever its highlight map says
 }
 )";
 
@@ -480,7 +482,7 @@ bool use_pbr_specular(std::string &fs)
 //   - just before the colour is encoded for display: add the reflection.
 // `sky` asks for the captured sky where the shader allows it; `extra` receives
 // declarations the shader then needs in front of it.
-bool add_pbr_environment(std::string &fs, bool sky, bool materials, std::string &extra)
+bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, std::string &extra)
 {
     static const std::regex decode(R"((\w+)\.xyz = pow \((\w+)\.xyz, vec3\(2\.2, 2\.2, 2\.2\)\);)");
     static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
@@ -537,9 +539,11 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, std::string 
             extra += k_pbr_sky_functions;
         }
     }
-    fs = std::regex_replace(fs, encode, "$1.xyz += " + call + ";\n  $&", std::regex_constants::format_first_only);
+    fs = std::regex_replace(fs, encode, "$1.xyz += " + call + ";\n  $&" + (debug ? std::string("\n  $1.xyz = vec3(wbm_metal, ") + (materials ? std::string(k_xl_material_uniform) + ".w * 0.5" : "wbm_debug_mask") + ", wbm_debug_gloss);" : std::string()),
+                            std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, decode,
-                            "wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  $1.xyz = (wbm_albedo * (1.0 - (0.35 * wbm_metal)));");
+                            std::string("wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  ") + (materials ? "wbm_classify();\n  " : "") +
+                                "$1.xyz = (wbm_albedo * (1.0 - (wbm_dim * wbm_metal)));");
     body = fs.find('{', fs.find("void main ()")) + 1; // again: the replacements above moved it
     // The mask alone does not say how reflective a material is: on many opaque
     // textures it is simply 1. The engine scales it by the material's specular
@@ -549,12 +553,30 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, std::string 
     std::string start = "\n  float wbm_gloss = dot(vSpecularColor.xyz, vec3(0.3333));"
                         "\n  float wbm_raw_mask = clamp(" + mask + ", 0.0, 1.0);"
                         "\n  wbm_mask = wbm_raw_mask * clamp(wbm_gloss / 40.0, 0.0, 1.0);"
-                        "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);";
+                        "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);"
+                        "\n  wbm_debug_mask = wbm_raw_mask;"
+                        "\n  wbm_debug_gloss = clamp(wbm_gloss / 40.0, 0.0, 1.0);";
     if (materials) {
         // What the texture is says more than the two numbers above can.
-        extra += std::string("uniform vec4 ") + k_xl_material_uniform + ";\n";
+        // The engine's specular maps are maps of painted highlights, nearly
+        // black over most of a helmet, so they cannot say what is metal. Two
+        // things can: the material's specular brightness, which the engine sets
+        // high for whatever should shine, and colour, since steel is grey where
+        // the leather, cloth and painted wood that share its textures are not.
+        // The texture's class limits how far that is believed (see
+        // k_xl_material_uniform); an unknown texture is believed most of the way.
+        extra += std::string("uniform vec4 ") + k_xl_material_uniform + ";\n" +
+                 "void wbm_classify()\n{\n"
+                 "    float hi = max(max(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b), lo = min(min(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b);\n"
+                 "    float grey = 1.0 - smoothstep(0.2, 0.5, (hi - lo) / max(hi, 0.08));\n"
+                 "    float shiny = smoothstep(0.12, 0.3, wbm_debug_gloss);\n"
+                 "    float known = " + k_xl_material_uniform + ".w;\n"
+                 "    float most = known > 0.0 ? known - 1.0 : 0.8;\n"
+                 "    float factor = known > 0.0 ? " + k_xl_material_uniform + ".x : 1.0;\n"
+                 "    wbm_metal = clamp(max(wbm_metal * factor, most * grey * shiny), 0.0, 1.0);\n"
+                 "    wbm_dim = 0.8;\n"
+                 "}\n";
         start += std::string("\n  if (") + k_xl_material_uniform + ".w > 0.0) {"
-                 "\n    wbm_metal = clamp(wbm_metal * " + k_xl_material_uniform + ".x, 0.0, 1.0);"
                  "\n    wbm_rough = " + k_xl_material_uniform + ".y;"
                  "\n    wbm_gain = " + k_xl_material_uniform + ".z;"
                  "\n    wbm_mask *= " + k_xl_material_uniform + ".z;"
@@ -664,7 +686,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
     bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment || options.pbr_sky) && use_pbr_specular(glsl);
     std::string pbr_extra;
-    bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, pbr_extra);
+    bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, options.debug_materials, pbr_extra);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);

@@ -339,16 +339,16 @@ uint64_t s_amb_stats_frames;
 // texture folders, and classed by words in the file's name.
 enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_COUNT };
 const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin and hair", "wood", "stone and ground", "horse"};
-// metalness factor, roughness factor, highlight strength, known
+// metalness factor, roughness factor, highlight strength, 1 + metalness of grey parts (0: unknown)
 const float k_material_params[MAT_COUNT][4] = {
-    {1.0f, 1.0f, 1.0f, 0.0f}, // unknown: the estimate from the specular mask stands
-    {1.5f, 0.6f, 1.2f, 1.0f}, // metal: readier to count as metal, smoother
-    {0.0f, 3.0f, 0.35f, 1.0f}, // cloth: never metal, matt
-    {0.0f, 1.4f, 0.8f, 1.0f}, // leather: a broad, soft sheen
-    {0.0f, 1.6f, 0.7f, 1.0f}, // skin and hair
-    {0.0f, 2.2f, 0.5f, 1.0f}, // wood
-    {0.0f, 2.5f, 0.4f, 1.0f}, // stone and ground
-    {0.0f, 1.2f, 0.9f, 1.0f}, // a horse's coat
+    {1.0f, 1.0f, 1.0f, 0.0f},   // unknown: the shader's own estimate stands
+    {1.5f, 0.6f, 1.2f, 1.95f},  // metal: its grey parts are metal, and smoother
+    {0.0f, 3.0f, 0.35f, 1.0f},  // cloth: never metal, matt
+    {0.0f, 1.4f, 0.8f, 1.8f},   // leather: a broad, soft sheen; helmets and buckles share its textures
+    {0.0f, 1.6f, 0.7f, 1.0f},   // skin and hair
+    {0.0f, 2.2f, 0.5f, 1.5f},   // wood: nails, bands and bosses on it may be metal
+    {0.0f, 2.5f, 0.4f, 1.0f},   // stone and ground
+    {0.0f, 1.2f, 0.9f, 1.0f},   // a horse's coat
 };
 bool s_materials;
 std::unordered_map<uint64_t, uint8_t> s_material_by_content; // filled once at start, read-only afterwards
@@ -2933,6 +2933,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     const char *mat_env = getenv("WBM_MATERIALS");
     s_materials = s_shader_options.materials = mat_env && atoi(mat_env) != 0 && s_shader_options.pbr_environment; // off unless set; needs WBM_PBR=2 or 3
     if (s_materials) scan_game_textures();
+    s_shader_options.debug_materials = getenv("WBM_DEBUG_MATERIALS") != nullptr && s_shader_options.pbr_environment;
     const char *blur_env = getenv("WBM_MOTION_BLUR");
     s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
     if (const char *v = getenv("WBM_MOTION_BLUR_STRENGTH")) s_motion_blur_strength = std::max(0.0f, (float)atof(v));
