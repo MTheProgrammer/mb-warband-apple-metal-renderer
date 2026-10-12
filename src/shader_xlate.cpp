@@ -199,6 +199,23 @@ float wbm_dyn_cascade(vec3 coord, vec3 cdx, vec3 cdy, vec4 window, float column,
     return lit / 12.0;
 }
 
+// How far behind the surface nearest the sun this point lies, in the depth's
+// own units, from the fine window; -1 where that window does not reach.
+float wbm_dyn_thickness(vec3 coord)
+{
+    if (wbm_dyn_near.z <= 0.0) return -1.0;
+    vec3 q = vec3((coord.xy - wbm_dyn_near.xy) * wbm_dyn_near.zw + 0.5, coord.z);
+    vec2 margin = min(q.xy, 1.0 - q.xy);
+    if (min(margin.x, margin.y) <= 0.02) return -1.0;
+    const float size = DYN_SIZE;
+    float sum = 0.0;
+    for (int i = 0; i < 4; i++) {
+        vec2 t = q.xy + vec2(i < 2 ? -0.7 : 0.7, (i & 1) == 0 ? -0.7 : 0.7) / size;
+        sum += max(q.z - textureLod(wbm_dyn_map, vec2((t.x + 1.0) * 0.5, t.y), 0.0).x, 0.0);
+    }
+    return sum * 0.25;
+}
+
 float wbm_dynamic_shadow(vec3 coord)
 {
     if (wbm_dyn.z <= 0.0) return 1.0;
@@ -493,19 +510,35 @@ vec3 wbm_skin_core(float mapped, float smooth_, float shadow)
     return lit * pow(vec3(shadow), vec3(0.7, 1.0, 1.25));
 }
 
+// Sunlight coming through thin parts (ears, the wings of a nose, fingers) when
+// the sun is behind them. depth: how far behind the sunward surface this
+// point is (wbm_dyn_thickness), which wbm_skin.y turns into metres; without
+// that there is no telling an ear from the far side of a head, and no light.
+// Red gets through about two centimetres, blue a few millimetres.
+vec3 wbm_skin_back(vec3 view, vec3 to_sun, float depth)
+{
+    if (depth < 0.0 || wbm_skin.y <= 0.0) return vec3(0.0);
+    vec3 v = normalize(view), l = normalize(to_sun);
+    float towards = pow(clamp(dot(v, -normalize(l + vec3(0.0, 0.0, 0.35))), 0.0, 1.0), 2.0); // looking into the light
+    float away = smoothstep(0.25, -0.15, l.z);                                                // on the side turned from it
+    // Even the thinnest path is through some skin: half a centimetre is added,
+    // so that what comes through is always warm and never plain white.
+    return towards * away * wbm_skin.z * exp(-(depth * wbm_skin.y + 0.005) * vec3(45.0, 130.0, 220.0));
+}
+
 // For the general shaders: skin or not is the draw's business.
-vec4 wbm_skin_sun(vec3 to_sun, vec3 normal, float shadow)
+vec4 wbm_skin_sun(vec3 to_sun, vec3 normal, float shadow, vec3 back)
 {
     float mapped = dot(to_sun, normal);
     float plain = clamp(mapped, 0.0, 1.0) * shadow;
     if (wbm_skin.x < 0.5) return vec4(vec3(plain), plain);
-    return vec4(wbm_skin_core(mapped, normalize(to_sun).z, shadow), plain);
+    return vec4(wbm_skin_core(mapped, normalize(to_sun).z, shadow) + back, plain);
 }
 
 // For the engine's own skin shader, which is skin whatever it draws.
-vec4 wbm_skin_lit(float mapped, float smooth_, float shadow)
+vec4 wbm_skin_lit(float mapped, float smooth_, float shadow, vec3 back)
 {
-    return vec4(wbm_skin_core(mapped, smooth_, shadow), clamp(max(0.2 * (mapped + 0.9), mapped), 0.0, 1.0) * shadow);
+    return vec4(wbm_skin_core(mapped, smooth_, shadow) + back, clamp(max(0.2 * (mapped + 0.9), mapped), 0.0, 1.0) * shadow);
 }
 )";
 
@@ -534,6 +567,9 @@ bool add_skin_scattering_vertex(std::string &vs)
 
 bool add_skin_scattering(std::string &fs)
 {
+    // The back-light needs the view direction and, for thickness, the per-frame shadow map.
+    bool can_back = fs.find("varying vec3 ViewDir;") != std::string::npos && fs.find("wbm_dynamic_shadow(") != std::string::npos;
+    const std::string back = can_back ? "wbm_skin_back(ViewDir, SunLightDir, wbm_dyn_thickness(ShadowTexCoord.xyz))" : "vec3(0.0)";
     // The sun's diffuse term, in the four shapes the engine's shaders have it:
     // with and without a shadow, as a vec3 times the sun's colour or (the two
     // face shaders) as a scalar times a vec4.
@@ -550,19 +586,19 @@ bool add_skin_scattering(std::string &fs)
     static const std::regex own_plain(R"(\(clamp \(\s*max \(\(0\.2 \* \((\w+) \+ 0\.9\)\), \1\)\s*, 0\.0, 1\.0\) \* (tmpvar_\d+)\))");
     if (fs.find("varying vec3 SunLightDir;") != std::string::npos) {
         if (std::regex_search(fs, own_shadowed)) {
-            fs = std::regex_replace(fs, own_shadowed, "(wbm_skin_lit($1, normalize(SunLightDir).z, $2) * $3)", std::regex_constants::format_first_only);
+            fs = std::regex_replace(fs, own_shadowed, "(wbm_skin_lit($1, normalize(SunLightDir).z, $2, " + back + ") * $3)", std::regex_constants::format_first_only);
             return true;
         }
         if (std::regex_search(fs, own_plain)) {
-            fs = std::regex_replace(fs, own_plain, "(wbm_skin_lit($1, normalize(SunLightDir).z, 1.0) * $2)", std::regex_constants::format_first_only);
+            fs = std::regex_replace(fs, own_plain, "(wbm_skin_lit($1, normalize(SunLightDir).z, 1.0, " + back + ") * $2)", std::regex_constants::format_first_only);
             return true;
         }
     }
-    static const char *const with[4] = {
-        "(wbm_skin_sun(SunLightDir, vec3($1), $2).xyz * vSunColor.xyz)",
-        "(wbm_skin_sun(SunLightDir, vec3($1), 1.0).xyz * vSunColor.xyz)",
-        "(wbm_skin_sun(SunLightDir, vec3($1), $2) * $3)",
-        "(wbm_skin_sun(SunLightDir, vec3($1), 1.0) * $2)",
+    const std::string with[4] = {
+        "(wbm_skin_sun(SunLightDir, vec3($1), $2, " + back + ").xyz * vSunColor.xyz)",
+        "(wbm_skin_sun(SunLightDir, vec3($1), 1.0, " + back + ").xyz * vSunColor.xyz)",
+        "(wbm_skin_sun(SunLightDir, vec3($1), $2, " + back + ") * $3)",
+        "(wbm_skin_sun(SunLightDir, vec3($1), 1.0, " + back + ") * $2)",
     };
     if (fs.find("varying vec3 SunLightDir;") == std::string::npos) return false;
     for (int i = 0; i < 4; i++) {

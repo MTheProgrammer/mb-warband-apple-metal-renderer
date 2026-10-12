@@ -140,7 +140,10 @@ extern const char *const k_xl_material_uniform;
 extern const char *const k_xl_pbr_sampler;
 extern const char *const k_xl_pbr_uniform;
 
-// With skin_scattering: wbm_skin, whose x is 1 when the surface being drawn is skin and 0 otherwise.
+// With skin_scattering: wbm_skin. x: 1 when the surface being drawn is skin,
+// 0 otherwise; y: metres per unit of shadow-map depth while the per-frame
+// shadow map's fine window is there to measure thickness with, else 0;
+// z: strength of the light coming through thin parts.
 extern const char *const k_xl_skin_uniform;
 
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in

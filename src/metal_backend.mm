@@ -358,6 +358,7 @@ const float k_material_params[MAT_COUNT][4] = {
 };
 bool s_materials;
 bool s_debug_skin = getenv("WBM_DEBUG_SKIN") != nullptr;
+float s_skin_backlight = 0.6f; // WBM_SSS_BACKLIGHT: sunlight through thin skin; 0 for none
 // The game's texture files, keyed by content: filled once at start, read-only afterwards.
 struct KnownTexture {
     uint8_t cls;     // MaterialClass
@@ -2602,7 +2603,8 @@ bool prepare_draw()
     }
     for (int stage = 0; stage < 2; stage++) {
         if (p->skin_offset[stage] < 0) continue;
-        const float skin[4] = {diffuse && diffuse->material == MAT_SKIN ? 1.0f : 0.0f, 0, 0, 0};
+        const float skin[4] = {diffuse && diffuse->material == MAT_SKIN ? 1.0f : 0.0f,
+                               s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f, s_skin_backlight, 0};
         if (memcmp(p->uniform_data[stage].data() + p->skin_offset[stage], skin, 16)) {
             memcpy(p->uniform_data[stage].data() + p->skin_offset[stage], skin, 16);
             p->uniform_dirty[stage] = true;
@@ -2993,6 +2995,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.debug_materials = getenv("WBM_DEBUG_MATERIALS") != nullptr && s_shader_options.pbr_environment;
     const char *sss_env = getenv("WBM_SSS");
     s_shader_options.skin_scattering = sss_env && atoi(sss_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
     index_texture_packs();
     if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering) scan_game_textures();
     const char *blur_env = getenv("WBM_MOTION_BLUR");
