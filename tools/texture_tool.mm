@@ -15,6 +15,9 @@
 //       blacked out, or simply white where that hair is and black elsewhere:
 //       red and green give the way the hair is combed, worked out from the run
 //       of the strands in the game's texture and its normal map; blue says what grows there (255 long hair, about 128 coat, 0 none).
+//       In place of the picture, "boxes:x0,y0,x1,y1/..." names rectangles of
+//       the texture inside which whatever is painted is long hair. What was
+//       taken for long hair is also written, white on black, to masks/.
 //       A second picture, of the saddle, straps and other gear alone, keeps
 //       the coat off those.
 //
@@ -26,6 +29,7 @@
 #import <ImageIO/ImageIO.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -306,7 +310,23 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     for (char &c : name) c = (char)tolower((unsigned char)c);
     std::map<std::string, std::string> files = game_textures();
     Image hair, base, spec, normal;
-    if (!read_picture(picture, &hair)) {
+    // In place of a picture: "boxes:x0,y0,x1,y1/x0,y0,x1,y1...", rectangles of
+    // the texture (0 to 1, from its top left) inside which whatever is painted is long hair.
+    std::vector<std::array<float, 4>> boxes;
+    if (picture.compare(0, 6, "boxes:") == 0) {
+        const char *at = picture.c_str() + 6;
+        std::array<float, 4> box;
+        while (sscanf(at, "%f,%f,%f,%f", &box[0], &box[1], &box[2], &box[3]) == 4) {
+            boxes.push_back(box);
+            at = strchr(at, '/');
+            if (!at) break;
+            at++;
+        }
+        if (boxes.empty()) {
+            fprintf(stderr, "no rectangles in %s\n", picture.c_str());
+            return 1;
+        }
+    } else if (!read_picture(picture, &hair)) {
         fprintf(stderr, "%s could not be read\n", picture.c_str());
         return 1;
     }
@@ -324,6 +344,14 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     int w = base.w, h = base.h;
     size_t count = (size_t)w * h;
     auto picture_at = [&](int x, int y) {
+        if (!boxes.empty()) {
+            float u = (x + 0.5f) / w, v = (y + 0.5f) / h;
+            const uint8_t *c = &base.px[((size_t)y * w + x) * 4];
+            bool painted = std::max({c[0], c[1], c[2]}) > 3;
+            for (auto &b : boxes)
+                if (painted && u >= b[0] && u <= b[2] && v >= b[1] && v <= b[3]) return 1.0f;
+            return 0.0f;
+        }
         int X = std::min(hair.w - 1, (int)((x + 0.5f) * hair.w / w)), Y = std::min(hair.h - 1, (int)((y + 0.5f) * hair.h / h));
         const uint8_t *p = &hair.px[((size_t)Y * hair.w + X) * 4];
         return (float)std::max({p[0], p[1], p[2]}) / 255.0f;
@@ -418,7 +446,14 @@ static int hair_map(const std::string &picture, std::string name, const std::str
             covered += mask[i] > 0.5f;
         }
     }
-    make_folders(out);
+    make_folders(out + "/masks");
+    {   // What was taken for long hair, white on black, to look at.
+        Image shown;
+        shown.w = w, shown.h = h;
+        shown.px.assign(count * 4, 255);
+        for (size_t i = 0; i < count; i++) shown.px[i * 4] = shown.px[i * 4 + 1] = shown.px[i * 4 + 2] = (uint8_t)lroundf(mask[i] * 255);
+        write_png(out + "/masks/" + name + "_longhair.png", shown);
+    }
     std::string path = out + "/" + name + "_hair.png";
     if (!write_png(path, map)) {
         fprintf(stderr, "%s could not be written\n", path.c_str());
