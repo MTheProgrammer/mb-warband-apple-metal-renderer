@@ -258,6 +258,13 @@ static float sample_luminance(const Image &m, float u, float v)
     return sum;
 }
 
+// Makes a folder and whatever folders above it are missing.
+static void make_folders(const std::string &path)
+{
+    for (size_t at = 1; at <= path.size(); at++)
+        if (at == path.size() || path[at] == '/') mkdir(path.substr(0, at).c_str(), 0755);
+}
+
 static bool is_horse(const std::string &name)
 {
     bool horse = false;
@@ -385,7 +392,7 @@ static int hair_map(const std::string &picture, std::string name, const std::str
             covered += mask[i] > 0.5f;
         }
     }
-    mkdir(out.c_str(), 0755);
+    make_folders(out);
     std::string path = out + "/" + name + "_hair.png";
     if (!write_png(path, map)) {
         fprintf(stderr, "%s could not be written\n", path.c_str());
@@ -406,7 +413,7 @@ int main(int argc, char **argv)
     }
     bool pbr = !strcmp(argv[1], "pbr");
     std::string out = argv[2];
-    mkdir(out.c_str(), 0755);
+    make_folders(out);
     std::map<std::string, std::string> files = game_textures();
     if (files.empty()) {
         fprintf(stderr, "no texture files found; set WBM_GAME to the game's folder\n");
