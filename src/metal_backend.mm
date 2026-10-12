@@ -154,6 +154,7 @@ struct Program {
     int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler
     int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform
     int wind_offset = -1;          // vertex stage, see k_xl_wind_uniform
+    int gaze_offset = -1;     // fragment stage, see k_eye_function in shader_xlate.cpp
     int leaf_sun_offset = -1; // vertex stage, see k_leaf_function in shader_xlate.cpp // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
@@ -373,6 +374,7 @@ uint64_t s_eye_frame;
 float s_foliage_backlight; // WBM_FOLIAGE: how much sunlight comes through leaves, 0 for none
 float s_wind_strength;     // WBM_WIND, 0 for none
 double s_wind_time;        // the same for every draw of a frame
+float s_gaze_strength = 1.0f; // WBM_EYES_MOVE: how far the eyes wander; 0 keeps them still
 float s_skin_backlight = 0.6f; // WBM_SSS_BACKLIGHT: sunlight through thin skin; 0 for none
 // The game's texture files, keyed by content: filled once at start, read-only afterwards.
 struct KnownTexture {
@@ -977,7 +979,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1047,6 +1049,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_skin_uniform) p.skin_offset[s] = u.offset;
             else if (u.name == k_xl_wind_uniform) p.wind_offset = u.offset;
             else if (u.name == "wbm_leaf_sun") p.leaf_sun_offset = u.offset;
+            else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -2256,6 +2259,33 @@ bool weigh_foliage(Buffer &b, bool radial)
     return true;
 }
 
+// Where a pair of eyes is turned at a time: held still for a second or two,
+// about half the time straight ahead, then moved to the next place in a
+// twelfth of a second, as eyes do. In the face texture's coordinates.
+void eye_gaze(double time, float phase, float *out)
+{
+    if (const char *fixed = getenv("WBM_GAZE")) { // "x y", for looking at the effect
+        sscanf(fixed, "%f %f", &out[0], &out[1]);
+        return;
+    }
+    auto hash = [](double n) {
+        double v = sin(n) * 43758.5453;
+        return (float)(v - floor(v));
+    };
+    auto target = [&](double step, float *xy) {
+        bool ahead = hash(step * 1.7 + phase) < 0.5f;
+        xy[0] = ahead ? 0.0f : (hash(step * 3.1 + phase + 4.0) - 0.5f) * 0.016f * s_gaze_strength;
+        xy[1] = ahead ? 0.0f : (hash(step * 5.3 + phase + 9.0) - 0.5f) * 0.005f * s_gaze_strength;
+    };
+    double period = 1.1 + 1.6 * hash(phase + 2.0), at = time / period + hash(phase), step = floor(at);
+    float now[2], before[2];
+    target(step, now), target(step - 1, before);
+    float t = (float)std::min(1.0, (at - step) * period / 0.08);
+    t = t * t * (3 - 2 * t);
+    out[0] = before[0] + (now[0] - before[0]) * t;
+    out[1] = before[1] + (now[1] - before[1]) * t;
+}
+
 // Holds the frame rate to a limit by waiting at the end of a frame.
 void limit_frame_rate()
 {
@@ -2869,6 +2899,19 @@ bool prepare_draw()
             complain("%s without scattering, program %u %s: %s", unlit_leaf ? "foliage" : "skin", s_program, sh->type == GL_VERTEX_SHADER ? "vs" : "fs", lines.c_str());
         }
     }
+    if (p->gaze_offset >= 0) {
+        float gaze[4] = {0, 0, 0, 0};
+        float phase = 0; // a face's own, from where its head is, so that a crowd does not glance about as one
+        if (p->u_world) {
+            const float *w = (const float *)(p->uniform_data[0].data() + p->u_world->offset);
+            phase = floorf(w[12] * 3.0f) * 12.9898f + floorf(w[13] * 3.0f) * 78.233f;
+        }
+        eye_gaze(s_wind_time, phase, gaze);
+        if (memcmp(p->uniform_data[1].data() + p->gaze_offset, gaze, 16)) {
+            memcpy(p->uniform_data[1].data() + p->gaze_offset, gaze, 16);
+            p->uniform_dirty[1] = true;
+        }
+    }
     if (p->leaf_sun_offset >= 0) {
         float sun[4] = {0, 0, 0, 0};
         // The direction to the sun in view space, from the camera worked out for this frame or the last.
@@ -3318,6 +3361,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     const char *sss_env = getenv("WBM_SSS");
     s_shader_options.skin_scattering = sss_env && atoi(sss_env) != 0; // off unless set
     s_shader_options.eyes = getenv("WBM_EYES") && atoi(getenv("WBM_EYES")) != 0; // off unless set
+    if (const char *v = getenv("WBM_EYES_MOVE")) s_gaze_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FOLIAGE")) s_foliage_backlight = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_WIND")) s_wind_strength = std::max(0.0f, (float)atof(v));

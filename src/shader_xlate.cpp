@@ -669,6 +669,19 @@ bool add_skin_scattering_vertex(std::string &vs)
 // of the irises, and the opening of the lids), in the coordinates the head's
 // mesh uses, which run upwards.
 const char k_eye_function[] = R"(
+uniform vec4 wbm_gaze; // xy: how far the eyes are turned, in the texture's coordinates
+
+// Where to read the face's texture so that the iris sits wbm_gaze.xy off its
+// painted place: all of the shift at the middle of the eye, none at the lids.
+vec2 wbm_eye_uv(vec2 uv)
+{
+    const vec2 left = vec2(0.388, 0.558), right = vec2(0.610, 0.558), reach = vec2(0.040, 0.019);
+    vec2 a = (uv - left) / reach, b = (uv - right) / reach;
+    vec2 d = dot(a, a) < dot(b, b) ? a : b;
+    float hold = 1.0 - smoothstep(0.15, 1.0, dot(d, d));
+    return uv - wbm_gaze.xy * hold;
+}
+
 vec3 wbm_eye(vec2 uv, vec3 view, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
 {
     const vec2 left = vec2(0.388, 0.558), right = vec2(0.610, 0.558), reach = vec2(0.040, 0.019);
@@ -681,6 +694,7 @@ vec3 wbm_eye(vec2 uv, vec3 view, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
     float glint = pow(max(dot(n, h), 0.0), 220.0) * 2.5 * shadow;
     float grazing = 0.03 + 0.97 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
     return inside * (glint * sun + grazing * sky * 0.8);
+    // (The highlight stays put while the iris moves under it, as it does on a real eye.)
 }
 )";
 
@@ -696,6 +710,8 @@ bool add_eye_glint(std::string &fs)
     if (!std::regex_search(fs, encode)) return false;
     std::smatch m;
     std::string lit = std::regex_search(fs, m, shadow) ? std::string(m[1]) : "1.0";
+    // The base colour (both layers: young and aged) is read through the moving eye.
+    fs = std::regex_replace(fs, std::regex(R"(texture2D \((diffuse_texture(_2)?), Tex0\))"), "texture2D ($1, wbm_eye_uv(Tex0))");
     fs = std::regex_replace(fs, encode, "$1.xyz += wbm_eye(Tex0, ViewDir, SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz + vSkyLightColor.xyz);\n  $&",
                             std::regex_constants::format_first_only);
     return true;
