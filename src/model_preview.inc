@@ -160,7 +160,10 @@ GLuint preview_texture(const std::string &texture_name)
                 Texture pbr, hair;
                 if (map != s_pack_files.end() && load_replacement(pbr, map->second, true)) t.pbr = pbr.mtl;
                 map = s_pack_files.find(name + "_hair");
-                if (map != s_pack_files.end() && load_replacement(hair, map->second, true)) t.hair = hair.mtl;
+                if (map != s_pack_files.end() && load_replacement(hair, map->second, true)) {
+                    t.hair = hair.mtl;
+                    read_hair_colour(map->second, t.hair_colour);
+                }
             } else {
                 s_textures.erase(id);
                 id = 0;

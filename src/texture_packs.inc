@@ -318,6 +318,7 @@ void attach_pbr_map(Texture &t, const KnownTexture &known)
 {
     t.pbr = nil;
     t.hair = nil;
+    t.hair_colour[3] = 0;
     if (s_pack_files.empty()) return;
     std::string name = s_texture_names[known.name];
     const char suffix[] = "_degraded_";
@@ -326,7 +327,10 @@ void attach_pbr_map(Texture &t, const KnownTexture &known)
     auto hair = s_pack_files.find(name + "_hair");
     if (hair != s_pack_files.end()) {
         Texture map;
-        if (load_replacement(map, hair->second, known.flipped)) t.hair = map.mtl;
+        if (load_replacement(map, hair->second, known.flipped)) {
+            t.hair = map.mtl;
+            read_hair_colour(hair->second, t.hair_colour);
+        }
         else s_pack_stats.failed++;
     }
     auto it = s_pack_files.find(name + "_pbr");

@@ -764,6 +764,18 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
 // wbm_shell.z: fewer, thicker strands that reach several centimetres out,
 // hang much farther along the surface, and swing a little (wbm_shell.w
 // carries the time, as 1 + seconds).
+// Long hair has one colour of its own (wbm_hair_colour, when w is above 0),
+// lighter and darker as the texture is where the hair is rooted: what else is
+// painted across the mane there, a strap or a patch of coat, keeps only its
+// brightness.
+uniform vec4 wbm_hair_colour;
+vec4 wbm_hair_tint(vec4 painted)
+{
+    if (wbm_shell.z >= 0.0 || wbm_shell.y <= 0.0 || wbm_hair_colour.w <= 0.0) return painted;
+    float tone = dot(painted.xyz, vec3(0.3333)) / max(dot(wbm_hair_colour.xyz, vec3(0.3333)), 0.004);
+    return vec4(wbm_hair_colour.xyz * clamp(tone, 0.55, 1.7), painted.w);
+}
+
 // Noise that changes smoothly from place to place, 0 to 1.
 float wbm_noise(vec2 p)
 {
@@ -895,7 +907,7 @@ bool add_fur(std::string &fs)
     if (body != std::string::npos) body = fs.find('{', body);
     if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0, " + down + ")) discard;");
     // A hair has the colour of the place it grows from, not of what it hangs over.
-    fs = std::regex_replace(fs, std::regex(R"(texture2D \(diffuse_texture, Tex0\))"), "texture2D (diffuse_texture, wbm_shell_root(Tex0, " + down + "))");
+    fs = std::regex_replace(fs, std::regex(R"(texture2D \(diffuse_texture, Tex0\))"), "wbm_hair_tint(texture2D (diffuse_texture, wbm_shell_root(Tex0, " + down + ")))");
     if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos)
         fs = std::regex_replace(fs, encode, "$1.xyz += wbm_horse_glint(Tex0, ViewDir, " + normal + ", SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz);\n  $&",
                                 std::regex_constants::format_first_only);

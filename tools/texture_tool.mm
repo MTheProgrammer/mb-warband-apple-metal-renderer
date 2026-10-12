@@ -572,6 +572,23 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         for (size_t i = 0; i < count; i++) shown.px[i * 4] = shown.px[i * 4 + 1] = shown.px[i * 4 + 2] = (uint8_t)lroundf(mask[i] * 255);
         write_png(out + "/masks/" + name + "_longhair.png", shown);
     }
+    {   // The hair's own colour, as the middle value of what is painted where the
+        // long hair is: the renderer colours long hair with it, so that a strap or
+        // a patch of coat lying across the mane in the texture does not show in the hair.
+        std::vector<uint8_t> channel[3];
+        for (size_t i = 0; i < count; i++)
+            if (mask[i] > 0.5f)
+                for (int k = 0; k < 3; k++) channel[k].push_back(base.px[i * 4 + k]);
+        if (FILE *f = channel[0].empty() ? nullptr : fopen((out + "/" + name + "_hair.txt").c_str(), "w")) {
+            int middle[3];
+            for (int k = 0; k < 3; k++) {
+                std::nth_element(channel[k].begin(), channel[k].begin() + (long)channel[k].size() / 2, channel[k].end());
+                middle[k] = channel[k][channel[k].size() / 2];
+            }
+            fprintf(f, "%d %d %d\n", middle[0], middle[1], middle[2]);
+            fclose(f);
+        }
+    }
     std::string path = out + "/" + name + "_hair.png";
     if (!write_png(path, map)) {
         fprintf(stderr, "%s could not be written\n", path.c_str());

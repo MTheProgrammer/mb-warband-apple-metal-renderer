@@ -59,6 +59,7 @@ struct Texture {
     bool woman = false;       // a woman's face, whose eyes are elsewhere in the texture than a man's (see k_eye_function)
     bool radial_wind = false; // foliage that hangs from a crown (a palm's leaves): the wind takes hold by distance from the middle, not by height
     bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
+    float hair_colour[4] = {0, 0, 0, 0}; // the long hair's own colour, as painted (0 to 1); w 1 when a hair map came with one
     id<MTLTexture> hair;   // a pack's hair map for this texture (<name>_hair), see k_fur_function in shader_xlate.cpp
     id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
@@ -161,6 +162,7 @@ struct Program {
     int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler
     int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform
     int wind_offset = -1;          // vertex stage, see k_xl_wind_uniform
+    int hair_colour_offset = -1; // fragment stage, the same
     int horse_eye_offset = -1; // fragment stage, the same
     int shell_offset[2] = {-1, -1}; // per stage: wbm_shell, see k_fur_function
     int fur_offset = -1;      // fragment stage, see k_fur_function in shader_xlate.cpp
@@ -391,6 +393,20 @@ void horse_eye_for(const std::string &name, float *out)
     out[0] = out[1] = out[2] = 0;
     for (auto &row : table)
         if (name == row.name) out[0] = row.x, out[1] = 1.0f - row.y, out[2] = row.size; // the meshes' coordinates run upwards
+}
+
+// Reads the colour that texture_tool wrote beside a hair map (<name>_hair.txt).
+void read_hair_colour(const std::string &map_path, float *out)
+{
+    out[0] = out[1] = out[2] = out[3] = 0;
+    size_t dot = map_path.rfind('.');
+    if (dot == std::string::npos) return;
+    if (FILE *f = fopen((map_path.substr(0, dot) + ".txt").c_str(), "r")) {
+        int c[3];
+        if (fscanf(f, "%d %d %d", &c[0], &c[1], &c[2]) == 3)
+            for (int k = 0; k < 3; k++) out[k] = (float)c[k] / 255.0f, out[3] = 1;
+        fclose(f);
+    }
 }
 
 bool is_womans_face(const std::string &name) { return name.find("woman") != std::string::npos || name.find("female") != std::string::npos || name.find("lady") != std::string::npos; }
@@ -1014,7 +1030,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1089,6 +1105,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
             else if (u.name == "wbm_fur") p.fur_offset = u.offset;
             else if (u.name == "wbm_horse_eye") p.horse_eye_offset = u.offset;
+            else if (u.name == "wbm_hair_colour") p.hair_colour_offset = u.offset;
             else if (u.name == "wbm_shell") p.shell_offset[s] = u.offset;
             else location(u.name).uniform[s] = &u;
         }
@@ -2953,6 +2970,18 @@ bool prepare_draw()
     if (p->fur_offset >= 0) {
         const float fur[4] = {diffuse && (diffuse->pbr || diffuse->hair) ? s_fur_strength : 0.0f, s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f,
                               s_skin_backlight, diffuse && diffuse->hair ? s_texture_per_metre : -s_texture_per_metre};
+        if (p->hair_colour_offset >= 0) {
+            float colour[4] = {0, 0, 0, 0};
+            if (diffuse && diffuse->hair_colour[3] > 0) {
+                // In whatever form the shader gets the texture's own colour: decoded by the GPU, or as painted.
+                for (int k = 0; k < 3; k++) colour[k] = s_shader_options.srgb_textures ? powf(diffuse->hair_colour[k], 2.2f) : diffuse->hair_colour[k];
+                colour[3] = 1;
+            }
+            if (memcmp(p->uniform_data[1].data() + p->hair_colour_offset, colour, 16)) {
+                memcpy(p->uniform_data[1].data() + p->hair_colour_offset, colour, 16);
+                p->uniform_dirty[1] = true;
+            }
+        }
         if (p->horse_eye_offset >= 0) {
             const float eye[4] = {diffuse ? diffuse->horse_eye[0] : 0, diffuse ? diffuse->horse_eye[1] : 0, diffuse && diffuse->horse_eye[2] > 0 ? diffuse->horse_eye[2] : 1.0f,
                                   diffuse && diffuse->horse_eye[2] > 0 && s_shader_options.eyes ? 1.0f : 0.0f};
