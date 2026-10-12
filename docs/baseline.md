@@ -50,3 +50,14 @@ Farmhouse battle on Metal at Retina resolution, `max_framerate = 120`, with a fr
 | Soft shadows, 4x multisampling | `20261012-132700` | 71 s | 9 | 71 fps |
 
 Neither option has a cost that shows below the 120 fps limit. Their cost with the limit lifted has not been measured.
+
+## State cache, 2026-10-12
+
+Farmhouse battle, `max_framerate = 1000`, `WBM_VSYNC=0`, Retina, 4x multisampling, soft shadows. Seconds 14 to 46 of each run, the battle:
+
+| Setting | Trace | Average | Slowest second | State calls made | Skipped |
+|---|---|---|---|---|---|
+| State cache on | `20261012-134119` | 154 fps | 122 fps | 32 million | 173 million |
+| `WBM_STATE_CACHE=0` | `20261012-134240` | 144 fps | 91 fps | 181 million | 0 |
+
+About 7% apart, which is within the variation between two hand-played battles. Skipping 85% of the state-setting calls does not move the frame rate much: the per-draw cost is not in those calls.
