@@ -9,6 +9,12 @@
 //       map (bright there means metal) and, for textures the name says are
 //       metal, from which parts are grey; and, for horses, in blue how much of
 //       the surface is coat (not armour, cloth or saddle).
+//   texture_tool hair <picture> <name> <out-folder>
+//       writes <name>_hair.png for the game's texture <name> from a picture of
+//       that texture with everything but the long hair (mane, tail, forelock)
+//       blacked out: red and green give the way the hair is combed, worked out
+//       from the run of the strands in the picture and in the texture's normal
+//       map; blue says what grows there (255 long hair, about 128 coat, 0 none).
 //
 // The game's folder is taken from WBM_GAME, or from where Steam puts it.
 
@@ -104,6 +110,75 @@ static bool read_dds(const std::string &path, Image *img)
     return true;
 }
 
+// PNG, JPEG and whatever else the system reads.
+static bool read_picture(const std::string &path, Image *img)
+{
+    @autoreleasepool {
+        NSURL *url = [NSURL fileURLWithPath:@(path.c_str())];
+        CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+        if (!source) return false;
+        CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+        CFRelease(source);
+        if (!image) return false;
+        size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+        img->w = (int)w, img->h = (int)h;
+        img->px.assign(w * h * 4, 255);
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(img->px.data(), w, h, 8, w * 4, space, (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(space);
+        if (ctx) {
+            CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);
+            CGContextRelease(ctx);
+        }
+        CGImageRelease(image);
+        return ctx != nullptr;
+    }
+}
+
+// A separable box blur of a plane of floats, run three times: near enough a Gaussian.
+static void blur(std::vector<float> &plane, int w, int h, int radius)
+{
+    if (radius < 1) return;
+    std::vector<float> tmp(plane.size());
+    for (int pass = 0; pass < 3; pass++) {
+        for (int y = 0; y < h; y++) {
+            double sum = 0;
+            for (int x = -radius; x <= radius; x++) sum += plane[(size_t)y * w + std::min(w - 1, std::max(0, x))];
+            for (int x = 0; x < w; x++) {
+                tmp[(size_t)y * w + x] = (float)(sum / (2 * radius + 1));
+                sum += plane[(size_t)y * w + std::min(w - 1, x + radius + 1)] - plane[(size_t)y * w + std::max(0, x - radius)];
+            }
+        }
+        for (int x = 0; x < w; x++) {
+            double sum = 0;
+            for (int y = -radius; y <= radius; y++) sum += tmp[(size_t)std::min(h - 1, std::max(0, y)) * w + x];
+            for (int y = 0; y < h; y++) {
+                plane[(size_t)y * w + x] = (float)(sum / (2 * radius + 1));
+                sum += tmp[(size_t)std::min(h - 1, y + radius + 1) * w + x] - tmp[(size_t)std::max(0, y - radius) * w + x];
+            }
+        }
+    }
+}
+
+// Adds to a structure tensor (xx, xy, yy) the gradients of one channel of an
+// image, sampled at the tensor's own size.
+static void add_gradients(const Image &img, int channel, int w, int h, std::vector<float> &xx, std::vector<float> &xy, std::vector<float> &yy)
+{
+    auto at = [&](int x, int y) {
+        int X = std::min(img.w - 1, std::max(0, (int)((x + 0.5f) * img.w / w))), Y = std::min(img.h - 1, std::max(0, (int)((y + 0.5f) * img.h / h)));
+        const uint8_t *p = &img.px[((size_t)Y * img.w + X) * 4];
+        return channel < 0 ? (p[0] + p[1] + p[2]) / 765.0f : p[channel] / 255.0f;
+    };
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float gx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1));
+            float gy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1));
+            size_t i = (size_t)y * w + x;
+            xx[i] += gx * gx, xy[i] += gx * gy, yy[i] += gy * gy;
+        }
+    }
+}
+
 static bool write_png(const std::string &path, const Image &img)
 {
     @autoreleasepool {
@@ -183,10 +258,150 @@ static float sample_luminance(const Image &m, float u, float v)
     return sum;
 }
 
+static bool is_horse(const std::string &name)
+{
+    bool horse = false;
+    for (const char *word : {"horse", "charger", "courser", "hunter", "steed"}) horse = horse || name.find(word) != std::string::npos;
+    if (name.compare(0, 4, "pic_") == 0 || name.find("boot") != std::string::npos || name.find("horseman") != std::string::npos) horse = false; // pictures and riders' gear
+    return horse;
+}
+
+// How much of a horse's texture at (u, v) is coat. With a specular map, what is
+// neither metal (bright there) nor cloth (black). Without one, all that is
+// painted, less the saddle of the horse_a layout.
+static float coat_at(bool has_spec, float spec, float u, float v, float brightest)
+{
+    if (has_spec) return smoothstep(0.03f, 0.10f, spec) * (1 - smoothstep(0.24f, 0.36f, spec));
+    bool saddle = (u > 0.485f && u < 0.755f && v > 0.02f && v < 0.335f) || (u > 0.195f && u < 0.315f && v > 0.455f && v < 0.715f) || (u > 0.03f && u < 0.10f && v > 0.44f && v < 0.60f);
+    return saddle ? 0.0f : smoothstep(0.0002f, 0.0012f, brightest); // a black coat is dark, but not as black as the unused parts
+}
+
+static bool load_specular(const std::map<std::string, std::string> &files, const std::string &name, Image *spec)
+{
+    for (const char *suffix : {"_specular", "_spec", "_s"}) {
+        auto s = files.find(name + suffix);
+        if (s != files.end() && read_dds(s->second, spec)) return true;
+    }
+    return false;
+}
+
+static int hair_map(const std::string &picture, std::string name, const std::string &out)
+{
+    for (char &c : name) c = (char)tolower((unsigned char)c);
+    std::map<std::string, std::string> files = game_textures();
+    Image hair, base, spec, normal;
+    if (!read_picture(picture, &hair)) {
+        fprintf(stderr, "%s could not be read\n", picture.c_str());
+        return 1;
+    }
+    auto it = files.find(name);
+    if (it == files.end() || !read_dds(it->second, &base)) {
+        fprintf(stderr, "%s is not one of the game's textures\n", name.c_str());
+        return 1;
+    }
+    bool has_spec = load_specular(files, name, &spec), has_normal = false;
+    for (const char *suffix : {"_normalmap", "_n", "_bump"}) {
+        auto n = files.find(name + suffix);
+        if (!has_normal && n != files.end() && read_dds(n->second, &normal)) has_normal = true;
+    }
+    // Arabian horses and some others share another's normal map; the caller may know better.
+    int w = base.w, h = base.h;
+    size_t count = (size_t)w * h;
+    auto picture_at = [&](int x, int y) {
+        int X = std::min(hair.w - 1, (int)((x + 0.5f) * hair.w / w)), Y = std::min(hair.h - 1, (int)((y + 0.5f) * hair.h / h));
+        const uint8_t *p = &hair.px[((size_t)Y * hair.w + X) * 4];
+        return (float)std::max({p[0], p[1], p[2]}) / 255.0f;
+    };
+    // Where the long hair is: what the picture did not black out. Smoothed, so
+    // that the dark gaps between strands and the picture's compression do not show.
+    std::vector<float> mask(count);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) mask[(size_t)y * w + x] = picture_at(x, y) > 0.07f ? 1.0f : 0.0f;
+    blur(mask, w, h, std::max(1, w / 400));
+    for (float &m : mask) m = smoothstep(0.35f, 0.65f, m);
+    // Which way the strands run: across a strand brightness changes fast, along
+    // it hardly at all. Summed over a neighbourhood, the squared gradients say
+    // which direction that is (the one they vary least in).
+    std::vector<float> xx(count, 0.0f), xy(count, 0.0f), yy(count, 0.0f);
+    add_gradients(hair, -1, w, h, xx, xy, yy);
+    if (has_normal) {
+        add_gradients(normal, 0, w, h, xx, xy, yy);
+        add_gradients(normal, 1, w, h, xx, xy, yy);
+    }
+    for (size_t i = 0; i < count; i++) xx[i] *= mask[i], xy[i] *= mask[i], yy[i] *= mask[i];
+    int radius = std::max(2, w / 110);
+    blur(xx, w, h, radius), blur(xy, w, h, radius), blur(yy, w, h, radius);
+    std::vector<float> dx(count), dy(count);
+    for (size_t i = 0; i < count; i++) {
+        float angle = 0.5f * atan2f(2 * xy[i], xx[i] - yy[i]) + 1.5707963f; // a right angle from the steepest change
+        dx[i] = cosf(angle), dy[i] = sinf(angle);
+    }
+    // A strand's run does not say which end is the tip. Within each patch of
+    // hair the choice is made the same way throughout, by spreading from one
+    // pixel to its neighbours; and for the patch as a whole, the way that goes
+    // down the picture, or failing that to the right, since hair hangs.
+    std::vector<int> patch(count, -1);
+    std::vector<size_t> queue;
+    for (size_t seed = 0; seed < count; seed++) {
+        if (mask[seed] <= 0.5f || patch[seed] >= 0) continue;
+        size_t first = queue.size();
+        patch[seed] = 1;
+        queue.push_back(seed);
+        double sum_x = 0, sum_y = 0;
+        for (size_t at = first; at < queue.size(); at++) {
+            size_t i = queue[at];
+            sum_x += dx[i], sum_y += dy[i];
+            int x = (int)(i % (size_t)w), y = (int)(i / (size_t)w);
+            const int step[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            for (auto &d : step) {
+                int X = x + d[0], Y = y + d[1];
+                if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+                size_t j = (size_t)Y * w + X;
+                if (mask[j] <= 0.5f || patch[j] >= 0) continue;
+                if (dx[i] * dx[j] + dy[i] * dy[j] < 0) dx[j] = -dx[j], dy[j] = -dy[j];
+                patch[j] = 1;
+                queue.push_back(j);
+            }
+        }
+        if (sum_y < -0.05 * (double)(queue.size() - first) || (fabs(sum_y) <= 0.05 * (double)(queue.size() - first) && sum_x < 0))
+            for (size_t at = first; at < queue.size(); at++) dx[queue[at]] = -dx[queue[at]], dy[queue[at]] = -dy[queue[at]];
+    }
+    Image map;
+    map.w = w, map.h = h;
+    map.px.assign(count * 4, 255);
+    size_t covered = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            size_t i = (size_t)y * w + x;
+            const uint8_t *c = &base.px[i * 4];
+            float brightest = powf(std::max({c[0], c[1], c[2]}) / 255.0f, 2.2f);
+            float s = has_spec ? sample_luminance(spec, (x + 0.5f) / w, (y + 0.5f) / h) : 0;
+            float coat = coat_at(has_spec, s, (x + 0.5f) / w, (y + 0.5f) / h, brightest) * 0.5f;
+            float kind = std::max(coat * (1 - mask[i]), mask[i]);
+            uint8_t *o = &map.px[i * 4];
+            o[0] = (uint8_t)lroundf(127.5f + 127.5f * dx[i] * mask[i]);
+            o[1] = (uint8_t)lroundf(127.5f + 127.5f * dy[i] * mask[i]);
+            o[2] = (uint8_t)lroundf(kind * 255);
+            covered += mask[i] > 0.5f;
+        }
+    }
+    mkdir(out.c_str(), 0755);
+    std::string path = out + "/" + name + "_hair.png";
+    if (!write_png(path, map)) {
+        fprintf(stderr, "%s could not be written\n", path.c_str());
+        return 1;
+    }
+    printf("%s: %dx%d, long hair on %.1f%% of it%s%s\n", path.c_str(), w, h, 100.0 * (double)covered / (double)count, has_normal ? ", normal map used" : ", no normal map found",
+           has_spec ? ", coat from the specular map" : "");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 5 && !strcmp(argv[1], "hair")) return hair_map(argv[2], argv[3], argv[4]);
     if (argc < 3 || (strcmp(argv[1], "export") && strcmp(argv[1], "pbr"))) {
-        fprintf(stderr, "usage: texture_tool export <out-folder> [name...]\n       texture_tool pbr <out-folder> [name...]\n");
+        fprintf(stderr, "usage: texture_tool export <out-folder> [name...]\n       texture_tool pbr <out-folder> [name...]\n"
+                        "       texture_tool hair <picture of the hair alone> <name> <out-folder>\n");
         return 2;
     }
     bool pbr = !strcmp(argv[1], "pbr");
