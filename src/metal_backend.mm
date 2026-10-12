@@ -145,7 +145,8 @@ struct Program {
     int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
     int material_offset = -1;     // fragment stage, see k_xl_material_uniform
-    int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler // fragment stage, see k_xl_dyn_sampler
+    int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler
+    int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
     const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
@@ -349,12 +350,14 @@ const float k_material_params[MAT_COUNT][4] = {
     {1.5f, 0.6f, 1.2f, 1.95f},  // metal: its grey parts are metal, and smoother
     {0.0f, 3.0f, 0.35f, 1.0f},  // cloth: never metal, matt
     {0.0f, 1.4f, 0.8f, 1.8f},   // leather: a broad, soft sheen; helmets and buckles share its textures
-    {0.0f, 1.6f, 0.7f, 1.0f},   // skin and hair
+    {0.0f, 1.6f, 0.7f, 1.0f},   // skin
     {0.0f, 2.2f, 0.5f, 1.5f},   // wood: nails, bands and bosses on it may be metal
     {0.0f, 2.5f, 0.4f, 1.0f},   // stone and ground
     {0.0f, 1.2f, 0.9f, 1.0f},   // a horse's coat
+    {0.0f, 1.6f, 0.7f, 1.0f},   // hair and beards
 };
 bool s_materials;
+bool s_debug_skin = getenv("WBM_DEBUG_SKIN") != nullptr;
 // The game's texture files, keyed by content: filled once at start, read-only afterwards.
 struct KnownTexture {
     uint8_t cls;     // MaterialClass
@@ -947,7 +950,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1014,6 +1017,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_ambient_uniform) p.amb_offset[s] = u.offset;
             else if (u.name == k_xl_material_uniform) p.material_offset = u.offset;
             else if (u.name == k_xl_pbr_uniform) p.pbr_offset = u.offset;
+            else if (u.name == k_xl_skin_uniform) p.skin_offset[s] = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -2573,9 +2577,36 @@ bool prepare_draw()
         }
     }
     Texture *diffuse = nullptr; // the diffuse texture says what the surface is
-    if ((p->material_offset >= 0 || p->pbr_offset >= 0) && p->alpha_texture_location >= 0) {
+    if ((p->material_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
         UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
         diffuse = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+    }
+    if (s_debug_skin && diffuse && diffuse->material == MAT_SKIN && p->skin_offset[0] < 0 && p->skin_offset[1] < 0) {
+        // Skin drawn by a shader the scattering rewrite did not recognise: show how it lights.
+        for (auto &sh : p->shaders) {
+            std::string lines;
+            size_t at = 0;
+            while (at < sh->source.size() && lines.size() < 700) {
+                size_t end = sh->source.find(';', at);
+                if (end == std::string::npos) break;
+                std::string st = sh->source.substr(at, end - at);
+                if (st.find("Sun") != std::string::npos && st.find("uniform") == std::string::npos && st.find("varying") == std::string::npos) {
+                    for (char &c : st)
+                        if (c == '\n' || c == '\r') c = ' ';
+                    lines += st + ";";
+                }
+                at = end + 1;
+            }
+            complain("skin without scattering, program %u %s: %s", s_program, sh->type == GL_VERTEX_SHADER ? "vs" : "fs", lines.c_str());
+        }
+    }
+    for (int stage = 0; stage < 2; stage++) {
+        if (p->skin_offset[stage] < 0) continue;
+        const float skin[4] = {diffuse && diffuse->material == MAT_SKIN ? 1.0f : 0.0f, 0, 0, 0};
+        if (memcmp(p->uniform_data[stage].data() + p->skin_offset[stage], skin, 16)) {
+            memcpy(p->uniform_data[stage].data() + p->skin_offset[stage], skin, 16);
+            p->uniform_dirty[stage] = true;
+        }
     }
     if (p->pbr_offset >= 0) {
         const float has[4] = {diffuse && diffuse->pbr ? 1.0f : 0.0f, 0, 0, 0};
@@ -2959,9 +2990,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_BOUNCE")) s_bounce_strength = std::max(0.0f, (float)atof(v));
     const char *mat_env = getenv("WBM_MATERIALS");
     s_materials = s_shader_options.materials = mat_env && atoi(mat_env) != 0 && s_shader_options.pbr_environment; // off unless set; needs WBM_PBR=2 or 3
-    index_texture_packs();
-    if (s_materials || !s_pack_files.empty() || s_pack_self_test) scan_game_textures();
     s_shader_options.debug_materials = getenv("WBM_DEBUG_MATERIALS") != nullptr && s_shader_options.pbr_environment;
+    const char *sss_env = getenv("WBM_SSS");
+    s_shader_options.skin_scattering = sss_env && atoi(sss_env) != 0; // off unless set
+    index_texture_packs();
+    if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering) scan_game_textures();
     const char *blur_env = getenv("WBM_MOTION_BLUR");
     s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
     if (const char *v = getenv("WBM_MOTION_BLUR_STRENGTH")) s_motion_blur_strength = std::max(0.0f, (float)atof(v));
@@ -3019,11 +3052,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; sky ambient %s; material classes %s; filmic tone map %s; extended-range output %s",
+            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; sky ambient %s; material classes %s; skin scattering %s; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_sky ? "on, with metalness and sky reflection" : s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off", s_sky_ambient ? "on" : "off", s_materials ? "on" : "off",
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off", s_sky_ambient ? "on" : "off", s_materials ? "on" : "off", s_shader_options.skin_scattering ? "on" : "off",
             s_shader_options.filmic_tonemap ? "on" : "off",
             s_hdr ? "on" : "off");
 }

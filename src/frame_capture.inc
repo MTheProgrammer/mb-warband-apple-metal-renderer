@@ -424,6 +424,9 @@ bool restore_state()
                     d.swizzle = sw;
                     t.mtl = [s_device newTextureWithDescriptor:d];
                     t.format = format;
+                    // What the texture shows is worked out again below when the game's
+                    // files are at hand; the capturing build may have classed it otherwise.
+                    if (!s_material_by_content.empty()) t.material = 0;
                     int64_t levels = r.i();
                     for (int64_t level = 0; level < levels; level++) {
                         auto data = r.blob();
@@ -432,7 +435,10 @@ bool restore_state()
                         if (level == 0 && data.first && !s_material_by_content.empty()) {
                             int alpha = format == MTLPixelFormatBC2_RGBA ? 3 : format == MTLPixelFormatBC3_RGBA ? 5 : format == MTLPixelFormatBC1_RGBA ? 0 : -1;
                             auto it = alpha < 0 ? s_material_by_content.end() : s_material_by_content.find(content_key((uint32_t)w, (uint32_t)h, data.first, data.second, alpha));
-                            if (it != s_material_by_content.end()) attach_pbr_map(t, it->second);
+                            if (it != s_material_by_content.end()) {
+                                t.material = it->second.cls; // as this build classes it, whatever the capturing one did
+                                attach_pbr_map(t, it->second);
+                            }
                             if (it != s_material_by_content.end() && replace_from_pack(t, it->second)) {
                                 replaced++;
                                 if (t.mtl.width != w || t.mtl.height != h) resized++;
@@ -545,6 +551,13 @@ bool restore_state()
         }
     }
     wb_note("replay: %d buffers, %d textures, %d programs restored", buffers, textures, programs);
+    if (!s_material_by_content.empty()) {
+        int classed[MAT_COUNT] = {};
+        for (auto &e : s_textures) classed[e.second.material < MAT_COUNT ? e.second.material : 0]++;
+        std::string line;
+        for (int c = 1; c < MAT_COUNT; c++) line += std::string(" ") + k_material_names[c] + " " + std::to_string(classed[c]) + ",";
+        wb_note("replay: textures by class:%s unknown %d", line.c_str(), classed[0]);
+    }
     if (replaced) wb_note("replay: %d textures taken from texture packs, %d of them at another size than the game's", replaced, resized);
     return true;
 }

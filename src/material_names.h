@@ -6,8 +6,8 @@
 #include <cctype>
 #include <string>
 
-enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_COUNT };
-static const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin and hair", "wood", "stone and ground", "horse"};
+enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_HAIR, MAT_COUNT };
+static const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin", "wood", "stone and ground", "horse", "hair"};
 
 inline int classify_texture_name(std::string name)
 {
@@ -21,7 +21,8 @@ inline int classify_texture_name(std::string name)
         {MAT_METAL, {"plate", "mail", "helmet", "helm", "lamellar", "scale", "gauntlet", "greave", "sword", "blade", "axe", "mace", "lance", "spear", "metal", "iron", "steel", "brass", "chain", "coif", "bascinet", "cuirass", "weapon"}},
         {MAT_CLOTH, {"dress", "tunic", "shirt", "cloth", "coat", "surcoat", "vest", "costume", "outfit", "robe", "padded", "ragged", "banner", "heraldic", "gambeson", "hood", "cape", "cloak", "linen", "turban", "veil", "wimple", "blouse", "peasant", "lady", "tabard"}},
         {MAT_LEATHER, {"leather", "boot", "saddle", "hide", "fur", "nomad", "belt", "glove", "shoe", "pelt"}},
-        {MAT_SKIN, {"face", "body", "hand", "skin", "hair", "beard"}},
+        {MAT_SKIN, {"face", "body", "hand", "skin"}},
+        {MAT_HAIR, {"hair", "beard"}},
         {MAT_WOOD, {"plank", "wood", "bark", "tree", "trunk", "bow", "barrel", "cart", "fence", "palisade", "timber"}},
         {MAT_STONE, {"stone", "wall", "rock", "stucco", "ground", "terrain", "roof", "building", "village", "brick", "earth", "road", "sand", "snow", "grass", "castle", "town", "floor", "mud", "steppe", "desert", "plaster"}},
         {MAT_HORSE, {"horse", "courser", "hunter", "steed"}},

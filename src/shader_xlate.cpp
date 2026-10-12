@@ -22,6 +22,7 @@ const char *const k_xl_ambient_uniform = "wbm_amb";
 const char *const k_xl_material_uniform = "wbm_material";
 const char *const k_xl_pbr_sampler = "wbm_pbr_map";
 const char *const k_xl_pbr_uniform = "wbm_pbr";
+const char *const k_xl_skin_uniform = "wbm_skin";
 const char *const k_xl_dyn_sampler = "wbm_dyn_map";
 const char *const k_xl_dyn_window_uniform = "wbm_dyn";
 const char *const k_xl_dyn_near_uniform = "wbm_dyn_near";
@@ -464,6 +465,114 @@ bool add_sky_ambient(std::string &glsl, bool vertex)
     return true;
 }
 
+// Subsurface scattering for skin, done where the skin is lit and not as a blur
+// of the finished picture: light entering skin comes out a little way off, red
+// travelling farthest. Seen from outside, the lit side reaches round the
+// terminator, reddest at its edge; fine relief shows in blue and green but is
+// smoothed away in red; and the edge of a cast shadow glows red.
+//
+// Skin has no shader of its own in this engine (two face shaders apart, which
+// only the player's kind of face uses): troops' faces, hands and bodies are
+// drawn with the general per-pixel shaders. So the sun's term is rewritten in
+// all of those and switched per draw by wbm_skin, which the backend sets from
+// what the base texture shows. They light in tangent space, where the smooth
+// surface's normal is simply +Z, so the sun's direction gives the unmapped
+// lighting for nothing.
+const char k_skin_function[] = R"(
+uniform vec4 wbm_skin;
+
+// mapped and smooth_: the cosine of the sun's angle to the normal-mapped
+// surface and to the smooth one.
+vec3 wbm_skin_core(float mapped, float smooth_, float shadow)
+{
+    const vec3 wrap = vec3(0.38, 0.16, 0.07);       // how far round each colour reaches
+    const vec3 relief = vec3(0.25, 0.7, 1.0);       // how much of the normal map each colour sees
+    vec3 facing = mix(vec3(smooth_), vec3(mapped), relief);
+    vec3 lit = clamp((facing + wrap) / (1.0 + wrap), 0.0, 1.0);
+    lit *= 1.0 / (1.0 + 0.5 * wrap);                // what is gained round the edge is given up at the front
+    return lit * pow(vec3(shadow), vec3(0.7, 1.0, 1.25));
+}
+
+// For the general shaders: skin or not is the draw's business.
+vec4 wbm_skin_sun(vec3 to_sun, vec3 normal, float shadow)
+{
+    float mapped = dot(to_sun, normal);
+    float plain = clamp(mapped, 0.0, 1.0) * shadow;
+    if (wbm_skin.x < 0.5) return vec4(vec3(plain), plain);
+    return vec4(wbm_skin_core(mapped, normalize(to_sun).z, shadow), plain);
+}
+
+// For the engine's own skin shader, which is skin whatever it draws.
+vec4 wbm_skin_lit(float mapped, float smooth_, float shadow)
+{
+    return vec4(wbm_skin_core(mapped, smooth_, shadow), clamp(max(0.2 * (mapped + 0.9), mapped), 0.0, 1.0) * shadow);
+}
+)";
+
+// Shaders that light per vertex get the wrap alone, from the vertex normal.
+const char k_skin_vertex_function[] = R"(
+uniform vec4 wbm_skin;
+
+vec4 wbm_skin_wrap(float facing)
+{
+    float plain = clamp(facing, 0.0, 1.0);
+    if (wbm_skin.x < 0.5) return vec4(plain);
+    const vec3 wrap = vec3(0.38, 0.16, 0.07);
+    vec3 lit = clamp((vec3(facing) + wrap) / (1.0 + wrap), 0.0, 1.0) / (1.0 + 0.5 * wrap);
+    return vec4(lit, plain);
+}
+)";
+
+bool add_skin_scattering_vertex(std::string &vs)
+{
+    // SunLight = (((clamp(dot(N, -vSunDir), 0, 1) * sun colour) * material) * vertex colour)
+    static const std::regex term(R"(\(\s*clamp \(dot \(([\w.]+), -\(vSunDir\.xyz\)\), 0\.0, 1\.0\)\s*\* (tmpvar_\d+)\))");
+    if (vs.find("varying vec4 SunLight;") == std::string::npos || !std::regex_search(vs, term)) return false;
+    vs = std::regex_replace(vs, term, "(wbm_skin_wrap(dot($1, -(vSunDir.xyz))) * $2)", std::regex_constants::format_first_only);
+    return true;
+}
+
+bool add_skin_scattering(std::string &fs)
+{
+    // The sun's diffuse term, in the four shapes the engine's shaders have it:
+    // with and without a shadow, as a vec3 times the sun's colour or (the two
+    // face shaders) as a scalar times a vec4.
+    static const std::regex shapes[4] = {
+        std::regex(R"(\(\(vec3\(\s*clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\)\s*\) \* (sun_amount_\d+)\) \* vSunColor\.xyz\))"),
+        std::regex(R"(\(vec3\(clamp \(\s*dot \(SunLightDir, ([\w.]+)\)\s*, 0\.0, 1\.0\)\) \* vSunColor\.xyz\))"),
+        std::regex(R"(\(\(\s*clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\)\s*\* (sun_amount_\d+)\) \* (tmpvar_\d+)\))"),
+        std::regex(R"(\(clamp \(\s*dot \(SunLightDir, ([\w.]+)\)\s*, 0\.0, 1\.0\) \* (tmpvar_\d+)\))"),
+    };
+    // The engine's skin shader, which troops' faces are drawn with, has a wrap
+    // of its own: clamp(max(0.2 * (d + 0.9), d), 0, 1), the same in every colour.
+    static const std::regex own_shadowed(
+        R"(\(\(\s*clamp \(max \(\(0\.2 \* \((\w+) \+ 0\.9\)\), \1\), 0\.0, 1\.0\)\s*\* (sun_amount_\d+)\) \* (tmpvar_\d+)\))");
+    static const std::regex own_plain(R"(\(clamp \(\s*max \(\(0\.2 \* \((\w+) \+ 0\.9\)\), \1\)\s*, 0\.0, 1\.0\) \* (tmpvar_\d+)\))");
+    if (fs.find("varying vec3 SunLightDir;") != std::string::npos) {
+        if (std::regex_search(fs, own_shadowed)) {
+            fs = std::regex_replace(fs, own_shadowed, "(wbm_skin_lit($1, normalize(SunLightDir).z, $2) * $3)", std::regex_constants::format_first_only);
+            return true;
+        }
+        if (std::regex_search(fs, own_plain)) {
+            fs = std::regex_replace(fs, own_plain, "(wbm_skin_lit($1, normalize(SunLightDir).z, 1.0) * $2)", std::regex_constants::format_first_only);
+            return true;
+        }
+    }
+    static const char *const with[4] = {
+        "(wbm_skin_sun(SunLightDir, vec3($1), $2).xyz * vSunColor.xyz)",
+        "(wbm_skin_sun(SunLightDir, vec3($1), 1.0).xyz * vSunColor.xyz)",
+        "(wbm_skin_sun(SunLightDir, vec3($1), $2) * $3)",
+        "(wbm_skin_sun(SunLightDir, vec3($1), 1.0) * $2)",
+    };
+    if (fs.find("varying vec3 SunLightDir;") == std::string::npos) return false;
+    for (int i = 0; i < 4; i++) {
+        if (!std::regex_search(fs, shapes[i])) continue;
+        fs = std::regex_replace(fs, shapes[i], with[i], std::regex_constants::format_first_only);
+        return true;
+    }
+    return false;
+}
+
 // Finds pow(clamp(dot(normalize(V +/- L), N), 0, 1), fMaterialPower) and
 // replaces it with wbm_specular(V, +/-L, N, fMaterialPower).
 bool use_pbr_specular(std::string &fs)
@@ -719,6 +828,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     std::string pbr_extra;
     bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, options.debug_materials, pbr_extra);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
+    // After the shadow rewrite, which looks for the sun term's shadow variable by its original shape.
+    bool skin = options.skin_scattering && (vertex ? add_skin_scattering_vertex(glsl) : add_skin_scattering(glsl));
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
@@ -737,6 +848,12 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
     if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
+    if (skin && vertex) out << k_skin_vertex_function;
+    if (skin && !vertex) { // with the materials debug view, skin that scatters is painted red
+        std::string f = k_skin_function;
+        if (options.debug_materials) f = std::regex_replace(f, std::regex("return lit \\* pow\\(vec3\\(shadow\\), vec3\\(0\\.7, 1\\.0, 1\\.25\\)\\);"), "return vec3(4.0, 0.0, 0.0);");
+        out << f;
+    }
     if (sky_ambient) out << k_ambient_functions;
     if (final_pass) out << k_tonemap_functions;
     if (final_pass && options.hdr_output) out << "uniform float " << k_xl_headroom_uniform << ";\n";

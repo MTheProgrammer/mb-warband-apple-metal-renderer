@@ -33,7 +33,7 @@ int main(int argc, char **argv)
     std::string dir = argv[1];
     bool verbose = false;
     XlOptions options;
-    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0, sky = 0, dynamic = 0, ambient_vs = 0, ambient_fs = 0, materials = 0;
+    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0, sky = 0, dynamic = 0, ambient_vs = 0, ambient_fs = 0, materials = 0, skin = 0;
     bool reported_amb = false;
     int dump = -1;
     for (int i = 2; i < argc; i++) {
@@ -43,6 +43,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-D")) options.dynamic_shadows = true;
         if (!strcmp(argv[i], "-A")) options.sky_ambient = true;
         if (!strcmp(argv[i], "-M")) options.materials = true;
+        if (!strcmp(argv[i], "-K")) options.skin_scattering = true;
         if (!strcmp(argv[i], "-a")) options.smooth_alpha_test = true;
         if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
         if (!strcmp(argv[i], "-p")) options.pbr_specular = true;
@@ -74,6 +75,7 @@ int main(int argc, char **argv)
         ambient_vs += p.vs.msl.find("wbm_ambient") != std::string::npos;
         ambient_fs += p.fs.msl.find("wbm_ambient_up") != std::string::npos;
         materials += p.fs.msl.find("wbm_material") != std::string::npos;
+        skin += p.fs.msl.find("wbm_skin_sun") != std::string::npos || p.vs.msl.find("wbm_skin_wrap") != std::string::npos;
         for (const XlStage *st : {&p.vs, &p.fs})
             for (const XlUniform &u : st->uniforms)
                 if (u.name.compare(0, 7, "wbm_amb") == 0 && !reported_amb) {
@@ -130,6 +132,7 @@ int main(int argc, char **argv)
     if (options.dynamic_shadows) printf("%d programs sample the per-frame shadow map\n", dynamic);
     if (options.sky_ambient) printf("%d programs take ambient light from the sky (%d in the vertex stage, %d in the fragment stage)\n", ambient_vs + ambient_fs, ambient_vs, ambient_fs);
     if (options.materials) printf("%d programs take material classes\n", materials);
+    if (options.skin_scattering) printf("%d programs scatter light in skin\n", skin);
     if (options.pbr_sky) printf("%d programs reflect the captured sky\n", sky);
     if (options.pbr_specular || options.pbr_environment || options.pbr_sky) printf("%d programs use microfacet specular highlights\n", pbr);
     if (options.pbr_environment || options.pbr_sky) printf("%d programs add metalness and an environment reflection\n", env);

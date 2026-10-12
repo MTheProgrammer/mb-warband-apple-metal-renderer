@@ -84,6 +84,12 @@ struct XlOptions {
     // strength per material class from the backend, which knows what each
     // texture is. Adds the wbm_material uniform (see k_xl_material_uniform).
     bool materials = false;
+    // Skin that scatters light: in shaders that light per pixel, the sun's
+    // diffuse term can wrap a little way round the terminator, farthest in red,
+    // with the red taken from the smooth surface instead of the normal map's
+    // pores, and the edge of a shadow tinted the same way. Whether it does is
+    // up to the wbm_skin uniform, which the backend sets per draw.
+    bool skin_scattering = false;
     // For tuning: shaders with an environment reflection show their estimated
     // metalness in place of their colour, white for metal and black for none.
     bool debug_materials = false;
@@ -133,6 +139,9 @@ extern const char *const k_xl_material_uniform;
 // has not (the sampler then holds anything). A map overrides the estimates.
 extern const char *const k_xl_pbr_sampler;
 extern const char *const k_xl_pbr_uniform;
+
+// With skin_scattering: wbm_skin, whose x is 1 when the surface being drawn is skin and 0 otherwise.
+extern const char *const k_xl_skin_uniform;
 
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in
 // the order +X, -X, +Y, -Y, +Z, -Z (Z is up). Face f looks along its axis with
