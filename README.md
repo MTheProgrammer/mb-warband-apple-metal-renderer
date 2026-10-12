@@ -1,8 +1,39 @@
 # warband-metal
 
-An injected library for Mount & Blade: Warband (Steam, macOS) that will replace the game's OpenGL renderer with Metal. The game's files are not modified.
+A Metal renderer for Mount & Blade: Warband on macOS. The Steam version of the game draws with OpenGL, which Apple deprecated years ago. This project loads a library into the game when it starts that takes over its drawing and does it with Metal instead. The game's files are not modified, and the game still runs as an Intel program under Rosetta 2.
 
-Status: the Metal renderer draws the game: menus, the world map, battles with shadows and post-processing, HUD and text. A 200 vs 200 battle and the world map of the Native module pass Metal's API validation (`MTL_DEBUG_LAYER=1`) without a violation. Frame rates against OpenGL are in `docs/baseline.md`. Not done yet: modules other than Native are unchecked.
+In a 200 vs 200 custom battle on a MacBook Pro M5:
+
+| | OpenGL (1512x982, limited to 120 fps) | Metal (3024x1964, unlimited) |
+|---|---|---|
+| Average | 110 fps | 199 fps |
+| Median second | 117 fps | 210 fps |
+| Slowest 10% of seconds | 86 fps or less | 131 fps or less |
+| Slowest second | 55 fps | 109 fps |
+
+Metal also draws at the display's native resolution, four times the pixels of the OpenGL path. The runs were played by hand, one each, so read the result as "roughly twice as fast"; details are in `docs/baseline.md`.
+
+## Using it
+
+1. Download `warband-metal-<version>.zip` from the Releases page and unzip it.
+2. macOS blocks apps that were downloaded and are not signed by a registered developer, and this one is not. Either run this once in Terminal:
+
+       xattr -dr com.apple.quarantine "Warband Metal.app"
+
+   or try to open the app, then go to System Settings → Privacy & Security and choose "Open Anyway".
+3. Open `Warband Metal.app`. It starts the game on Metal. If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once.
+
+The module and the graphics options are still set in the game's own launcher, the window Steam's Play button opens: the game reads them when it starts, whichever way it is started.
+
+If something looks wrong, the log of the latest run is in `~/Library/Logs/warband-metal/trace.log`.
+
+**Do not use this in multiplayer.** It loads code into the game process, which is the kind of thing anti-cheat systems object to.
+
+Tested on one machine: MacBook Pro M5, macOS 26.5, game version 1.174 from Steam, Native module (menus, world map, towns, battles). Other modules, Intel Macs and older macOS versions are untested.
+
+## Status
+
+The Metal renderer draws the whole game and passes Metal's API validation (`MTL_DEBUG_LAYER=1`) in a 200 vs 200 battle and on the world map. The rest of this document is for developers.
 
 ## Build
 
@@ -14,9 +45,13 @@ The first build downloads glslang and SPIRV-Cross at pinned versions into `third
 
 This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2). If the game is not in the default Steam library, pass `GAME=/path/to/MountBlade\ Warband`.
 
+`make app` builds `build/Warband Metal.app` and `make dist` zips it for a release.
+
 ## Run
 
     scripts/run.sh
+
+This starts the game on Metal with the library just built. `WBM_MODE=trace scripts/run.sh` runs the game's own OpenGL renderer with every call traced, which is how the renderer was developed and is still the reference to compare against.
 
 Each run writes to a new directory, `traces/<timestamp>/`, also reachable as `traces/latest`:
 
@@ -36,13 +71,13 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 
 | Variable | Meaning |
 |---|---|
-| `WBM_MODE` | `trace` (default): OpenGL with tracing. `native`: the game's own OpenGL calls are left untouched and only frame times are recorded. `metal`: the Metal renderer |
+| `WBM_MODE` | `metal` (default): the Metal renderer. `trace`: OpenGL with tracing. `native`: the game's own OpenGL calls are left untouched and only frame times are recorded |
 | `WBM_TRACE` | `1` traces the calls in Metal mode too, at a cost in frame rate. Off by default there |
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
 | `WBM_SCALE` | Metal mode: resolution multiplier for the screen and screen-sized render targets. Defaults to the display's scale (2 on Retina); `1` renders at the game's own resolution, as OpenGL does |
 | `WBM_CACHE` | Directory of the translated-shader cache. Default `~/Library/Caches/warband-metal`; `0` disables it |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
-| `WBM_OUT` | Output directory. `run.sh` sets it |
+| `WBM_OUT` | Output directory. `run.sh` sets it to `traces/<timestamp>`; otherwise `~/Library/Logs/warband-metal` |
 | `WBM_TRACE_FRAMES` | Frames to log call by call and capture, for example `1-3,600` |
 | `WBM_GLERR` | `1` checks `glGetError` after every setup call |
 | `WBM_LOG_MAX_MB` | Size limit of `trace.log` outside call-by-call frames. Default 256 |

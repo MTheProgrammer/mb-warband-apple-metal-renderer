@@ -4,7 +4,8 @@ The scene used to compare renderers: **Native module, Custom Battle, map "Villag
 
 Run it the same way each time:
 
-    WBM_MODULE=Native WBM_MODE=native scripts/run.sh
+    WBM_MODULE=Native WBM_MODE=native scripts/run.sh    # OpenGL
+    WBM_MODULE=Native scripts/run.sh                    # Metal
 
 then read the battle seconds out of `traces/latest/fps.log`. The game limits itself to `max_framerate` from `~/Library/Application Support/MBWarband/rgl_config.txt` (120 here), so only the seconds below that limit carry information unless the limit is raised.
 

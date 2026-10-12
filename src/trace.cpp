@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -384,6 +385,12 @@ void wb_write_summary()
 
 static void wb_init()
 {
+    // In any process other than the game (its launcher, when started by Steam)
+    // stay inert and leave the environment alone, so the game inherits the shim.
+    const char *exe = _dyld_get_image_name(0);
+    const char *base = exe ? strrchr(exe, '/') : nullptr;
+    if (strcmp(base ? base + 1 : "", "Mount and Blade") != 0) return;
+
     // Children of the game (crash reporters, Steam helpers) must not inherit the shim.
     unsetenv("DYLD_INSERT_LIBRARIES");
 

@@ -25,13 +25,15 @@ LIB  := build/libwbmetal.dylib
 
 all: $(LIB)
 
-# The rpath is relative to the game's executable, the only process the library
-# is loaded into, so the built file works on any Mac and in any location.
+# The rpath is relative to the game's executable, so the built file works on
+# any Mac and in any location. GLEW and SDL2 are linked weakly: when the game
+# is started through its own launcher (as Steam does), the library is loaded
+# into that launcher first, which has neither, and must load there harmlessly.
 # Linked under a temporary name and renamed, so that rebuilding does not
 # disturb a game that is running with the old library mapped.
 $(LIB): $(OBJS) $(DEPS)
 	$(CXX) -arch x86_64 -dynamiclib -mmacosx-version-min=11.0 -o $@.tmp $(OBJS) $(DEPS) \
-	    "$(GLEW)/GLEW" "$(SDL)/SDL2" $(FRAMEWORKS) \
+	    -Wl,-weak_library,"$(GLEW)/GLEW" -Wl,-weak_library,"$(SDL)/SDL2" $(FRAMEWORKS) \
 	    -Wl,-rpath,@executable_path/../Resources -install_name @rpath/libwbmetal.dylib
 	mv $@.tmp $@
 
