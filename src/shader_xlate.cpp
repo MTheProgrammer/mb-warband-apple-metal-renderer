@@ -8,6 +8,7 @@
 #include <glslang/Public/ShaderLang.h>
 #include <spirv_msl.hpp>
 
+#include <algorithm>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -130,15 +131,54 @@ bool smooth_alpha_tests(std::string &fs)
     return changed;
 }
 
+// The engine decodes texture colour itself, pow(sample.rgb, 2.2), after the
+// sample has been filtered. An sRGB texture format does it per texel before
+// filtering and with the exact curve. This removes the pow for every sampler
+// whose samples are all decoded that way and used in no other way, and
+// reports those samplers, which must then be given sRGB views.
+void decode_srgb_in_hardware(std::string &fs, std::vector<std::string> &samplers)
+{
+    static const std::regex decode(R"(pow \((\w+)\.xyz, vec3\(2\.2, 2\.2, 2\.2\)\))");
+    auto count = [&](const std::string &pattern) {
+        std::regex re(pattern);
+        return (int)std::distance(std::sregex_iterator(fs.begin(), fs.end(), re), std::sregex_iterator());
+    };
+    std::map<std::string, std::vector<std::string>> decoded; // sampler -> variables holding its decoded samples
+    std::set<std::string> rejected;
+    for (auto it = std::sregex_iterator(fs.begin(), fs.end(), decode); it != std::sregex_iterator(); ++it) {
+        std::string var = (*it)[1];
+        std::smatch m;
+        std::regex assign("\\b" + var + " = texture2D \\((\\w+), ");
+        if (!std::regex_search(fs, m, assign)) continue;
+        std::string sampler = m[1];
+        // The variable must be declared and assigned once, and read only as .w or inside the pow.
+        int uses = count("\\b" + var + "\\b");
+        int expected = 1 + count("\\bvec4 " + var + ";") + count("pow \\(" + var + "\\.xyz, vec3\\(2\\.2, 2\\.2, 2\\.2\\)\\)") +
+                       count("\\b" + var + "\\.w\\b");
+        if (uses != expected) rejected.insert(sampler);
+        auto &vars = decoded[sampler];
+        if (std::find(vars.begin(), vars.end(), var) == vars.end()) vars.push_back(var);
+    }
+    for (auto &entry : decoded) {
+        const std::string &sampler = entry.first;
+        if (rejected.count(sampler)) continue;
+        if (count("texture2D\\w* \\(" + sampler + ",") != (int)entry.second.size()) continue; // sampled some other way too
+        for (const std::string &var : entry.second)
+            fs = std::regex_replace(fs, std::regex("pow \\(" + var + "\\.xyz, vec3\\(2\\.2, 2\\.2, 2\\.2\\)\\)"), var + ".xyz");
+        samplers.push_back(sampler);
+    }
+}
+
 // Rewrites the declarations and built-ins that changed between GLSL 1.20 and
 // 4.50. Attributes and varyings get explicit locations so that the two stages
 // and the vertex descriptor agree without relying on declaration order.
 std::string modernise(const std::string &source, bool vertex, const std::map<std::string, int> &attribs, Varyings &varyings,
-                      const XlOptions &options, std::string &log)
+                      const XlOptions &options, std::vector<std::string> &srgb_samplers, std::string &log)
 {
     std::string glsl = source;
     bool soft_shadows = !vertex && options.soft_shadows && soften_shadows(glsl);
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
+    if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
@@ -190,8 +230,14 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     s = replace_word(s, "texture2DProj", "textureProj");
     s = replace_word(s, "texture2D", "texture");
     if (vertex) {
-        size_t end = s.rfind('}'); // main is the last function the optimiser emits
-        if (end != std::string::npos) s.insert(end, std::string("  gl_Position.y *= ") + k_xl_yflip_uniform + ";\n");
+        // Appended to main, the last function the optimiser emits: the Y flip, and
+        // the change from OpenGL's clip-space depth (-w..w) to Metal's (0..w),
+        // reversed if asked. SPIRV-Cross's own depth fix-up is turned off.
+        size_t end = s.rfind('}');
+        if (end != std::string::npos)
+            s.insert(end, std::string("  gl_Position.y *= ") + k_xl_yflip_uniform + ";\n  gl_Position.z = (" +
+                              (options.reverse_depth ? "gl_Position.w - gl_Position.z" : "gl_Position.z + gl_Position.w") +
+                              ") * 0.5;\n");
     } else {
         s = replace_word(s, "gl_FragColor", "wbm_FragColor");
     }
@@ -238,9 +284,6 @@ bool to_msl(const std::vector<uint32_t> &spirv, bool vertex, XlStage &stage, std
         options.platform = spirv_cross::CompilerMSL::Options::macOS;
         options.set_msl_version(2, 3);
         msl.set_msl_options(options);
-        auto common = msl.get_common_options();
-        common.vertex.fixup_clipspace = true; // OpenGL clip-space Z is -w..w, Metal's is 0..w
-        msl.set_common_options(common);
 
         stage.msl = msl.compile();
         stage.entry = msl.get_cleansed_entry_point_name("main", vertex ? spv::ExecutionModelVertex : spv::ExecutionModelFragment);
@@ -289,8 +332,8 @@ XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,
 {
     XlProgram p;
     Varyings varyings;
-    std::string vs = modernise(vs_glsl, true, attrib_locations, varyings, options, p.log);
-    std::string fs = modernise(fs_glsl, false, attrib_locations, varyings, options, p.log);
+    std::string vs = modernise(vs_glsl, true, attrib_locations, varyings, options, p.vs.srgb_samplers, p.log);
+    std::string fs = modernise(fs_glsl, false, attrib_locations, varyings, options, p.fs.srgb_samplers, p.log);
     std::vector<uint32_t> vs_spirv, fs_spirv;
     p.ok = to_spirv(EShLangVertex, vs, vs_spirv, p.log) && to_spirv(EShLangFragment, fs, fs_spirv, p.log) &&
            to_msl(vs_spirv, true, p.vs, p.log) && to_msl(fs_spirv, false, p.fs, p.log);

@@ -31,6 +31,7 @@ struct XlStage {
     std::vector<XlUniform> uniforms;
     std::vector<XlSampler> samplers;
     std::vector<int> input_locations; // vertex stage: attribute locations the shader reads
+    std::vector<std::string> srgb_samplers; // fragment stage: samplers that need an sRGB view bound
 };
 
 struct XlProgram {
@@ -47,6 +48,14 @@ struct XlOptions {
     // Turn alpha tests (discard below a threshold) into partial coverage of a
     // multisampled pixel, so cut-out edges are smoothed like geometry edges.
     bool smooth_alpha_test = false;
+    // Map depth so that far is 0 and near is 1. With a floating-point depth
+    // buffer this spreads precision evenly instead of crowding it at the near
+    // plane. The backend must then reverse its depth comparisons and clear to 0.
+    bool reverse_depth = false;
+    // Drop the shader's own pow(colour, 2.2) on texture samples, leaving the
+    // decode to the GPU through an sRGB view of the texture. The samplers this
+    // was done for are listed in XlStage::srgb_samplers.
+    bool srgb_textures = false;
 };
 
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space

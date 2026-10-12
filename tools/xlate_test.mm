@@ -1,8 +1,9 @@
 // Translates every program recorded in a trace directory and compiles the
-// result with Metal. Usage: xlate_test <trace-dir> [-v] [-s] [-a] [-d program-id]
+// result with Metal. Usage: xlate_test <trace-dir> [-v] [-s] [-a] [-z] [-g] [-d program-id]
 //   -v  print the log of failing programs      -d  dump one program's sources
 //   -s  translate with soft shadows; also reports how many programs it changed
 //   -a  translate with smoothed alpha tests; likewise
+//   -z  translate with reversed depth          -g  with hardware sRGB decoding; reports samplers changed
 
 #include "../src/shader_xlate.h"
 
@@ -26,12 +27,14 @@ int main(int argc, char **argv)
     std::string dir = argv[1];
     bool verbose = false;
     XlOptions options;
-    int softened = 0, smoothed = 0;
+    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0;
     int dump = -1;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = true;
         if (!strcmp(argv[i], "-s")) options.soft_shadows = true;
         if (!strcmp(argv[i], "-a")) options.smooth_alpha_test = true;
+        if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
+        if (!strcmp(argv[i], "-g")) options.srgb_textures = true;
         if (!strcmp(argv[i], "-d") && i + 1 < argc) dump = atoi(argv[++i]);
     }
     const std::map<std::string, int> attribs = {{"inPosition", 0}, {"inNormal", 1},   {"inColor0", 2},
@@ -47,6 +50,8 @@ int main(int argc, char **argv)
         XlProgram p = xl_translate(slurp(dir + "/" + vs), slurp(dir + "/" + fs), attribs, options);
         softened += p.fs.msl.find("wbm_shadow") != std::string::npos;
         smoothed += p.fs.msl.find("wbm_cover") != std::string::npos;
+        srgb_programs += !p.fs.srgb_samplers.empty();
+        srgb_samplers += (int)p.fs.srgb_samplers.size();
         std::string error = p.ok ? p.log : "translation failed:\n" + p.log;
         if (p.ok) {
             for (const XlStage *stage : {&p.vs, &p.fs}) {
@@ -92,5 +97,6 @@ int main(int argc, char **argv)
     printf("%d programs, %d failed\n", total, failed);
     if (options.soft_shadows) printf("%d programs use the soft shadow filter\n", softened);
     if (options.smooth_alpha_test) printf("%d programs have smoothed alpha tests\n", smoothed);
+    if (options.srgb_textures) printf("%d programs decode %d samplers through sRGB views\n", srgb_programs, srgb_samplers);
     return failed != 0;
 }

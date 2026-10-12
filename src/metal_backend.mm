@@ -42,6 +42,7 @@ struct Texture {
     int scale = 1;      // storage is this many times the size the game asked for (see s_scale)
     bool screen_sized = false; // a render target the size of the screen: scaled, and multisampled if that is on
     id<MTLTexture> ms;         // multisampled companion that is rendered into; `mtl` receives the resolve
+    id<MTLTexture> srgb_view;  // the same storage read through an sRGB format, made on demand
     // sampler parameters, with OpenGL's defaults
     GLenum min_filter = GL_NEAREST_MIPMAP_LINEAR, mag_filter = GL_LINEAR, wrap_s = GL_REPEAT, wrap_t = GL_REPEAT;
     float anisotropy = 1;
@@ -84,6 +85,7 @@ struct UniformLocation {
     std::string name;
     const XlUniform *uniform[2] = {nullptr, nullptr}; // per stage: vertex, fragment
     int texture_index[2] = {-1, -1};                  // set for samplers
+    bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
 
@@ -104,6 +106,12 @@ struct Program {
     id<MTLFunction> function[2]; // set from compile[] the first time the program draws
     bool functions_ready = false;
     std::vector<uint8_t> uniform_data[2];
+    // Where each stage's uniform block was last copied for the GPU. It is
+    // copied again only after a value changed or a new frame began.
+    bool uniform_dirty[2] = {true, true};
+    id<MTLBuffer> pushed_buffer[2];
+    NSUInteger pushed_offset[2] = {0, 0};
+    uint64_t pushed_frame[2] = {0, 0};
     std::vector<UniformLocation> locations;
     std::unordered_map<std::string, GLint> location_by_name;
     int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
@@ -190,6 +198,43 @@ GLenum s_depth_func = GL_LESS, s_cull_face = GL_BACK, s_polygon_mode = GL_FILL;
 GLenum s_blend_src = GL_ONE, s_blend_dst = GL_ZERO, s_blend_eq = GL_FUNC_ADD;
 
 XlOptions s_shader_options; // set once in mtl_attach_window, from the environment
+bool s_reverse_depth;       // mirrors s_shader_options.reverse_depth
+
+// What the open render pass already has set, so that a draw only issues the
+// Metal calls whose values changed since the previous draw (WBM_STATE_CACHE=0
+// turns the skipping off). Cleared whenever a pass starts.
+struct PassState {
+    void *pipeline, *depth_state;
+    double viewport[4];
+    int winding, cull, fill; // -1 while unknown
+    void *texture[2][16], *sampler[2][16];
+    void *buffer[2][31];
+    NSUInteger offset[2][31];
+};
+PassState s_set;
+bool s_state_cache = true;
+uint64_t s_frame_serial = 1; // counts presented frames; uniform storage is per frame
+GLuint s_last_key_program;   // the previous draw's pipeline, reused while its key repeats
+PipelineKey s_last_key;
+id<MTLRenderPipelineState> s_last_pipeline;
+struct {
+    uint64_t made, skipped, uniform_copies, uniform_reuses;
+} s_call_stats;
+
+void reset_pass_state()
+{
+    memset(&s_set, 0, sizeof s_set);
+    s_set.winding = s_set.cull = s_set.fill = -1;
+    s_set.viewport[2] = -1;
+}
+
+// True when the value is already set in this pass and the call can be skipped.
+bool already(bool same)
+{
+    if (same && s_state_cache) return s_call_stats.skipped++, true;
+    return s_call_stats.made++, false;
+}
+
 std::unordered_map<std::string, std::shared_ptr<StageCompile>> s_stage_compiles; // by MSL source
 struct {
     int links, cache_hits, stage_compiles;
@@ -341,9 +386,10 @@ void start_pass(const Target &t, GLbitfield clear_mask)
         d.depthAttachment.texture = t.depth;
         d.depthAttachment.loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
         d.depthAttachment.storeAction = MTLStoreActionStore;
-        d.depthAttachment.clearDepth = 1.0;
+        d.depthAttachment.clearDepth = s_reverse_depth ? 0.0 : 1.0; // the far plane
     }
     s_pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    reset_pass_state();
     s_pass_color = t.color;
     s_pass_depth = t.depth;
     s_pass_screen = t.screen;
@@ -480,12 +526,14 @@ bool ensure_storage(Texture &t, const FormatInfo &f, int level, int w, int h)
     const MTLTextureSwizzleChannels none = MTLTextureSwizzleChannelsDefault;
     bool swizzled = memcmp(&f.swizzle, &none, sizeof none) != 0;
     d.usage = (f.block_bytes || swizzled) ? MTLTextureUsageShaderRead : MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    if (s_shader_options.srgb_textures && !swizzled) d.usage |= MTLTextureUsagePixelFormatView;
     d.swizzle = f.swizzle;
     t.mtl = [s_device newTextureWithDescriptor:d];
     t.format = f.format;
     t.top_level = -1;
     t.sampler = nil;
     t.ms = nil;
+    t.srgb_view = nil;
     return t.mtl != nil;
 }
 
@@ -502,6 +550,23 @@ MTLSamplerAddressMode address_mode(GLenum wrap)
     case GL_CLAMP_TO_BORDER: return MTLSamplerAddressModeClampToBorderColor;
     default: return MTLSamplerAddressModeClampToEdge;
     }
+}
+
+// The texture seen through the sRGB twin of its format, or nil if it has none.
+id<MTLTexture> srgb_view_for(Texture &t)
+{
+    if (t.srgb_view) return t.srgb_view;
+    MTLPixelFormat format;
+    switch (t.format) {
+    case MTLPixelFormatBC1_RGBA: format = MTLPixelFormatBC1_RGBA_sRGB; break;
+    case MTLPixelFormatBC2_RGBA: format = MTLPixelFormatBC2_RGBA_sRGB; break;
+    case MTLPixelFormatBC3_RGBA: format = MTLPixelFormatBC3_RGBA_sRGB; break;
+    case MTLPixelFormatRGBA8Unorm: format = MTLPixelFormatRGBA8Unorm_sRGB; break;
+    case MTLPixelFormatBGRA8Unorm: format = MTLPixelFormatBGRA8Unorm_sRGB; break;
+    default: return nil;
+    }
+    if (!(t.mtl.usage & MTLTextureUsagePixelFormatView)) return nil;
+    return t.srgb_view = [t.mtl newTextureViewWithPixelFormat:format];
 }
 
 id<MTLSamplerState> sampler_for(Texture &t)
@@ -542,6 +607,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = -1;
+    s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
     std::string vs, fs;
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
     bool from_cache = false;
@@ -594,6 +660,9 @@ void link_program(GLuint program_id, Program &p)
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
+        for (const std::string &name : stages[s]->srgb_samplers) location(name).srgb = true;
+        p.uniform_dirty[s] = true;
+        p.pushed_frame[s] = 0;
     }
     p.input_mask = 0;
     for (int loc : p.xl.vs.input_locations)
@@ -637,14 +706,23 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
         uint8_t *dst = p->uniform_data[s].data() + u->offset;
         const uint32_t *src = (const uint32_t *)data;
         for (int i = 0; i < n; i++, dst += stride, src += components) {
-            if (u->is_int == data_is_int) {
-                memcpy(dst, src, (size_t)words * 4);
-            } else if (data_is_int) {
-                float v = (float)*(const GLint *)src;
-                memcpy(dst, &v, 4);
-            } else {
-                GLint v = (GLint) * (const GLfloat *)src;
-                memcpy(dst, &v, 4);
+            uint32_t converted;
+            const void *value = src;
+            size_t bytes = (size_t)words * 4;
+            if (u->is_int != data_is_int) {
+                if (data_is_int) {
+                    float v = (float)*(const GLint *)src;
+                    memcpy(&converted, &v, 4);
+                } else {
+                    GLint v = (GLint) * (const GLfloat *)src;
+                    memcpy(&converted, &v, 4);
+                }
+                value = &converted;
+                bytes = 4;
+            }
+            if (memcmp(dst, value, bytes) != 0) { // the engine re-sends unchanged values for every draw
+                memcpy(dst, value, bytes);
+                p->uniform_dirty[s] = true;
             }
         }
     }
@@ -799,11 +877,34 @@ id<MTLDepthStencilState> depth_state(bool has_depth)
                                                       MTLCompareFunctionGreater,      MTLCompareFunctionNotEqual,
                                                       MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways};
         MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
-        d.depthCompareFunction = compare[func];
+        // With reversed depth nearer is larger, so the ordering comparisons swap.
+        static const unsigned reversed[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+        d.depthCompareFunction = compare[s_reverse_depth ? reversed[func] : func];
         d.depthWriteEnabled = s_depth_mask;
         state = [s_device newDepthStencilStateWithDescriptor:d];
     }
     return state;
+}
+
+// Binds a buffer to a vertex (stage 0) or fragment (stage 1) slot, doing only
+// as much as changed: nothing, the offset alone, or the whole binding.
+void bind_buffer(int stage, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index)
+{
+    void *identity = (__bridge void *)buffer;
+    bool same_buffer = index < 31 && s_set.buffer[stage][index] == identity;
+    if (already(same_buffer && s_set.offset[stage][index] == offset)) return;
+    if (same_buffer && s_state_cache) {
+        if (stage == 0) [s_pass setVertexBufferOffset:offset atIndex:index];
+        else [s_pass setFragmentBufferOffset:offset atIndex:index];
+    } else if (stage == 0) {
+        [s_pass setVertexBuffer:buffer offset:offset atIndex:index];
+    } else {
+        [s_pass setFragmentBuffer:buffer offset:offset atIndex:index];
+    }
+    if (index < 31) {
+        s_set.buffer[stage][index] = identity;
+        s_set.offset[stage][index] = offset;
+    }
 }
 
 // Binds everything a draw needs. Returns false when the draw has to be skipped.
@@ -827,59 +928,97 @@ bool prepare_draw()
         key.blend_dst = (uint16_t)s_blend_dst;
         key.blend_eq = (uint16_t)s_blend_eq;
     }
-    id<MTLRenderPipelineState> pipeline = pipeline_for(*p, key);
+    id<MTLRenderPipelineState> pipeline;
+    if (s_state_cache && s_last_key_program == s_program && s_last_key == key) {
+        pipeline = s_last_pipeline;
+    } else {
+        pipeline = pipeline_for(*p, key);
+        s_last_key_program = s_program;
+        s_last_key = key;
+        s_last_pipeline = pipeline;
+    }
     if (!pipeline) return false;
-    [s_pass setRenderPipelineState:pipeline];
-    [s_pass setDepthStencilState:depth_state(s_pass_depth != nil)];
+    if (!already(s_set.pipeline == (__bridge void *)pipeline)) {
+        [s_pass setRenderPipelineState:pipeline];
+        s_set.pipeline = (__bridge void *)pipeline;
+    }
+    id<MTLDepthStencilState> depth = depth_state(s_pass_depth != nil);
+    if (!already(s_set.depth_state == (__bridge void *)depth)) {
+        [s_pass setDepthStencilState:depth];
+        s_set.depth_state = (__bridge void *)depth;
+    }
 
     // Textures are rendered upside down so that their rows are stored in OpenGL's
     // order (see wbm_yflip in shader_xlate.h). That mirrors the winding, and the
     // viewport then counts from the top like Metal's own.
     bool flip = !s_pass_screen;
     double target_h = s_pass_color ? (double)s_pass_color.height : (double)s_pass_depth.height;
-    double k = s_pass_scale, vx = s_viewport.x * k, vy = s_viewport.y * k, vw = s_viewport.w * k, vh = s_viewport.h * k;
-    [s_pass setViewport:(MTLViewport){vx, flip ? vy : target_h - vy - vh, vw, vh, 0.0, 1.0}];
-    [s_pass setFrontFacingWinding:flip ? MTLWindingClockwise : MTLWindingCounterClockwise];
-    [s_pass setCullMode:!s_cull ? MTLCullModeNone : s_cull_face == GL_FRONT ? MTLCullModeFront : MTLCullModeBack];
-    [s_pass setTriangleFillMode:s_polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-
-    if (p->samples_offset >= 0) {
-        float samples = (float)s_pass_samples;
-        memcpy(p->uniform_data[1].data() + p->samples_offset, &samples, 4);
+    double k = s_pass_scale, vw = s_viewport.w * k, vh = s_viewport.h * k;
+    double viewport[4] = {s_viewport.x * k, flip ? s_viewport.y * k : target_h - s_viewport.y * k - vh, vw, vh};
+    if (!already(!memcmp(viewport, s_set.viewport, sizeof viewport))) {
+        [s_pass setViewport:(MTLViewport){viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0}];
+        memcpy(s_set.viewport, viewport, sizeof viewport);
     }
-    if (p->yflip_offset >= 0) {
-        float yflip = flip ? -1.0f : 1.0f;
+    int winding = flip ? MTLWindingClockwise : MTLWindingCounterClockwise;
+    if (!already(s_set.winding == winding)) [s_pass setFrontFacingWinding:(MTLWinding)(s_set.winding = winding)];
+    int cull = !s_cull ? MTLCullModeNone : s_cull_face == GL_FRONT ? MTLCullModeFront : MTLCullModeBack;
+    if (!already(s_set.cull == cull)) [s_pass setCullMode:(MTLCullMode)(s_set.cull = cull)];
+    int fill = s_polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+    if (!already(s_set.fill == fill)) [s_pass setTriangleFillMode:(MTLTriangleFillMode)(s_set.fill = fill)];
+
+    float samples = (float)s_pass_samples, yflip = flip ? -1.0f : 1.0f;
+    if (p->samples_offset >= 0 && memcmp(p->uniform_data[1].data() + p->samples_offset, &samples, 4)) {
+        memcpy(p->uniform_data[1].data() + p->samples_offset, &samples, 4);
+        p->uniform_dirty[1] = true;
+    }
+    if (p->yflip_offset >= 0 && memcmp(p->uniform_data[0].data() + p->yflip_offset, &yflip, 4)) {
         memcpy(p->uniform_data[0].data() + p->yflip_offset, &yflip, 4);
+        p->uniform_dirty[0] = true;
     }
     const XlStage *stages[2] = {&p->xl.vs, &p->xl.fs};
     for (int s = 0; s < 2; s++) {
         if (stages[s]->uniform_buffer_index < 0 || p->uniform_data[s].empty()) continue;
-        NSUInteger offset;
-        id<MTLBuffer> buffer = push_uniforms(p->uniform_data[s], &offset);
-        if (s == 0) [s_pass setVertexBuffer:buffer offset:offset atIndex:(NSUInteger)stages[s]->uniform_buffer_index];
-        else [s_pass setFragmentBuffer:buffer offset:offset atIndex:(NSUInteger)stages[s]->uniform_buffer_index];
+        if (!s_state_cache || p->uniform_dirty[s] || p->pushed_frame[s] != s_frame_serial) {
+            p->pushed_buffer[s] = push_uniforms(p->uniform_data[s], &p->pushed_offset[s]);
+            p->pushed_frame[s] = s_frame_serial;
+            p->uniform_dirty[s] = false;
+            s_call_stats.uniform_copies++;
+        } else {
+            s_call_stats.uniform_reuses++;
+        }
+        bind_buffer(s, p->pushed_buffer[s], p->pushed_offset[s], (NSUInteger)stages[s]->uniform_buffer_index);
     }
     for (UniformLocation &l : p->locations) {
         for (int s = 0; s < 2; s++) {
-            if (l.texture_index[s] < 0) continue;
+            int index = l.texture_index[s];
+            if (index < 0) continue;
             Texture *t = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
             id<MTLTexture> texture = t && t->mtl ? t->mtl : s_white;
             id<MTLSamplerState> sampler = t && t->mtl ? sampler_for(*t) : s_samplers.begin()->second;
-            if (s == 0) {
-                [s_pass setVertexTexture:texture atIndex:(NSUInteger)l.texture_index[s]];
-                [s_pass setVertexSamplerState:sampler atIndex:(NSUInteger)l.texture_index[s]];
-            } else {
-                [s_pass setFragmentTexture:texture atIndex:(NSUInteger)l.texture_index[s]];
-                [s_pass setFragmentSamplerState:sampler atIndex:(NSUInteger)l.texture_index[s]];
+            if (l.srgb && t && t->mtl) {
+                // The shader no longer decodes this sampler's colour itself.
+                if (id<MTLTexture> view = srgb_view_for(*t)) texture = view;
+                else complain("a texture without an sRGB format is bound to %s; it will look too bright", l.name.c_str());
+            }
+            bool tracked = index < 16;
+            if (!already(tracked && s_set.texture[s][index] == (__bridge void *)texture)) {
+                if (s == 0) [s_pass setVertexTexture:texture atIndex:(NSUInteger)index];
+                else [s_pass setFragmentTexture:texture atIndex:(NSUInteger)index];
+                if (tracked) s_set.texture[s][index] = (__bridge void *)texture;
+            }
+            if (!already(tracked && s_set.sampler[s][index] == (__bridge void *)sampler)) {
+                if (s == 0) [s_pass setVertexSamplerState:sampler atIndex:(NSUInteger)index];
+                else [s_pass setFragmentSamplerState:sampler atIndex:(NSUInteger)index];
+                if (tracked) s_set.sampler[s][index] = (__bridge void *)sampler;
             }
         }
     }
     for (int slot = 0; slot < binding.slots; slot++) {
         Buffer *b = find(s_buffers, binding.buffer[slot]);
         if (!b || !b->mtl) return false;
-        [s_pass setVertexBuffer:b->mtl offset:binding.base[slot] atIndex:(NSUInteger)(VERTEX_SLOT_BASE + slot)];
+        bind_buffer(0, b->mtl, binding.base[slot], (NSUInteger)(VERTEX_SLOT_BASE + slot));
     }
-    [s_pass setVertexBuffer:s_constant_attrib offset:0 atIndex:CONSTANT_SLOT];
+    bind_buffer(0, s_constant_attrib, 0, CONSTANT_SLOT);
     return true;
 }
 
@@ -934,6 +1073,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     const char *shadows_env = getenv("WBM_SHADOWS"); // on unless set to 0
     s_shader_options.soft_shadows = !(shadows_env && atoi(shadows_env) == 0);
     const char *msaa_env = getenv("WBM_MSAA");
+    const char *reverse_env = getenv("WBM_REVERSE_Z"), *srgb_env = getenv("WBM_SRGB"), *cache_env = getenv("WBM_STATE_CACHE");
+    s_reverse_depth = s_shader_options.reverse_depth = !(reverse_env && atoi(reverse_env) == 0); // on unless set to 0
+    s_shader_options.srgb_textures = srgb_env && atoi(srgb_env) != 0;                            // off unless set
+    s_state_cache = !(cache_env && atoi(cache_env) == 0);
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -975,8 +1118,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     };
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
-    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling", width, height,
-            width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa);
+    wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
+            "reversed depth %s; sRGB textures %s; state cache %s",
+            width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
+            s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off");
 }
 
 const char *mtl_device_name()
@@ -990,6 +1135,10 @@ void mtl_dump_stats(FILE *f)
             s_shader_stats.cache_hits, s_shader_stats.translate_ms);
     fprintf(f, "%d distinct shaders compiled by Metal in the background, %.0f ms spent waiting for them at draws\n",
             s_shader_stats.stage_compiles, s_shader_stats.wait_ms);
+    fprintf(f, "\n== Metal state changes ==\n%llu state-setting calls made, %llu skipped as unchanged\n",
+            (unsigned long long)s_call_stats.made, (unsigned long long)s_call_stats.skipped);
+    fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
+            (unsigned long long)s_call_stats.uniform_reuses);
 }
 
 void mtl_set_vsync(bool on)
@@ -1042,6 +1191,7 @@ void mtl_present(bool capture, uint32_t frame)
         }
         s_cmd = nil;
         s_drawable = nil;
+        s_frame_serial++;
     }
 }
 
@@ -1410,7 +1560,11 @@ void mtl_glLinkProgram(GLuint program)
 }
 
 void mtl_glDeleteShader(GLuint shader) { s_shaders.erase(shader); } // programs keep their own reference
-void mtl_glDeleteProgram(GLuint program) { s_programs.erase(program); }
+void mtl_glDeleteProgram(GLuint program)
+{
+    s_programs.erase(program);
+    s_last_key_program = 0;
+}
 void mtl_glUseProgram(GLuint program) { s_program = program; }
 
 // Compile and link status are always reported as success: a program that

@@ -85,6 +85,9 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_VSYNC` | Overrides the swap interval. `0` asks for an uncapped frame rate |
 | `WBM_SCALE` | Metal mode: resolution multiplier for the screen and screen-sized render targets. Defaults to the display's scale (2 on Retina); `1` renders at the game's own resolution, as OpenGL does |
 | `WBM_MSAA` | Metal mode: samples per pixel for the screen and screen-sized render targets, `2` or `4`. Smooths geometry edges, and alpha-tested edges (foliage, hair, fur) through a rewrite of the shaders' alpha tests. Default `4`; `1` turns it off |
+| `WBM_REVERSE_Z` | Metal mode: `0` uses the conventional depth mapping. By default depth is reversed (far is 0), which spreads the float depth buffer's precision evenly and avoids flicker between distant, nearly coplanar surfaces |
+| `WBM_SRGB` | Metal mode: `1` removes the shaders' own `pow(colour, 2.2)` on texture samples and binds sRGB views of the textures instead, for an exact decode before filtering. Off by default: it shifts dark tones slightly |
+| `WBM_STATE_CACHE` | Metal mode: `0` issues every state-setting Metal call on every draw, as a baseline for measuring the saving. By default calls whose value is unchanged within a render pass are skipped |
 | `WBM_SHADOWS` | Metal mode: `0` keeps the game's own 4-sample shadow filter. By default shadows are filtered over a 4x4 block of shadow-map texels, for softer edges |
 | `WBM_CACHE` | Directory of the translated-shader cache. Default `~/Library/Caches/warband-metal`; `0` disables it |
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
@@ -107,7 +110,7 @@ In Metal mode the window is created without an OpenGL surface and gets a `CAMeta
 
 Shaders are translated when a program is linked (`src/shader_xlate.cpp`), and the result is cached on disk (`src/shader_cache.cpp`), so later launches skip the translation. Metal then compiles the translated source in the background; a program waits for that only if it draws before its shaders are ready. The translation itself: the engine's GLSL 1.20 is rewritten to GLSL 4.50, compiled to SPIR-V by glslang and turned into Metal Shading Language by SPIRV-Cross. `make build/xlate_test && build/xlate_test traces/latest` runs that translation over every program a trace recorded and compiles the results with Metal.
 
-The translation step can also change what a shader computes. The engine's shadow filter is recognised by its shape and replaced with a wider one (`soften_shadows` in `src/shader_xlate.cpp`). With multisampling on it also rewrites alpha tests into per-sample coverage (`smooth_alpha_tests`). `build/xlate_test traces/latest -s -a` checks that every program still compiles with both on.
+The translation step can also change what a shader computes. The engine's shadow filter is recognised by its shape and replaced with a wider one (`soften_shadows` in `src/shader_xlate.cpp`). With multisampling on it also rewrites alpha tests into per-sample coverage (`smooth_alpha_tests`). Two more rewrites are optional: reversed depth (the clip-space mapping appended to every vertex shader) and hardware sRGB decoding (`decode_srgb_in_hardware`). `build/xlate_test traces/latest -s -a -z -g` checks that every program still compiles with all of them on.
 
 Render-to-texture passes are drawn upside down, so that textures keep OpenGL's row order and the game's texture coordinates work unchanged.
 

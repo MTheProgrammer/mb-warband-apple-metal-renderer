@@ -16,7 +16,7 @@ namespace {
 
 // Bump when the translation changes (the rewriter, its options, or the
 // versions of glslang and SPIRV-Cross), so that stale entries are ignored.
-const char k_version[] = "wbx-3 glslang-15.1.0 spirv-cross-1.4.304.0";
+const char k_version[] = "wbx-4 glslang-15.1.0 spirv-cross-1.4.304.0";
 const uint32_t k_magic = 0x31584257; // "WBX1"
 
 uint64_t fnv(const std::string &s, uint64_t h)
@@ -89,6 +89,8 @@ void write_stage(Writer &w, const XlStage &s)
     }
     w.u32((uint32_t)s.input_locations.size());
     for (int l : s.input_locations) w.u32((uint32_t)l);
+    w.u32((uint32_t)s.srgb_samplers.size());
+    for (const std::string &name : s.srgb_samplers) w.str(name);
 }
 
 void read_stage(Reader &r, XlStage &s)
@@ -115,6 +117,7 @@ void read_stage(Reader &r, XlStage &s)
         s.samplers.push_back(m);
     }
     for (uint32_t n = r.u32(); n && r.ok; n--) s.input_locations.push_back((int)r.u32());
+    for (uint32_t n = r.u32(); n && r.ok; n--) s.srgb_samplers.push_back(r.str());
 }
 
 bool load(const std::string &path, XlProgram &p)
@@ -161,6 +164,8 @@ XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_
     for (auto &a : attrib_locations) key += a.first + "=" + std::to_string(a.second) + ";";
     key += std::string("\0soft_shadows=", 14) + (options.soft_shadows ? "1" : "0");
     key += std::string("\0smooth_alpha_test=", 19) + (options.smooth_alpha_test ? "1" : "0");
+    key += std::string("\0reverse_depth=", 15) + (options.reverse_depth ? "1" : "0");
+    key += std::string("\0srgb_textures=", 15) + (options.srgb_textures ? "1" : "0");
     char name[40];
     snprintf(name, sizeof name, "/%016llx%016llx.wbx", (unsigned long long)fnv(key, 0xcbf29ce484222325ull),
              (unsigned long long)fnv(key, 0x84222325cbf29ce4ull));
