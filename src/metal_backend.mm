@@ -346,10 +346,15 @@ bool s_materials;
 std::unordered_map<uint64_t, uint8_t> s_material_by_content; // filled once at start, read-only afterwards
 struct {
     std::atomic<int> uploads{0}, matched{0}, recognised{0}, strangers{0};
-    int files = 0, classed[MAT_COUNT] = {};
+    int files = 0, classed[MAT_COUNT] = {}, dumped = 0;
 } s_material_stats;
 
-uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t size)
+// alpha: 0 for DXT1, 3 for DXT3, 5 for DXT5. The alpha half of a block is
+// left out of the key except for DXT5's two alpha values: the game's way of
+// turning the alpha indices upside down does not always give what turning the
+// image does (measured: a few bits differ in some blocks), so they cannot be
+// predicted from the file.
+uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t size, int alpha)
 {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](const uint8_t *p, size_t n) {
@@ -357,7 +362,16 @@ uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t s
     };
     mix((const uint8_t *)&width, 4);
     mix((const uint8_t *)&height, 4);
-    mix((const uint8_t *)data, std::min<size_t>(size, 1024));
+    const uint8_t *p = (const uint8_t *)data;
+    size = std::min<size_t>(size, 1024);
+    if (!alpha) {
+        mix(p, size);
+    } else {
+        for (size_t b = 0; b + 16 <= size; b += 16) {
+            if (alpha == 5) mix(p + b, 2);
+            mix(p + b + 8, 8);
+        }
+    }
     return h;
 }
 
@@ -414,13 +428,14 @@ void scan_texture_folder(const std::string &dir)
             memcpy(&mips, header + 28, 4);
             memcpy(&fourcc, header + 84, 4);
             size_t block = !memcmp(&fourcc, "DXT1", 4) ? 8 : (!memcmp(&fourcc, "DXT3", 4) || !memcmp(&fourcc, "DXT5", 4)) ? 16 : 0;
+            int alpha = !memcmp(&fourcc, "DXT3", 4) ? 3 : !memcmp(&fourcc, "DXT5", 4) ? 5 : 0;
             long at = sizeof header;
             for (uint32_t level = 0; block && level < std::min<uint32_t>(std::max<uint32_t>(mips, 1), 4) && width && height; level++) {
                 size_t size = (size_t)((width + 3) / 4) * ((height + 3) / 4) * block;
                 uint8_t head[1024];
                 size_t want = std::min(size, sizeof head);
                 if (fseek(f, at, SEEK_SET) || fread(head, 1, want, f) != want) break;
-                s_material_by_content[content_key(width, height, head, want)] = (uint8_t)cls; // unknown ones too, to tell them from strangers
+                s_material_by_content[content_key(width, height, head, want, alpha)] = (uint8_t)cls; // unknown ones too, to tell them from strangers
                 // The game turns most textures upside down before handing them to
                 // OpenGL, whose rows run bottom to top: the rows of blocks in
                 // reverse order, and the four rows inside each block reversed too.
@@ -447,7 +462,7 @@ void scan_texture_folder(const std::string &dir)
                     }
                     if (ok) flipped.insert(flipped.end(), row.begin(), row.end());
                 }
-                if (ok && flipped.size() >= want) s_material_by_content[content_key(width, height, flipped.data(), want)] = (uint8_t)cls;
+                if (ok && flipped.size() >= want) s_material_by_content[content_key(width, height, flipped.data(), want, alpha)] = (uint8_t)cls;
                 at += (long)size;
                 width = std::max<uint32_t>(width / 2, 1);
                 height = std::max<uint32_t>(height / 2, 1);
@@ -3291,8 +3306,11 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
     @autoreleasepool {
         if (!ensure_storage(*t, f, level, width, height) || !data) return;
         if (s_materials && level == 0) {
-            auto it = s_material_by_content.find(content_key((uint32_t)width, (uint32_t)height, data, (size_t)imageSize));
-            t->material = it == s_material_by_content.end() ? (uint8_t)MAT_UNKNOWN : it->second;
+            int alpha = internalformat == 0x83F2 ? 3 : internalformat == 0x83F3 ? 5 : 0; // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, ..._DXT5_EXT
+            auto it = s_material_by_content.find(content_key((uint32_t)width, (uint32_t)height, data, (size_t)imageSize, alpha));
+            // The game loads some textures small first and in full later; whatever
+            // was recognised stays until something else is.
+            if (it != s_material_by_content.end()) t->material = it->second;
             s_material_stats.uploads++;
             if (it != s_material_by_content.end()) s_material_stats.matched++;
             else if (s_material_stats.strangers++ < 60 && imageSize >= 32) {
@@ -3300,6 +3318,16 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
                 char first[40], last[40];
                 for (int i = 0; i < 16; i++) snprintf(first + i * 2, 3, "%02x", b[i]), snprintf(last + i * 2, 3, "%02x", e[i]);
                 wb_note("material classes: no file matches a %dx%d %s texture of %d bytes, first %s last %s", width, height, E(internalformat), imageSize, first, last);
+                if (imageSize >= 16384 && s_material_stats.dumped < 12) { // a few of them whole, to compare with the files by hand
+                    if (const char *dir = getenv("WBM_OUT")) {
+                        char path[1200];
+                        snprintf(path, sizeof path, "%s/unmatched_%02d_%dx%d_%s.bin", dir, s_material_stats.dumped++, width, height, E(internalformat));
+                        if (FILE *out = fopen(path, "wb")) {
+                            fwrite(data, 1, (size_t)imageSize, out);
+                            fclose(out);
+                        }
+                    }
+                }
             }
             if (t->material) s_material_stats.recognised++;
         }
