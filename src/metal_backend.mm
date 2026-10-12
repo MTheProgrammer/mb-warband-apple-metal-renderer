@@ -2903,7 +2903,9 @@ bool prepare_draw()
                 const float *w = (const float *)(p->uniform_data[0].data() + p->u_world->offset);
                 phase = w[12] * 0.37f + w[13] * 0.71f;
             }
-            // A palm's leaves in their own space would need the same treatment; there the crown's height is not known. They are batched in practice.
+            // A palm's leaves are weighed whether batched or not: height above the
+            // foot says nothing about them, their crown being at the top of a trunk.
+            if (diffuse->radial_wind && vb && vb->mtl) batch = true;
             bool ready = !batch || weigh_foliage(*vb, diffuse->radial_wind);
             wind[0] = (float)s_wind_time, wind[1] = ready ? s_wind_strength : 0.0f, wind[2] = batch ? 1.0f : 0.0f, wind[3] = fmodf(phase, 6.2831853f);
             // Once a buffer's alpha holds heights, every shader has to be told, sway or not.
