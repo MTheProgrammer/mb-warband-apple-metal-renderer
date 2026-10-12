@@ -1,6 +1,8 @@
 #!/bin/sh
-# Launches Warband with the shim injected. No game file is modified.
-# Extra arguments are passed to the game. See README.md for the WBM_* variables.
+# Developer launcher: starts Warband with the freshly built library injected and
+# writes the run's log to traces/<timestamp>. No game file is modified. Extra
+# arguments are passed to the game. See README.md for the WBM_* variables;
+# WBM_MODE=trace or native selects the OpenGL modes, the default is Metal.
 set -e
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -12,7 +14,6 @@ LIB="$ROOT/build/libwbmetal.dylib"
 [ -f "$LIB" ] || { echo "shim not built: run make" >&2; exit 1; }
 pgrep -q steam_osx || echo "warning: Steam is not running; the game may refuse to start" >&2
 
-export WBM_MODE=${WBM_MODE:-trace}
 export WBM_OUT=${WBM_OUT:-"$ROOT/traces/$(date +%Y%m%d-%H%M%S)"}
 mkdir -p "$WBM_OUT"
 ln -sfn "$WBM_OUT" "$ROOT/traces/latest"

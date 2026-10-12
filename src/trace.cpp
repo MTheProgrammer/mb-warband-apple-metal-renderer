@@ -387,21 +387,28 @@ static void wb_init()
     // Children of the game (crash reporters, Steam helpers) must not inherit the shim.
     unsetenv("DYLD_INSERT_LIBRARIES");
 
+    // The default is what a player wants: Metal, no tracing. "trace" (OpenGL
+    // with tracing) and "native" (OpenGL untouched, frame times only) are for
+    // development and comparison.
     const char *mode = getenv("WBM_MODE");
-    if (mode && !strcmp(mode, "metal")) {
+    if (mode && !strcmp(mode, "trace")) {
+    } else if (mode && !strcmp(mode, "native")) {
+        g_native = true;
+    } else {
+        if (mode && *mode && strcmp(mode, "metal")) fprintf(stderr, "wbmetal: unknown WBM_MODE '%s', using metal\n", mode);
         g_metal = true;
-        const char *trace = getenv("WBM_TRACE"); // Metal runs untraced unless asked
+        const char *trace = getenv("WBM_TRACE");
         g_fast = !(trace && atoi(trace) != 0);
     }
-    else if (mode && !strcmp(mode, "native")) g_native = true;
-    else if (mode && strcmp(mode, "trace")) fprintf(stderr, "wbmetal: unknown WBM_MODE '%s', using trace\n", mode);
 
+    // Without WBM_OUT the log of the latest run goes where macOS keeps logs.
     const char *out = getenv("WBM_OUT");
-    s_out = out && *out ? out : "/tmp/wbmetal-" + std::to_string(getpid());
+    const char *home = getenv("HOME");
+    s_out = out && *out ? out : std::string(home ? home : "/tmp") + "/Library/Logs/warband-metal";
     mkdirs(s_out);
     char abs[PATH_MAX];
     if (realpath(s_out.c_str(), abs)) s_out = abs; // the game changes its working directory
-    mkdirs(s_out + "/shaders");
+    if (!g_fast && !g_native) mkdirs(s_out + "/shaders");
     mkdirs(s_out + "/frames");
     g_out_dir = s_out.c_str();
 

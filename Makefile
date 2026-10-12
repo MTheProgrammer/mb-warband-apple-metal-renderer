@@ -25,12 +25,14 @@ LIB  := build/libwbmetal.dylib
 
 all: $(LIB)
 
+# The rpath is relative to the game's executable, the only process the library
+# is loaded into, so the built file works on any Mac and in any location.
 # Linked under a temporary name and renamed, so that rebuilding does not
 # disturb a game that is running with the old library mapped.
 $(LIB): $(OBJS) $(DEPS)
 	$(CXX) -arch x86_64 -dynamiclib -mmacosx-version-min=11.0 -o $@.tmp $(OBJS) $(DEPS) \
 	    "$(GLEW)/GLEW" "$(SDL)/SDL2" $(FRAMEWORKS) \
-	    -Wl,-rpath,"$(RES)" -install_name @rpath/libwbmetal.dylib
+	    -Wl,-rpath,@executable_path/../Resources -install_name @rpath/libwbmetal.dylib
 	mv $@.tmp $@
 
 build/%.o: src/%.cpp $(HDRS) Makefile | build $(DEPS)
@@ -38,6 +40,25 @@ build/%.o: src/%.cpp $(HDRS) Makefile | build $(DEPS)
 
 build/%.o: src/%.mm $(HDRS) Makefile | build $(DEPS)
 	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -c $< -o $@
+
+# The double-clickable launcher: a script, with the library inside the bundle.
+APP := build/Warband Metal.app
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+app: $(LIB) launcher/warband-metal.sh launcher/Info.plist
+	rm -rf "$(APP)"
+	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
+	sed 's/@VERSION@/$(VERSION)/' launcher/Info.plist > "$(APP)/Contents/Info.plist"
+	cp launcher/warband-metal.sh "$(APP)/Contents/MacOS/warband-metal"
+	chmod +x "$(APP)/Contents/MacOS/warband-metal"
+	cp $(LIB) "$(APP)/Contents/Resources/"
+	strip -S "$(APP)/Contents/Resources/libwbmetal.dylib"  # drops debug info, which names build paths
+
+# The file to attach to a release.
+dist: app
+	rm -f "build/warband-metal-$(VERSION).zip"
+	cd build && ditto -c -k --keepParent "Warband Metal.app" "warband-metal-$(VERSION).zip"
+	@echo "build/warband-metal-$(VERSION).zip"
 
 # glslang and SPIRV-Cross, fetched into third_party/ and compiled without cmake.
 $(DEPS):
@@ -53,9 +74,10 @@ build:
 	mkdir -p build
 
 clean:
-	rm -f build/*.o build/*.dylib build/xlate_test
+	rm -f build/*.o build/*.dylib build/xlate_test build/*.zip
+	rm -rf "$(APP)"
 
 distclean:
 	rm -rf build
 
-.PHONY: all clean distclean
+.PHONY: all app dist clean distclean
