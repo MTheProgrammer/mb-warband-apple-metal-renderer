@@ -1,6 +1,6 @@
 # Benchmark scene and baseline
 
-The scene used to compare renderers: **Native module, Custom Battle, map "Village", 200 vs 200**.
+The scene used to compare renderers: **Native module, Custom Battle, map "Farmhouse", 200 vs 200**.
 
 Run it the same way each time:
 
