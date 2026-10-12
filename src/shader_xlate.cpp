@@ -15,6 +15,7 @@
 
 const char *const k_xl_yflip_uniform = "wbm_yflip";
 const char *const k_xl_samples_uniform = "wbm_samples";
+const char *const k_xl_headroom_uniform = "wbm_headroom";
 
 namespace {
 
@@ -281,6 +282,49 @@ bool add_pbr_environment(std::string &fs)
     return true;
 }
 
+// The engine's last post-processing shader adds bloom to the scene, applies
+// the exposure it measured, runs one of four tone-mapping operators chosen by
+// the module (none, exponential, Reinhard, extended Reinhard), and encodes the
+// result for display. Two optional changes are made just before the encode:
+//
+//   - filmic: ignore the engine's operator and map the exposed colour with the
+//     ACES filmic fit (Narkowicz), which keeps more contrast in mid-tones and
+//     rolls highlights off more gently than Reinhard.
+//   - HDR: the operators all end at 1.0, display white. For an extended-range
+//     drawable the top of that range is stretched towards the display's
+//     headroom: colour * (1 + (headroom - 1) * peak^6). Mid-tones barely move
+//     (peak 0.5 gains 5% at headroom 4) while values near white reach the full
+//     headroom, so the sun, fire and bright sky go brighter than the UI's white.
+const char k_tonemap_functions[] = R"(
+vec3 wbm_filmic(vec3 x)
+{
+    x *= 0.6;
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+vec3 wbm_expand(vec3 c, float headroom)
+{
+    vec3 g = clamp(c, 0.0, 1.0);
+    float peak = max(g.r, max(g.g, g.b));
+    return g * (1.0 + (max(headroom, 1.0) - 1.0) * pow(peak, 6.0));
+}
+)";
+
+// Returns true if this is the final shader and it was changed.
+bool rewrite_final_pass(std::string &fs, const XlOptions &options)
+{
+    static const std::regex first_branch(R"(if \(\(tonemapOp_\d+ < 1\.0\)\) \{\s*(final_color_\d+) = (tmpvar_\d+);)");
+    static const std::regex encode(R"(color_\d+\.xyz = pow \((final_color_\d+), output_gamma_inv\.xyz\);)");
+    std::smatch branch, enc;
+    if (!std::regex_search(fs, branch, first_branch) || !std::regex_search(fs, enc, encode)) return false;
+    std::string result = enc[1], exposed = branch[2];
+    if (result != std::string(branch[1])) return false;
+    std::string extra;
+    if (options.filmic_tonemap) extra += result + " = wbm_filmic(" + exposed + ");\n  ";
+    if (options.hdr_output) extra += result + " = wbm_expand(" + result + ", " + k_xl_headroom_uniform + ");\n  ";
+    fs.insert((size_t)enc.position(), extra);
+    return true;
+}
+
 // The engine decodes texture colour itself, pow(sample.rgb, 2.2), after the
 // sample has been filtered. An sRGB texture format does it per texel before
 // filtering and with the exact curve. This removes the pow for every sampler
@@ -331,6 +375,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment) && use_pbr_specular(glsl);
     bool pbr_environment = pbr_specular && options.pbr_environment && add_pbr_environment(glsl);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
+    bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
@@ -343,6 +388,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (soft_shadows) out << k_soft_shadow_function;
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
+    if (final_pass) out << k_tonemap_functions;
+    if (final_pass && options.hdr_output) out << "uniform float " << k_xl_headroom_uniform << ";\n";
     if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
 
     std::istringstream in(glsl);

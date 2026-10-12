@@ -64,6 +64,12 @@ struct XlOptions {
     // the base colour of metals, and add a reflection of a sky-and-ground
     // environment built from the scene's own light colours.
     bool pbr_environment = false;
+    // In the engine's final post-processing shader: replace its tone-mapping
+    // operator with a filmic curve.
+    bool filmic_tonemap = false;
+    // In the same shader: let the brightest parts of the image exceed display
+    // white, for an extended-range (HDR) drawable. Adds the wbm_headroom uniform.
+    bool hdr_output = false;
 };
 
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space
@@ -73,6 +79,10 @@ extern const char *const k_xl_yflip_uniform;
 // With smooth_alpha_test, fragment shaders that test alpha get a uniform,
 // wbm_samples, that must hold the sample count of the target being drawn to.
 extern const char *const k_xl_samples_uniform;
+
+// With hdr_output, the final shader gets a uniform, wbm_headroom: how many
+// times brighter than display white the screen can currently show (1 = none).
+extern const char *const k_xl_headroom_uniform;
 
 // attrib_locations: names given to glBindAttribLocation and their indices.
 XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,

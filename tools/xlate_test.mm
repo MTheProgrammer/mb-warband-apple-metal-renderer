@@ -1,10 +1,11 @@
 // Translates every program recorded in a trace directory and compiles the
-// result with Metal. Usage: xlate_test <trace-dir> [-v] [-s] [-a] [-z] [-g] [-p] [-e] [-d program-id]
+// result with Metal. Usage: xlate_test <trace-dir> [-v] [-s] [-a] [-z] [-g] [-p] [-e] [-t] [-r] [-d program-id]
 //   -v  print the log of failing programs      -d  dump one program's sources
 //   -s  translate with soft shadows; also reports how many programs it changed
 //   -a  translate with smoothed alpha tests; likewise
 //   -p  translate with microfacet specular highlights; reports programs changed
 //   -e  also with estimated metalness and environment reflection; likewise
+//   -t  with the filmic tone map               -r  with extended-range output; reports final shaders changed
 //   -z  translate with reversed depth          -g  with hardware sRGB decoding; reports samplers changed
 
 #include "../src/shader_xlate.h"
@@ -29,7 +30,7 @@ int main(int argc, char **argv)
     std::string dir = argv[1];
     bool verbose = false;
     XlOptions options;
-    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0;
+    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0;
     int dump = -1;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = true;
@@ -38,6 +39,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
         if (!strcmp(argv[i], "-p")) options.pbr_specular = true;
         if (!strcmp(argv[i], "-e")) options.pbr_environment = true;
+        if (!strcmp(argv[i], "-t")) options.filmic_tonemap = true;
+        if (!strcmp(argv[i], "-r")) options.hdr_output = true;
         if (!strcmp(argv[i], "-g")) options.srgb_textures = true;
         if (!strcmp(argv[i], "-d") && i + 1 < argc) dump = atoi(argv[++i]);
     }
@@ -57,6 +60,7 @@ int main(int argc, char **argv)
         srgb_programs += !p.fs.srgb_samplers.empty();
         pbr += p.fs.msl.find("wbm_specular") != std::string::npos;
         env += p.fs.msl.find("wbm_environment") != std::string::npos;
+        final_passes += p.fs.msl.find("wbm_filmic(") != std::string::npos || p.fs.msl.find("wbm_expand(") != std::string::npos;
         srgb_samplers += (int)p.fs.srgb_samplers.size();
         std::string error = p.ok ? p.log : "translation failed:\n" + p.log;
         if (p.ok) {
@@ -105,6 +109,7 @@ int main(int argc, char **argv)
     if (options.smooth_alpha_test) printf("%d programs have smoothed alpha tests\n", smoothed);
     if (options.pbr_specular || options.pbr_environment) printf("%d programs use microfacet specular highlights\n", pbr);
     if (options.pbr_environment) printf("%d programs add metalness and an environment reflection\n", env);
+    if (options.filmic_tonemap || options.hdr_output) printf("%d final post-processing programs changed\n", final_passes);
     if (options.srgb_textures) printf("%d programs decode %d samplers through sRGB views\n", srgb_programs, srgb_samplers);
     return failed != 0;
 }

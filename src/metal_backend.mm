@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <map>
@@ -118,6 +119,7 @@ struct Program {
     std::unordered_map<std::string, GLint> location_by_name;
     int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
+    int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     uint32_t input_mask = 0; // attribute locations the vertex shader reads
     std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines;
 };
@@ -232,6 +234,17 @@ struct LastPass {
     uint64_t occluded_in_frame = 0;
 };
 LastPass s_last;
+
+// Extended-range output (WBM_HDR=1). The drawable is 16-bit float in extended
+// sRGB, so the game's gamma-encoded colours mean what they did, and values
+// above 1 are brighter than display white. How far above the screen can go
+// right now (it depends on its brightness setting) is polled on the main
+// thread and handed to the final shader.
+bool s_hdr;
+float s_hdr_peak = 4.0f; // WBM_HDR_PEAK: the most headroom to use
+std::atomic<float> s_headroom{1.0f};
+NSWindow *s_window;
+float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macOS 26 and later)
 
 // Ambient occlusion (WBM_AO=1), applied to the engine's HDR scene buffer when
 // the engine moves on from it to post-processing.
@@ -628,6 +641,9 @@ id<MTLSamplerState> sampler_for(Texture &t)
         d.borderColor = MTLSamplerBorderColorTransparentBlack;
         d.lodMaxClamp = top;
         d.maxAnisotropy = min_linear ? aniso : 1;
+        if (s_lod_bias != 0) {
+            if (@available(macOS 26.0, *)) d.lodBias = s_lod_bias;
+        }
         cached = [s_device newSamplerStateWithDescriptor:d];
     }
     return t.sampler = cached;
@@ -641,7 +657,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = -1;
+    p.yflip_offset = p.samples_offset = p.headroom_offset = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
     std::string vs, fs;
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
@@ -693,6 +709,7 @@ void link_program(GLuint program_id, Program &p)
         for (const XlUniform &u : stages[s]->uniforms) {
             if (u.name == k_xl_yflip_uniform) p.yflip_offset = u.offset;
             else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
+            else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -1269,6 +1286,11 @@ bool prepare_draw()
         memcpy(p->uniform_data[1].data() + p->samples_offset, &samples, 4);
         p->uniform_dirty[1] = true;
     }
+    float headroom = s_headroom.load(std::memory_order_relaxed);
+    if (p->headroom_offset >= 0 && memcmp(p->uniform_data[1].data() + p->headroom_offset, &headroom, 4)) {
+        memcpy(p->uniform_data[1].data() + p->headroom_offset, &headroom, 4);
+        p->uniform_dirty[1] = true;
+    }
     if (p->yflip_offset >= 0 && memcmp(p->uniform_data[0].data() + p->yflip_offset, &yflip, 4)) {
         memcpy(p->uniform_data[0].data() + p->yflip_offset, &yflip, 4);
         p->uniform_dirty[0] = true;
@@ -1348,10 +1370,26 @@ id<MTLBuffer> quad_indices(int quads)
     return s_quad_indices;
 }
 
+float half_to_float(uint16_t h)
+{
+    int exponent = (h >> 10) & 31, mantissa = h & 1023;
+    float v = exponent == 0 ? ldexpf((float)mantissa, -24) : exponent == 31 ? 65504.0f : ldexpf((float)(mantissa | 1024), exponent - 25);
+    return (h & 0x8000) ? -v : v;
+}
+
 void save_capture(id<MTLTexture> copy, uint32_t frame)
 {
     int w = (int)copy.width, h = (int)copy.height;
     std::vector<unsigned char> pixels((size_t)w * h * 4);
+    if (copy.pixelFormat == MTLPixelFormatRGBA16Float) {
+        // An extended-range frame: a PNG can only hold the part up to display white.
+        std::vector<uint16_t> halves((size_t)w * h * 4);
+        [copy getBytes:halves.data() bytesPerRow:(NSUInteger)w * 8 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        for (size_t i = 0; i < halves.size(); i++)
+            pixels[i] = (unsigned char)lrintf(std::min(1.0f, std::max(0.0f, half_to_float(halves[i]))) * 255.0f);
+        wb_save_frame_png(pixels.data(), w, h, frame, false);
+        return;
+    }
     [copy getBytes:pixels.data() bytesPerRow:(NSUInteger)w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
     wb_save_frame_png(pixels.data(), w, h, frame, true);
 }
@@ -1376,6 +1414,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_reverse_depth = s_shader_options.reverse_depth = !(reverse_env && atoi(reverse_env) == 0); // on unless set to 0
     s_shader_options.srgb_textures = srgb_env && atoi(srgb_env) != 0;                            // off unless set
     s_state_cache = !(cache_env && atoi(cache_env) == 0);
+    const char *hdr_env = getenv("WBM_HDR"), *tonemap_env = getenv("WBM_TONEMAP");
+    s_hdr = s_shader_options.hdr_output = hdr_env && atoi(hdr_env) != 0;                  // off unless set
+    s_shader_options.filmic_tonemap = tonemap_env && atoi(tonemap_env) != 0;              // off unless set
+    if (const char *v = getenv("WBM_HDR_PEAK")) s_hdr_peak = std::max(1.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_LOD_BIAS")) s_lod_bias = (float)atof(v);
     const char *ao_env = getenv("WBM_AO");
     s_ao = ao_env && atoi(ao_env) != 0; // off unless set
     if (const char *v = getenv("WBM_AO_RADIUS")) s_ao_radius = (float)atof(v);
@@ -1410,6 +1453,14 @@ void mtl_attach_window(void *nswindow, int width, int height)
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = s_device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        if (s_hdr) {
+            layer.pixelFormat = MTLPixelFormatRGBA16Float;
+            layer.wantsExtendedDynamicRangeContent = YES;
+            CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
+            layer.colorspace = space;
+            CGColorSpaceRelease(space);
+        }
+        s_window = window;
         layer.framebufferOnly = NO; // frame captures read the drawable back
         layer.opaque = YES;
         // The drawable is the game's size times s_scale; the layer stretches it to the view.
@@ -1425,11 +1476,12 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
-            "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s",
+            "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
+            "filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off");
+            s_ao ? "on" : "off", s_shader_options.filmic_tonemap ? "on" : "off", s_hdr ? "on" : "off");
 }
 
 const char *mtl_device_name()
@@ -1500,6 +1552,12 @@ void mtl_present(bool capture, uint32_t frame)
         s_cmd = nil;
         s_drawable = nil;
         s_frame_serial++;
+        if (s_hdr && s_frame_serial % 30 == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+              CGFloat available = s_window.screen.maximumExtendedDynamicRangeColorComponentValue;
+              s_headroom.store(std::min(s_hdr_peak, std::max(1.0f, (float)available)));
+            });
+        }
     }
 }
 
