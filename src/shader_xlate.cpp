@@ -440,6 +440,17 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
                               (options.reverse_depth ? "gl_Position.w - gl_Position.z" : "gl_Position.z + gl_Position.w") +
                               ") * 0.5;\n");
     } else {
+        if (options.hdr_output) {
+            // An 8-bit target clamps what a shader writes to 0..1 before blending,
+            // and the engine relies on it: text fading out is drawn with an alpha
+            // that runs below zero. A float target keeps such values, and blending
+            // with a negative alpha draws the whole glyph rectangle. So the clamp
+            // is done here: alpha to 0..1, colour to non-negative (colour above 1
+            // is what extended range is for).
+            size_t end = s.rfind('}');
+            if (end != std::string::npos)
+                s.insert(end, "  gl_FragColor = vec4(max(gl_FragColor.xyz, vec3(0.0)), clamp(gl_FragColor.w, 0.0, 1.0));\n");
+        }
         s = replace_word(s, "gl_FragColor", "wbm_FragColor");
     }
     return s;
