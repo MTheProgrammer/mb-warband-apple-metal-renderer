@@ -1190,7 +1190,7 @@ void apply_ambient_occlusion()
         s_ao_texture = make(MTLPixelFormatR8Unorm);
         s_ao_z_texture = make(MTLPixelFormatR32Float);
     }
-    id<MTLRenderPipelineState> apply = ao_apply_pipeline(s_last.color.pixelFormat, s_last.samples);
+    id<MTLRenderPipelineState> apply = ao_apply_pipeline(s_last.color.pixelFormat, 1);
     if (!apply) return;
 
     auto half_pass = [&](id<MTLTexture> target, id<MTLRenderPipelineState> pipeline, id<MTLTexture> input) {
@@ -1208,16 +1208,14 @@ void apply_ambient_occlusion()
     half_pass(s_ao_z_texture, s_ao_linearize_pipeline, s_last.depth);
     half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture);
 
+    // Blended onto the resolved image, which is what post-processing reads. The
+    // multisampled copy is left as it was: writing there would blend every
+    // sample and resolve the whole buffer a second time, and the engine does not
+    // draw into the scene again once post-processing has begun.
     MTLRenderPassDescriptor *onto = [MTLRenderPassDescriptor renderPassDescriptor];
+    onto.colorAttachments[0].texture = s_last.color;
     onto.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    if (s_last.ms_color) {
-        onto.colorAttachments[0].texture = s_last.ms_color;
-        onto.colorAttachments[0].resolveTexture = s_last.color;
-        onto.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
-    } else {
-        onto.colorAttachments[0].texture = s_last.color;
-        onto.colorAttachments[0].storeAction = MTLStoreActionStore;
-    }
+    onto.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:onto];
     [pass setRenderPipelineState:apply];
     [pass setFragmentTexture:s_last.depth atIndex:0];
