@@ -12,9 +12,9 @@
 //   texture_tool hair <picture> <name> <out-folder> [tack-picture]
 //       writes <name>_hair.png for the game's texture <name> from a picture of
 //       that texture with everything but the long hair (mane, tail, forelock)
-//       blacked out: red and green give the way the hair is combed, worked out
-//       from the run of the strands in the picture and in the texture's normal
-//       map; blue says what grows there (255 long hair, about 128 coat, 0 none).
+//       blacked out, or simply white where that hair is and black elsewhere:
+//       red and green give the way the hair is combed, worked out from the run
+//       of the strands in the game's texture and its normal map; blue says what grows there (255 long hair, about 128 coat, 0 none).
 //       A second picture, of the saddle, straps and other gear alone, keeps
 //       the coat off those.
 //
@@ -335,16 +335,27 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     };
     // Where the long hair is: what the picture did not black out. Smoothed, so
     // that the dark gaps between strands and the picture's compression do not show.
+    // "Blacked out" is rarely quite black: the commonest brightness is taken for
+    // the background, and hair is what is brighter than that. Dark hair is
+    // strands with gaps of background between them, so the mask is spread
+    // widely enough to close those before it is cut off again.
+    int histogram[256] = {};
+    for (int y = 0; y < h; y += 2)
+        for (int x = 0; x < w; x += 2) histogram[std::min(255, (int)(picture_at(x, y) * 255))]++;
+    int background = 0;
+    for (int v = 1; v < 256; v++)
+        if (histogram[v] > histogram[background]) background = v;
+    float floor_ = (float)background / 255.0f + 0.03f;
     std::vector<float> mask(count);
     for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) mask[(size_t)y * w + x] = picture_at(x, y) > 0.07f ? 1.0f : 0.0f;
-    blur(mask, w, h, std::max(1, w / 400));
-    for (float &m : mask) m = smoothstep(0.35f, 0.65f, m);
+        for (int x = 0; x < w; x++) mask[(size_t)y * w + x] = picture_at(x, y) > floor_ ? 1.0f : 0.0f;
+    blur(mask, w, h, std::max(2, w / 130));
+    for (float &m : mask) m = smoothstep(0.2f, 0.4f, m);
     // Which way the strands run: across a strand brightness changes fast, along
     // it hardly at all. Summed over a neighbourhood, the squared gradients say
     // which direction that is (the one they vary least in).
     std::vector<float> xx(count, 0.0f), xy(count, 0.0f), yy(count, 0.0f);
-    add_gradients(hair, -1, w, h, xx, xy, yy);
+    add_gradients(base, -1, w, h, xx, xy, yy); // the game's own strands, not the picture's: a picture may have been redrawn
     if (has_normal) {
         add_gradients(normal, 0, w, h, xx, xy, yy);
         add_gradients(normal, 1, w, h, xx, xy, yy);
