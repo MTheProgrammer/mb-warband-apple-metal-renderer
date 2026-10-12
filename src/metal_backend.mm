@@ -150,7 +150,7 @@ struct Program {
     int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler
     int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform
     int wind_offset = -1;          // vertex stage, see k_xl_wind_uniform
-    int leaf_sun_offset = -1, leaf_eye_offset = -1; // vertex stage, see k_leaf_function in shader_xlate.cpp // fragment stage, see k_xl_dyn_sampler
+    int leaf_sun_offset = -1; // vertex stage, see k_leaf_function in shader_xlate.cpp // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
     const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
@@ -294,6 +294,7 @@ bool s_ao_full; // WBM_AO_FULL: compute at the depth buffer's full resolution in
 // space, the third being the direction of increasing w.
 struct Camera {
     double a = 0, b = 0, p00 = 1, p11 = 1, view[3][3] = {};
+    double forward_sign = 1; // +1 when the shaders' view space has its third axis pointing forwards, -1 when back
     uint64_t projection_frame = 0, view_frame = 0;
     // World space to clip space, for this frame and the one before (motion blur).
     double view_proj[16] = {}, last_view_proj[16] = {};
@@ -968,7 +969,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.leaf_eye_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1038,7 +1039,6 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_skin_uniform) p.skin_offset[s] = u.offset;
             else if (u.name == k_xl_wind_uniform) p.wind_offset = u.offset;
             else if (u.name == "wbm_leaf_sun") p.leaf_sun_offset = u.offset;
-            else if (u.name == "wbm_leaf_eye") p.leaf_eye_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -1828,6 +1828,7 @@ void observe_camera(Program &p)
         mat_inverse(w, inv)) {
         mat_mul(wv, inv, m);
         double forward_sign = s_camera.view[2][0];
+        s_camera.forward_sign = forward_sign < 0 ? -1.0 : 1.0;
         for (int r = 0; r < 3; r++) {
             double x = m[r], y = m[4 + r], z = m[8 + r], len = sqrt(x * x + y * y + z * z);
             if (len < 1e-9) return;
@@ -2779,7 +2780,8 @@ bool prepare_draw()
     if (s_debug_skin && diffuse && diffuse->material == MAT_FLORA && (p->wind_offset < 0 || (p->skin_offset[0] < 0 && p->skin_offset[1] < 0 && p->leaf_sun_offset < 0)))
         complain("foliage drawn by program %u: wind %s, light through leaves %s", s_program, p->wind_offset >= 0 ? "yes" : "NO",
                  p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->leaf_sun_offset >= 0 ? "yes" : "NO");
-    if (s_debug_skin && diffuse && diffuse->material == MAT_SKIN && p->skin_offset[0] < 0 && p->skin_offset[1] < 0) {
+    bool unlit_leaf = diffuse && diffuse->material == MAT_FLORA && p->skin_offset[0] < 0 && p->skin_offset[1] < 0 && p->leaf_sun_offset < 0;
+    if (s_debug_skin && diffuse && (unlit_leaf || (diffuse->material == MAT_SKIN && p->skin_offset[0] < 0 && p->skin_offset[1] < 0))) {
         // Skin drawn by a shader the scattering rewrite did not recognise: show how it lights.
         for (auto &sh : p->shaders) {
             std::string lines;
@@ -2795,19 +2797,25 @@ bool prepare_draw()
                 }
                 at = end + 1;
             }
-            complain("skin without scattering, program %u %s: %s", s_program, sh->type == GL_VERTEX_SHADER ? "vs" : "fs", lines.c_str());
+            complain("%s without scattering, program %u %s: %s", unlit_leaf ? "foliage" : "skin", s_program, sh->type == GL_VERTEX_SHADER ? "vs" : "fs", lines.c_str());
         }
     }
-    if (p->leaf_sun_offset >= 0 && p->leaf_eye_offset >= 0) {
+    if (p->leaf_sun_offset >= 0) {
         float sun[4] = {0, 0, 0, 0};
-        // Needs the sun's direction and the camera's place, which the per-frame shadow map works out.
-        if (diffuse && diffuse->material == MAT_FLORA && s_sun_valid && s_eye_frame + 2 >= s_frame_serial) {
-            float len = sqrtf(s_sun_dir[0] * s_sun_dir[0] + s_sun_dir[1] * s_sun_dir[1] + s_sun_dir[2] * s_sun_dir[2]);
-            if (len > 1e-6f) sun[0] = -s_sun_dir[0] / len, sun[1] = -s_sun_dir[1] / len, sun[2] = -s_sun_dir[2] / len, sun[3] = s_foliage_backlight;
+        // The direction to the sun in view space, from the camera worked out for this frame or the last.
+        if (diffuse && diffuse->material == MAT_FLORA && s_sun_valid && s_camera.view_frame + 2 >= s_frame_serial) {
+            double v[3], len = 0;
+            for (int r = 0; r < 3; r++) {
+                v[r] = -(s_camera.view[r][0] * s_sun_dir[0] + s_camera.view[r][1] * s_sun_dir[1] + s_camera.view[r][2] * s_sun_dir[2]);
+                len += v[r] * v[r];
+            }
+            v[2] *= s_camera.forward_sign; // the third axis is kept pointing forwards; the shaders' own may point back
+            if (len > 1e-12)
+                for (int r = 0; r < 3; r++) sun[r] = (float)(v[r] / sqrt(len));
+            sun[3] = s_foliage_backlight;
         }
-        if (memcmp(p->uniform_data[0].data() + p->leaf_sun_offset, sun, 16) || memcmp(p->uniform_data[0].data() + p->leaf_eye_offset, s_eye, 16)) {
+        if (memcmp(p->uniform_data[0].data() + p->leaf_sun_offset, sun, 16)) {
             memcpy(p->uniform_data[0].data() + p->leaf_sun_offset, sun, 16);
-            memcpy(p->uniform_data[0].data() + p->leaf_eye_offset, s_eye, 16);
             p->uniform_dirty[0] = true;
         }
     }
@@ -2932,7 +2940,7 @@ bool prepare_draw()
     s_draw_binding = binding;
     if (s_dyn_shadows && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world)
         render_dynamic_shadows(*p);
-    if (s_pass_scene && (((s_ao || s_contact_shadows || s_light_shafts) && s_camera.view_frame != s_frame_serial) ||
+    if (s_pass_scene && (((s_ao || s_contact_shadows || s_light_shafts || s_foliage_backlight > 0) && s_camera.view_frame != s_frame_serial) ||
                          (s_motion_blur && s_camera.view_proj_frame != s_frame_serial)))
         observe_camera(*p);
     return true;

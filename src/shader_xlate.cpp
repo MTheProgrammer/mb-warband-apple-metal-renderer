@@ -591,28 +591,27 @@ bool add_wind(std::string &vs)
 // normal: a fixed share of the sun's colour, whichever way a leaf faces. For
 // those the light coming through is judged by where the viewer stands: looking
 // towards the sun, one sees the far side of the leaves, lit through.
-// wbm_leaf_sun: xyz the direction to the sun in the world, w the strength, 0
-// for what is not foliage. wbm_leaf_eye: the camera's place in the world.
+// wbm_leaf_sun: xyz the direction to the sun in view space (the space
+// matWorldView leads to), w the strength, 0 for what is not foliage.
 const char k_leaf_function[] = R"(
 uniform vec4 wbm_leaf_sun;
-uniform vec4 wbm_leaf_eye;
 
-vec4 wbm_leaf_glow(vec3 world)
+vec4 wbm_leaf_glow(vec3 seen)
 {
     if (wbm_leaf_sun.w <= 0.0) return vec4(1.0);
-    float into = clamp(dot(normalize(world - wbm_leaf_eye.xyz), wbm_leaf_sun.xyz), 0.0, 1.0);
+    float into = clamp(dot(normalize(seen), wbm_leaf_sun.xyz), 0.0, 1.0);
     return vec4(1.0) + wbm_leaf_sun.w * 2.5 * into * into * vec4(0.85, 1.0, 0.35, 0.0);
 }
 )";
 
 bool add_leaf_glow(std::string &vs)
 {
-    // SunLight = ((sun colour * 0.34) * (vMaterialColor * inColor0.zyxw)), and the world position from matWorld * P
+    // SunLight = ((sun colour * 0.34) * (vMaterialColor * inColor0.zyxw)), and the view-space position from matWorldView * P
     static const std::regex flat(R"(SunLight = \(\((tmpvar_\d+) \* (0\.\d+)\) \* \(vMaterialColor \* inColor0\.zyxw\)\);)");
-    static const std::regex placed(R"(\(matWorld \* (tmpvar_\d+)\))");
+    static const std::regex seen(R"(\(matWorldView \* (tmpvar_\d+)\))");
     std::smatch m;
-    if (!std::regex_search(vs, flat) || !std::regex_search(vs, m, placed)) return false;
-    vs = std::regex_replace(vs, flat, "SunLight = ((($1 * $2) * wbm_leaf_glow((matWorld * " + std::string(m[1]) + ").xyz)) * (vMaterialColor * inColor0.zyxw));");
+    if (!std::regex_search(vs, flat) || !std::regex_search(vs, m, seen)) return false;
+    vs = std::regex_replace(vs, flat, "SunLight = ((($1 * $2) * wbm_leaf_glow((matWorldView * " + std::string(m[1]) + ").xyz)) * (vMaterialColor * inColor0.zyxw));");
     return true;
 }
 
@@ -676,6 +675,13 @@ bool add_skin_scattering(std::string &fs)
         "(wbm_skin_sun(SunLightDir, vec3($1), 1.0, " + back + ") * $2)",
     };
     if (fs.find("varying vec3 SunLightDir;") == std::string::npos) return false;
+    // The leaf shader squares its shadow.
+    static const std::regex squared(
+        R"(\(\(\s*clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\)\s*\*\s*\((sun_amount_\d+) \* \2\)\s*\) \* (tmpvar_\d+)\))");
+    if (std::regex_search(fs, squared)) {
+        fs = std::regex_replace(fs, squared, "(wbm_skin_sun(SunLightDir, vec3($1), ($2 * $2), " + back + ") * $3)", std::regex_constants::format_first_only);
+        return true;
+    }
     for (int i = 0; i < 4; i++) {
         if (!std::regex_search(fs, shapes[i])) continue;
         fs = std::regex_replace(fs, shapes[i], with[i], std::regex_constants::format_first_only);

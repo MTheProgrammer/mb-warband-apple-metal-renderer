@@ -16,7 +16,7 @@ namespace {
 
 // Bump when the translation changes (the rewriter, its options, or the
 // versions of glslang and SPIRV-Cross), so that stale entries are ignored.
-const char k_version[] = "wbx-37 glslang-15.1.0 spirv-cross-1.4.304.0";
+const char k_version[] = "wbx-39 glslang-15.1.0 spirv-cross-1.4.304.0";
 const uint32_t k_magic = 0x31584257; // "WBX1"
 
 uint64_t fnv(const std::string &s, uint64_t h)
