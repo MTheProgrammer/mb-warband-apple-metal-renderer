@@ -131,6 +131,49 @@ bool smooth_alpha_tests(std::string &fs)
     return changed;
 }
 
+// The engine's highlight is Blinn-Phong: strength * pow(dot(N, H), shininess).
+// wbm_specular stands in for the pow() factor with a microfacet lobe:
+//
+//   - GGX distribution, scaled so that its peak is 1 and its energy matches the
+//     Blinn-Phong lobe of the same exponent (alpha^2 = 2 / (shininess + 2)).
+//     Highlights keep their brightness and size but gain GGX's soft falloff.
+//   - Smith shadowing-masking, which fades the highlight as the light or the
+//     view grazes the surface instead of letting it show on unlit faces.
+//   - Schlick Fresnel relative to an assumed base reflectance, so highlights
+//     strengthen towards grazing angles.
+//
+// The strength in front (specular colour, specular map, light colour) is the
+// game's own and is not touched. This is the specular half of physically
+// based shading; the game has no roughness or metalness maps to drive more.
+const char k_pbr_specular_function[] = R"(
+float wbm_specular(vec3 view, vec3 light, vec3 normal, float shininess)
+{
+    vec3 v = normalize(view), l = normalize(light), n = normalize(normal);
+    vec3 h = normalize(v + l);
+    float nh = clamp(dot(n, h), 0.0, 1.0), nl = clamp(dot(n, l), 0.0, 1.0);
+    float nv = clamp(abs(dot(n, v)), 0.001, 1.0), vh = clamp(dot(v, h), 0.0, 1.0);
+    float a2 = clamp(2.0 / (shininess + 2.0), 0.0004, 1.0);
+    float d = nh * nh * (a2 - 1.0) + 1.0;
+    float lobe = (a2 * a2) / (d * d);
+    float gl = 2.0 * nl / (nl + sqrt(a2 + (1.0 - a2) * nl * nl));
+    float gv = 2.0 * nv / (nv + sqrt(a2 + (1.0 - a2) * nv * nv));
+    const float f0 = 0.25;
+    float fresnel = (f0 + (1.0 - f0) * pow(1.0 - vh, 5.0)) / f0;
+    return lobe * gl * gv * fresnel;
+}
+)";
+
+// Finds pow(clamp(dot(normalize(V +/- L), N), 0, 1), fMaterialPower) and
+// replaces it with wbm_specular(V, +/-L, N, fMaterialPower).
+bool use_pbr_specular(std::string &fs)
+{
+    static const std::regex lobe(
+        R"(pow \(\s*clamp \(\s*dot \(normalize\(\s*\(([\w.]+) ([+-]) ([\w.]+)\)\s*\), ([\w.]+)\)\s*, 0\.0, 1\.0\)\s*, fMaterialPower\))");
+    if (!std::regex_search(fs, lobe)) return false;
+    fs = std::regex_replace(fs, lobe, "wbm_specular(vec3($1), $2vec3($3), vec3($4), fMaterialPower)");
+    return true;
+}
+
 // The engine decodes texture colour itself, pow(sample.rgb, 2.2), after the
 // sample has been filtered. An sRGB texture format does it per texel before
 // filtering and with the exact curve. This removes the pow for every sampler
@@ -179,6 +222,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool soft_shadows = !vertex && options.soft_shadows && soften_shadows(glsl);
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers);
+    bool pbr_specular = !vertex && options.pbr_specular && use_pbr_specular(glsl);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
@@ -189,6 +233,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
     if (soft_shadows) out << k_soft_shadow_function;
+    if (pbr_specular) out << k_pbr_specular_function;
     if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
 
     std::istringstream in(glsl);

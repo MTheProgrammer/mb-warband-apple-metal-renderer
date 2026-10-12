@@ -1077,6 +1077,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_reverse_depth = s_shader_options.reverse_depth = !(reverse_env && atoi(reverse_env) == 0); // on unless set to 0
     s_shader_options.srgb_textures = srgb_env && atoi(srgb_env) != 0;                            // off unless set
     s_state_cache = !(cache_env && atoi(cache_env) == 0);
+    const char *pbr_env = getenv("WBM_PBR");
+    s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) != 0; // off unless set
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -1119,9 +1121,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if ([NSThread isMainThread]) attach();
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
-            "reversed depth %s; sRGB textures %s; state cache %s",
+            "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
-            s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off");
+            s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
+            s_shader_options.pbr_specular ? "on" : "off");
 }
 
 const char *mtl_device_name()

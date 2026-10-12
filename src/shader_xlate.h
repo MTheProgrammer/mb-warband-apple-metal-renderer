@@ -56,6 +56,10 @@ struct XlOptions {
     // decode to the GPU through an sRGB view of the texture. The samplers this
     // was done for are listed in XlStage::srgb_samplers.
     bool srgb_textures = false;
+    // Replace the engine's Blinn-Phong highlight with a microfacet one (GGX
+    // distribution, Smith shadowing, Schlick Fresnel), keeping each material's
+    // highlight strength and deriving roughness from its shininess exponent.
+    bool pbr_specular = false;
 };
 
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space
