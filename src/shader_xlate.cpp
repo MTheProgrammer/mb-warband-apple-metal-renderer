@@ -668,20 +668,46 @@ bool add_skin_scattering_vertex(std::string &vs)
 // Fur. See XlOptions::fur.
 const char k_fur_function[] = R"(
 uniform sampler2D wbm_fur_map;
-uniform vec4 wbm_fur;
+uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts
+uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size there; w: strength, 0 for none
 
-// facing: the cosine of the sun's angle to the surface; highlight: the engine's own; fur: 0 to 1.
-vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_sun, float fur)
+// facing: the cosine of the sun's angle to the surface; highlight: the engine's
+// own; fur: 0 to 1; depth: how far behind the sunward surface this point is
+// (wbm_dyn_thickness), below 0 when unknown.
+vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_sun, float fur, float depth)
 {
     vec4 plain = vec4(clamp(facing, 0.0, 1.0)) + highlight;
     if (fur <= 0.0) return plain;
     float wrapped = clamp((facing + 0.3) / 1.3, 0.0, 1.0) / 1.12;
     // Hairs standing off the surface catch light when seen along it: brightest
     // at the outline, on the side the sun is on.
-    float edge = 1.0 - clamp(dot(normalize(view), normalize(normal)), 0.0, 1.0);
+    vec3 v = normalize(view), l = normalize(to_sun);
+    float edge = 1.0 - clamp(dot(v, normalize(normal)), 0.0, 1.0);
     float rim = edge * edge * edge * clamp(facing * 0.5 + 0.5, 0.0, 1.0) * 0.55;
-    vec4 coat = vec4(vec3(wrapped + rim), plain.w) + vec4(highlight.xyz * 0.45, 0.0);
+    // Sunlight through what is thin, an ear above all, seen against the sun;
+    // hide and hair let less through than a person's skin.
+    vec3 back = vec3(0.0);
+    if (depth >= 0.0 && wbm_fur.y > 0.0) {
+        float towards = pow(clamp(dot(v, -normalize(l + vec3(0.0, 0.0, 0.35))), 0.0, 1.0), 2.0);
+        back = towards * smoothstep(0.25, -0.15, l.z) * wbm_fur.z * exp(-(depth * wbm_fur.y + 0.004) * vec3(70.0, 190.0, 300.0));
+    }
+    vec4 coat = vec4(vec3(wrapped + rim) + back, plain.w) + vec4(highlight.xyz * 0.45, 0.0);
     return mix(plain, coat, fur);
+}
+
+// A wet eye: a sharp highlight from the sun and a little of the sky, on top of
+// whatever glint is painted there.
+vec3 wbm_horse_glint(vec2 uv, vec3 view, vec3 normal, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
+{
+    if (wbm_horse_eye.w <= 0.0) return vec3(0.0);
+    vec2 d = (uv - wbm_horse_eye.xy) / wbm_horse_eye.z;
+    float inside = 1.0 - smoothstep(0.5, 1.0, dot(d, d));
+    if (inside <= 0.0) return vec3(0.0);
+    vec3 n = normalize(normalize(normal) + vec3(d * 0.7, 0.0)); // the ball bulges
+    vec3 v = normalize(view), h = normalize(v + normalize(to_sun));
+    float glint = pow(max(dot(n, h), 0.0), 160.0) * 2.5 * shadow;
+    float grazing = min(0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0), 0.25);
+    return inside * wbm_horse_eye.w * (glint * sun + grazing * sky * 0.7);
 }
 )";
 
@@ -691,17 +717,26 @@ bool add_fur(std::string &fs)
     static const std::regex shadowed(
         R"(\(\(\s*\(clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\) \+ (fSpecular_\d+)\)\s*\* (sun_amount_\d+)\) \* (tmpvar_\d+)\))");
     static const std::regex plain(R"(\(\(\s*clamp \(dot \(SunLightDir, ([\w.]+)\), 0\.0, 1\.0\)\s*\+ (fSpecular_\d+)\) \* (tmpvar_\d+)\))");
+    static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
     if (fs.find("0.800118") == std::string::npos || fs.find("varying vec3 ViewDir;") == std::string::npos) return false; // the engine's hair-like highlight marks the shaders
     const std::string fur = "(texture2D(wbm_fur_map, Tex0).z * wbm_fur.x)";
-    if (std::regex_search(fs, shadowed)) {
-        fs = std::regex_replace(fs, shadowed, "((wbm_fur_lit(dot(SunLightDir, $1), $2, ViewDir, $1, SunLightDir, " + fur + ") * $3) * $4)", std::regex_constants::format_first_only);
-        return true;
+    const std::string depth = fs.find("wbm_dynamic_shadow(") != std::string::npos ? "wbm_dyn_thickness(ShadowTexCoord.xyz)" : "-1.0";
+    std::smatch m;
+    std::string normal, lit = "1.0";
+    if (std::regex_search(fs, m, shadowed)) {
+        normal = m[1], lit = m[3];
+        fs = std::regex_replace(fs, shadowed, "((wbm_fur_lit(dot(SunLightDir, $1), $2, ViewDir, $1, SunLightDir, " + fur + ", " + depth + ") * $3) * $4)",
+                                std::regex_constants::format_first_only);
+    } else if (std::regex_search(fs, m, plain)) {
+        normal = m[1];
+        fs = std::regex_replace(fs, plain, "(wbm_fur_lit(dot(SunLightDir, $1), $2, ViewDir, $1, SunLightDir, " + fur + ", " + depth + ") * $3)", std::regex_constants::format_first_only);
+    } else {
+        return false;
     }
-    if (std::regex_search(fs, plain)) {
-        fs = std::regex_replace(fs, plain, "(wbm_fur_lit(dot(SunLightDir, $1), $2, ViewDir, $1, SunLightDir, " + fur + ") * $3)", std::regex_constants::format_first_only);
-        return true;
-    }
-    return false;
+    if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos)
+        fs = std::regex_replace(fs, encode, "$1.xyz += wbm_horse_glint(Tex0, ViewDir, " + normal + ", SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz);\n  $&",
+                                std::regex_constants::format_first_only);
+    return true;
 }
 
 // Eyes. Where they are in a face texture is the same for every face of a sex

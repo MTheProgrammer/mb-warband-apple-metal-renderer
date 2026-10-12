@@ -442,6 +442,7 @@ bool restore_state()
                                 t.material = it->second.cls; // as this build classes it, whatever the capturing one did
                                 t.radial_wind = s_texture_names[it->second.name].find("palm") != std::string::npos;
                                 t.woman = is_womans_face(s_texture_names[it->second.name]);
+                                horse_eye_for(s_texture_names[it->second.name], t.horse_eye);
                                 attach_pbr_map(t, it->second);
                             }
                             if (it != s_material_by_content.end() && replace_from_pack(t, it->second)) {

@@ -153,6 +153,7 @@ GLuint preview_texture(const std::string &texture_name)
                 t.material = (uint8_t)classify_texture_name(name);
                 t.radial_wind = name.find("palm") != std::string::npos;
                 t.woman = is_womans_face(name);
+                horse_eye_for(name, t.horse_eye);
                 t.min_filter = GL_LINEAR_MIPMAP_LINEAR;
                 t.anisotropy = 16;
                 auto map = s_pack_files.find(name + "_pbr");
