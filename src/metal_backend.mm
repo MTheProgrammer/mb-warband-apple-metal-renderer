@@ -253,6 +253,7 @@ float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macO
 // the engine moves on from it to post-processing.
 bool s_ao;
 float s_ao_radius = 0.6f, s_ao_strength = 0.5f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
+bool s_ao_full; // WBM_AO_FULL: compute at the depth buffer's full resolution instead of half
 float s_view_proj[16];                          // the camera's matViewProj, as last set while drawing the scene
 bool s_view_proj_valid;
 // Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
@@ -1018,10 +1019,23 @@ typedef depth2d<float> DepthTexture;
 
 // Distance in front of the camera for a pixel of the depth buffer; a very
 // large value for the sky.
+//
+// With multisampling a pixel holds several depths. Along cut-out edges (hair,
+// leaves, grass) they differ from sample to sample, and taking any single one
+// makes thin shapes flicker in and out of the occlusion. The farthest is used:
+// a pixel only counts as covered by a thin shape once all of it is.
 static float view_z(DepthTexture t, int2 c, Params p)
 {
     c = clamp(c, int2(0), int2(p.depth_size) - 1);
+#if WBM_MSAA
     float d = t.read(uint2(c), 0);
+    for (uint i = 1; i < t.get_num_samples(); i++) {
+        float e = t.read(uint2(c), i);
+        d = p.reversed > 0.5 ? min(d, e) : max(d, e);
+    }
+#else
+    float d = t.read(uint2(c), 0);
+#endif
     bool sky = p.reversed > 0.5 ? d <= 0.0 : d >= 1.0;
     if (sky) return 1.0e6;
     float ndc = p.reversed > 0.5 ? 1.0 - 2.0 * d : 2.0 * d - 1.0;
@@ -1040,11 +1054,12 @@ vertex VertexOut ao_vertex(uint id [[vertex_id]])
     return out;
 }
 
-// Pass 1, half resolution: distances, so that the passes after it read a small
+// Pass 1, at the occlusion resolution (half the depth buffer's, or all of it
+// with WBM_AO_FULL): distances, so that the passes after it read a small
 // single-sample texture instead of the multisampled depth buffer.
 fragment float4 ao_linearize(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], constant Params &p [[buffer(0)]])
 {
-    return float4(view_z(depth, int2(in.position.xy) * 2 + 1, p));
+    return float4(view_z(depth, int2(in.position.xy * p.depth_size / p.ao_size), p));
 }
 
 static float load_z(texture2d<float> z, int2 c, Params p)
@@ -1075,7 +1090,7 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
     float3 n = normalize(cross(dy, dx));
     if (dot(n, P) > 0.0) n = -n; // towards the camera
 
-    float radius_px = clamp(p.radius * p.p00 / P.z * 0.5 * p.ao_size.x, 2.0, 48.0);
+    float radius_px = clamp(p.radius * p.p00 / P.z * 0.5 * p.ao_size.x, 2.0, 96.0 * p.ao_size.x / p.depth_size.x);
     float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
     float bias = 0.02 + 0.004 * P.z;
     float sum = 0.0;
@@ -1246,7 +1261,8 @@ void apply_ambient_occlusion()
         complain("ambient occlusion: the camera matrix is not a perspective projection it understands");
         return;
     }
-    NSUInteger w = s_last.depth.width, h = s_last.depth.height, aw = (w + 1) / 2, ah = (h + 1) / 2;
+    NSUInteger w = s_last.depth.width, h = s_last.depth.height;
+    NSUInteger aw = s_ao_full ? w : (w + 1) / 2, ah = s_ao_full ? h : (h + 1) / 2;
     params.depth_size[0] = (float)w, params.depth_size[1] = (float)h;
     params.ao_size[0] = (float)aw, params.ao_size[1] = (float)ah;
     params.radius = s_ao_radius;
@@ -1544,6 +1560,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_ao = ao_env && atoi(ao_env) != 0; // off unless set
     if (const char *v = getenv("WBM_AO_RADIUS")) s_ao_radius = (float)atof(v);
     if (const char *v = getenv("WBM_AO_STRENGTH")) s_ao_strength = (float)atof(v);
+    if (const char *v = getenv("WBM_AO_FULL")) s_ao_full = atoi(v) != 0;
     const char *contact_env = getenv("WBM_CONTACT_SHADOWS");
     s_contact_shadows = contact_env && atoi(contact_env) != 0; // off unless set
     if (const char *v = getenv("WBM_CONTACT_STRENGTH")) s_contact_strength = (float)atof(v);
