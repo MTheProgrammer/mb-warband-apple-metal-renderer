@@ -16,6 +16,7 @@
 const char *const k_xl_yflip_uniform = "wbm_yflip";
 const char *const k_xl_samples_uniform = "wbm_samples";
 const char *const k_xl_headroom_uniform = "wbm_headroom";
+const char *const k_xl_limit_uniform = "wbm_limit";
 
 namespace {
 
@@ -390,6 +391,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_environment) out << k_pbr_environment_function;
     if (final_pass) out << k_tonemap_functions;
     if (final_pass && options.hdr_output) out << "uniform float " << k_xl_headroom_uniform << ";\n";
+    if (!vertex && !final_pass && options.hdr_output) out << "uniform float " << k_xl_limit_uniform << ";\n";
     if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
 
     std::istringstream in(glsl);
@@ -442,14 +444,19 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     } else {
         if (options.hdr_output) {
             // An 8-bit target clamps what a shader writes to 0..1 before blending,
-            // and the engine relies on it: text fading out is drawn with an alpha
-            // that runs below zero. A float target keeps such values, and blending
-            // with a negative alpha draws the whole glyph rectangle. So the clamp
-            // is done here: alpha to 0..1, colour to non-negative (colour above 1
-            // is what extended range is for).
+            // and the engine's UI relies on it. Text is drawn in two passes, and the
+            // first multiplies the screen by (font texture + a fade offset), which is
+            // above 1 over the whole glyph rectangle while a line fades: harmless
+            // when clamped, a visible rectangle on a float target.
+            //
+            // So the clamp is done here. Alpha is always limited to 0..1. Colour is
+            // limited to 0..wbm_limit, which the backend sets to 1 for the screen and
+            // leaves open for the engine's HDR buffers; the final shader, whose job
+            // is to write colours above 1 to the screen, is not limited.
             size_t end = s.rfind('}');
-            if (end != std::string::npos)
-                s.insert(end, "  gl_FragColor = vec4(max(gl_FragColor.xyz, vec3(0.0)), clamp(gl_FragColor.w, 0.0, 1.0));\n");
+            std::string top = final_pass ? "max(gl_FragColor.xyz, vec3(0.0))"
+                                         : std::string("clamp(gl_FragColor.xyz, vec3(0.0), vec3(") + k_xl_limit_uniform + "))";
+            if (end != std::string::npos) s.insert(end, "  gl_FragColor = vec4(" + top + ", clamp(gl_FragColor.w, 0.0, 1.0));\n");
         }
         s = replace_word(s, "gl_FragColor", "wbm_FragColor");
     }

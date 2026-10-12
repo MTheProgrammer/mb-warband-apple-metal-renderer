@@ -84,6 +84,11 @@ extern const char *const k_xl_samples_uniform;
 // times brighter than display white the screen can currently show (1 = none).
 extern const char *const k_xl_headroom_uniform;
 
+// With hdr_output, every other fragment shader gets a uniform, wbm_limit: the
+// largest colour value it may write. The backend sets it to 1 when drawing to
+// the screen and to a very large number otherwise.
+extern const char *const k_xl_limit_uniform;
+
 // attrib_locations: names given to glBindAttribLocation and their indices.
 XlProgram xl_translate(const std::string &vs_glsl, const std::string &fs_glsl,
                        const std::map<std::string, int> &attrib_locations, const XlOptions &options);

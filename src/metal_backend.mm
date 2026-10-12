@@ -120,6 +120,7 @@ struct Program {
     int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
+    int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
     uint32_t input_mask = 0; // attribute locations the vertex shader reads
     std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines;
 };
@@ -154,6 +155,7 @@ int s_pass_scale = 1, s_pass_samples = 1;
 // target's contents always live in the same place.
 int s_msaa = 1;
 id<MTLTexture> s_screen_ms;
+uint64_t s_scene_frame; // the last frame in which the engine drew into its HDR scene buffer
 
 // The game renders at the window's size in points. On a Retina display that is
 // half the panel's resolution, so the screen and every screen-sized render
@@ -358,13 +360,19 @@ bool resolve_target(Target &t)
             if (!s_drawable) return false;
         }
         t.color = s_drawable.texture;
-        if (!s_screen_depth || s_screen_depth.width != t.color.width || s_screen_depth.height != t.color.height) {
-            s_screen_depth = new_depth_texture(t.color.width, t.color.height, s_msaa);
-            s_screen_ms = s_msaa > 1 ? new_render_texture(t.color.pixelFormat, t.color.width, t.color.height, s_msaa) : nil;
+        // When the engine renders the 3D scene into its own HDR buffer (this frame
+        // or the last), all the screen receives is one full-screen image and the
+        // UI. Multisampling that gains nothing and costs a full-screen resolve,
+        // so the screen is then single-sampled.
+        int samples = (s_scene_frame + 1 >= s_frame_serial) ? 1 : s_msaa;
+        if (!s_screen_depth || s_screen_depth.width != t.color.width || s_screen_depth.height != t.color.height ||
+            (int)s_screen_depth.sampleCount != samples) {
+            s_screen_depth = new_depth_texture(t.color.width, t.color.height, samples);
+            s_screen_ms = samples > 1 ? new_render_texture(t.color.pixelFormat, t.color.width, t.color.height, samples) : nil;
         }
         t.depth = s_screen_depth;
         t.ms_color = s_screen_ms;
-        t.samples = s_msaa;
+        t.samples = samples;
         t.screen = true;
         t.scale = s_scale;
         return true;
@@ -437,6 +445,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_screen = t.screen;
     s_pass_scale = t.scale;
     s_pass_samples = t.samples;
+    if (t.scene) s_scene_frame = s_frame_serial;
     if (s_last.color != t.color) s_last.draws = 0; // a clear restarts the pass on the same target; keep counting
     s_last.color = t.color;
     s_last.ms_color = t.ms_color;
@@ -657,7 +666,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.headroom_offset = -1;
+    p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
     std::string vs, fs;
     for (auto &sh : p.shaders) (sh->type == GL_VERTEX_SHADER ? vs : fs) = sh->source;
@@ -710,6 +719,7 @@ void link_program(GLuint program_id, Program &p)
             if (u.name == k_xl_yflip_uniform) p.yflip_offset = u.offset;
             else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
+            else if (u.name == k_xl_limit_uniform) p.limit_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -963,9 +973,11 @@ id<MTLDepthStencilState> depth_state(bool has_depth)
 // the more. This is the "Alchemy" estimator, a horizon-based method that needs
 // only depth.
 //
-// ao_apply, at full resolution: blur the result over 3x3 half-resolution
-// texels, ignoring texels at a different depth so that occlusion does not
-// leak across silhouettes, and multiply the scene's colour by it.
+// ao_blur, at half resolution: blur the result over 3x3 texels, ignoring
+// texels at a different depth so that occlusion does not leak across
+// silhouettes.
+//
+// ao_apply, at full resolution: multiply the scene's colour by it.
 const char k_ao_source[] = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -1063,24 +1075,32 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
     return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
 }
 
-// Pass 3, full resolution, blended onto the scene: the occlusion blurred over
-// 3x3 half-resolution texels, skipping those at a different distance.
-fragment float4 ao_apply(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], texture2d<float> ao [[texture(1)]],
-                         texture2d<float> z [[texture(2)]], constant Params &p [[buffer(0)]])
+// Pass 3, half resolution: blur over 3x3 texels, skipping those at a different
+// distance so that occlusion does not leak across silhouettes.
+fragment float4 ao_blur(VertexOut in [[stage_in]], texture2d<float> ao [[texture(0)]], texture2d<float> z [[texture(1)]],
+                        constant Params &p [[buffer(0)]])
 {
     int2 c = int2(in.position.xy);
-    float zc = view_z(depth, c, p);
-    int2 h = c / 2;
+    float zc = load_z(z, c, p);
     float total = 0.0, weight = 0.0;
     for (int j = -1; j <= 1; j++) {
         for (int i = -1; i <= 1; i++) {
-            int2 t = clamp(h + int2(i, j), int2(0), int2(p.ao_size) - 1);
+            int2 t = clamp(c + int2(i, j), int2(0), int2(p.ao_size) - 1);
             float w = exp(-abs(load_z(z, t, p) - zc) / (0.03 * zc + 0.02)) / (1.0 + abs(float(i)) + abs(float(j)));
             total += ao.read(uint2(t)).x * w;
             weight += w;
         }
     }
-    float a = weight > 0.0001 ? total / weight : 1.0;
+    return float4(weight > 0.0001 ? total / weight : 1.0);
+}
+
+// Pass 4, full resolution, blended onto the scene: one filtered sample. All the
+// per-pixel work was done at half resolution; this pass touches four times as
+// many pixels and has to stay cheap.
+fragment float4 ao_apply(VertexOut in [[stage_in]], texture2d<float> ao [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    float a = ao.sample(smooth, in.position.xy / p.depth_size).x;
     return float4(a, a, a, 1.0);
 }
 )";
@@ -1092,8 +1112,8 @@ struct AOParams {
 };
 
 id<MTLLibrary> s_ao_library;
-id<MTLRenderPipelineState> s_ao_linearize_pipeline, s_ao_compute_pipeline;
-id<MTLTexture> s_ao_z_texture;
+id<MTLRenderPipelineState> s_ao_linearize_pipeline, s_ao_compute_pipeline, s_ao_blur_pipeline;
+id<MTLTexture> s_ao_z_texture, s_ao_blurred_texture;
 std::map<std::pair<int, int>, id<MTLRenderPipelineState>> s_ao_apply_pipelines; // by colour format and sample count
 id<MTLTexture> s_ao_texture;
 
@@ -1116,7 +1136,9 @@ bool ao_setup()
     d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_compute"];
     d.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
     s_ao_compute_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
-    if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline) {
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_blur"];
+    s_ao_blur_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline || !s_ao_blur_pipeline) {
         complain("ambient occlusion pipeline failed: %s", error.localizedDescription.UTF8String);
         return s_ao = false;
     }
@@ -1188,25 +1210,28 @@ void apply_ambient_occlusion()
             return [s_device newTextureWithDescriptor:td];
         };
         s_ao_texture = make(MTLPixelFormatR8Unorm);
+        s_ao_blurred_texture = make(MTLPixelFormatR8Unorm);
         s_ao_z_texture = make(MTLPixelFormatR32Float);
     }
     id<MTLRenderPipelineState> apply = ao_apply_pipeline(s_last.color.pixelFormat, 1);
     if (!apply) return;
 
-    auto half_pass = [&](id<MTLTexture> target, id<MTLRenderPipelineState> pipeline, id<MTLTexture> input) {
+    auto half_pass = [&](id<MTLTexture> target, id<MTLRenderPipelineState> pipeline, id<MTLTexture> input0, id<MTLTexture> input1) {
         MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
         d.colorAttachments[0].texture = target;
         d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         d.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
         [pass setRenderPipelineState:pipeline];
-        [pass setFragmentTexture:input atIndex:0];
+        [pass setFragmentTexture:input0 atIndex:0];
+        if (input1) [pass setFragmentTexture:input1 atIndex:1];
         [pass setFragmentBytes:&params length:sizeof params atIndex:0];
         [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [pass endEncoding];
     };
-    half_pass(s_ao_z_texture, s_ao_linearize_pipeline, s_last.depth);
-    half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture);
+    half_pass(s_ao_z_texture, s_ao_linearize_pipeline, s_last.depth, nil);
+    half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture, nil);
+    half_pass(s_ao_blurred_texture, s_ao_blur_pipeline, s_ao_texture, s_ao_z_texture);
 
     // Blended onto the resolved image, which is what post-processing reads. The
     // multisampled copy is left as it was: writing there would blend every
@@ -1218,9 +1243,7 @@ void apply_ambient_occlusion()
     onto.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:onto];
     [pass setRenderPipelineState:apply];
-    [pass setFragmentTexture:s_last.depth atIndex:0];
-    [pass setFragmentTexture:s_ao_texture atIndex:1];
-    [pass setFragmentTexture:s_ao_z_texture atIndex:2];
+    [pass setFragmentTexture:s_ao_blurred_texture atIndex:0];
     [pass setFragmentBytes:&params length:sizeof params atIndex:0];
     [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [pass endEncoding];
@@ -1311,6 +1334,11 @@ bool prepare_draw()
         memcpy(p->uniform_data[1].data() + p->samples_offset, &samples, 4);
         p->uniform_dirty[1] = true;
     }
+    float limit = s_pass_screen ? 1.0f : 65000.0f;
+    if (p->limit_offset >= 0 && memcmp(p->uniform_data[1].data() + p->limit_offset, &limit, 4)) {
+        memcpy(p->uniform_data[1].data() + p->limit_offset, &limit, 4);
+        p->uniform_dirty[1] = true;
+    }
     float headroom = s_headroom.load(std::memory_order_relaxed);
     if (p->headroom_offset >= 0 && memcmp(p->uniform_data[1].data() + p->headroom_offset, &headroom, 4)) {
         memcpy(p->uniform_data[1].data() + p->headroom_offset, &headroom, 4);
@@ -1393,52 +1421,6 @@ id<MTLBuffer> quad_indices(int quads)
         s_quad_indices = [s_device newBufferWithBytes:idx.data() length:idx.size() * 2 options:MTLResourceStorageModeShared];
     }
     return s_quad_indices;
-}
-
-// The game blends translucent UI with one blend function for colour and
-// alpha alike, which leaves the screen's alpha channel below 1 wherever
-// something translucent was drawn. An 8-bit opaque layer ignores that channel.
-// The extended-range layer appears not to: such pixels came out darker, as
-// rectangles around text while it faded. This pass sets alpha to 1 across the
-// finished frame and touches nothing else.
-id<MTLRenderPipelineState> s_opaque_pipeline;
-
-void make_frame_opaque()
-{
-    if (!s_opaque_pipeline) {
-        static const char source[] = R"(
-#include <metal_stdlib>
-using namespace metal;
-struct VertexOut { float4 position [[position]]; };
-vertex VertexOut opaque_vertex(uint id [[vertex_id]])
-{
-    VertexOut out;
-    out.position = float4(float2((id << 1) & 2, id & 2) * 2.0 - 1.0, 0.0, 1.0);
-    return out;
-}
-fragment float4 opaque_fragment() { return float4(0.0, 0.0, 0.0, 1.0); }
-)";
-        NSError *error = nil;
-        id<MTLLibrary> library = [s_device newLibraryWithSource:@(source) options:nil error:&error];
-        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-        d.vertexFunction = [library newFunctionWithName:@"opaque_vertex"];
-        d.fragmentFunction = [library newFunctionWithName:@"opaque_fragment"];
-        d.colorAttachments[0].pixelFormat = s_drawable.texture.pixelFormat;
-        d.colorAttachments[0].writeMask = MTLColorWriteMaskAlpha;
-        if (library) s_opaque_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
-        if (!s_opaque_pipeline) {
-            complain("the pass that makes the frame opaque failed: %s", error.localizedDescription.UTF8String);
-            return;
-        }
-    }
-    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
-    d.colorAttachments[0].texture = s_drawable.texture;
-    d.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    d.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> pass = [s_cmd renderCommandEncoderWithDescriptor:d];
-    [pass setRenderPipelineState:s_opaque_pipeline];
-    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [pass endEncoding];
 }
 
 float half_to_float(uint16_t h)
@@ -1585,7 +1567,6 @@ void mtl_present(bool capture, uint32_t frame)
     @autoreleasepool {
         end_pass();
         if (!s_cmd) return; // the game issued nothing this frame
-        if (s_hdr && s_drawable) make_frame_opaque();
         id<MTLTexture> copy = nil;
         if (capture && s_drawable) {
             id<MTLTexture> src = s_drawable.texture;
