@@ -764,6 +764,16 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
 // wbm_shell.z: fewer, thicker strands that reach several centimetres out,
 // hang much farther along the surface, and swing a little (wbm_shell.w
 // carries the time, as 1 + seconds).
+// Noise that changes smoothly from place to place, 0 to 1.
+float wbm_noise(vec2 p)
+{
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = fract(sin(dot(i, vec2(127.1, 311.7))) * 43758.5453), b = fract(sin(dot(i + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+    float c = fract(sin(dot(i + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453), d = fract(sin(dot(i + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
 // Where on the texture the hair passing over uv in this layer is rooted.
 vec2 wbm_shell_root(vec2 uv, vec3 down)
 {
@@ -809,12 +819,19 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
         if (share > length_) return true;
         return abs(fract(across) - 0.5) > 0.5 * (1.0 - 0.6 * share / length_);
     }
+    // Hairs on a plain grid make stripes with the layers and with the mesh's
+    // own triangles. So each hair stands off the middle of its cell by a
+    // chance amount, and how long the hairs are varies smoothly from place to
+    // place, in tufts, as well as from hair to hair.
     vec2 at = root * density;
-    vec2 cell = floor(at), within = fract(at) - 0.5;
+    vec2 cell = floor(at);
     float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
-    float length_ = (0.35 + 0.65 * chance) * mix(0.6, 1.0, grows.y);
+    vec2 centre = 0.5 + 0.28 * (vec2(fract(chance * 37.17), fract(chance * 91.73)) - 0.5) * 2.0;
+    vec2 within = fract(at) - centre;
+    float tufts = 0.6 * wbm_noise(at / 9.0) + 0.4 * wbm_noise(at / 3.5 + 17.0);
+    float length_ = (0.3 + 0.35 * chance + 0.35 * tufts) * mix(0.6, 1.0, grows.y);
     if (share > length_) return true;
-    float thickness = 0.42 * (1.0 - 0.75 * share / length_);
+    float thickness = 0.36 * (1.0 - 0.75 * share / length_);
     return dot(within, within) > thickness * thickness;
 }
 
