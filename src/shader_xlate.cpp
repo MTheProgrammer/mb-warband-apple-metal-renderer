@@ -315,6 +315,7 @@ vec3 wbm_albedo = vec3(0.5);
 float wbm_mask = 0.0;
 float wbm_metal = 0.0;
 float wbm_debug_mask = 0.0, wbm_debug_gloss = 0.0;
+float wbm_metal_map = -1.0; // metalness read from a specular map, when the shader has one
 float wbm_dim = 0.35;  // how far a metal loses its diffuse colour
 float wbm_rough = 1.0; // factors from the material class, see k_xl_material_uniform
 float wbm_gain = 1.0;
@@ -500,7 +501,9 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
 
     std::string mask;
     std::smatch m;
+    bool has_map = false;
     if (std::regex_search(fs, m, specular_map)) {
+        has_map = true;
         mask = "dot(texture2D(specular_texture, " + std::string(m[1]) + ").xyz, vec3(0.33))";
     } else if (std::regex_search(fs, m, alpha_mask)) {
         std::smatch uv;
@@ -539,7 +542,7 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
             extra += k_pbr_sky_functions;
         }
     }
-    fs = std::regex_replace(fs, encode, "$1.xyz += " + call + ";\n  $&" + (debug ? std::string("\n  $1.xyz = vec3(wbm_metal, ") + (materials ? std::string(k_xl_material_uniform) + ".w * 0.5" : "wbm_debug_mask") + ", wbm_debug_gloss);" : std::string()),
+    fs = std::regex_replace(fs, encode, "$1.xyz += " + call + ";\n  $&" + (debug ? "\n  $1.xyz = vec3(wbm_metal);" : ""),
                             std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, decode,
                             std::string("wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  ") + (materials ? "wbm_classify();\n  " : "") +
@@ -553,26 +556,33 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
     std::string start = "\n  float wbm_gloss = dot(vSpecularColor.xyz, vec3(0.3333));"
                         "\n  float wbm_raw_mask = clamp(" + mask + ", 0.0, 1.0);"
                         "\n  wbm_mask = wbm_raw_mask * clamp(wbm_gloss / 40.0, 0.0, 1.0);"
-                        "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);"
+                        // A specular map is grey-scale and works as a mask of materials:
+                        // measured on a helmet texture, fur and leather are below 0.08 and
+                        // steel from 0.3 up. Without one the mask is the base texture's
+                        // alpha, which most armour textures do not have (it reads as 1).
+                        + (has_map ? "\n  wbm_metal_map = smoothstep(0.12, 0.3, wbm_raw_mask);"
+                                     "\n  wbm_metal = wbm_metal_map * smoothstep(3.0, 10.0, wbm_gloss);"
+                                   : "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);") +
                         "\n  wbm_debug_mask = wbm_raw_mask;"
                         "\n  wbm_debug_gloss = clamp(wbm_gloss / 40.0, 0.0, 1.0);";
     if (materials) {
         // What the texture is says more than the two numbers above can.
-        // The engine's specular maps are maps of painted highlights, nearly
-        // black over most of a helmet, so they cannot say what is metal. Two
-        // things can: the material's specular brightness, which the engine sets
-        // high for whatever should shine, and colour, since steel is grey where
-        // the leather, cloth and painted wood that share its textures are not.
-        // The texture's class limits how far that is believed (see
-        // k_xl_material_uniform); an unknown texture is believed most of the way.
+        // A specular map gives metalness where it is bright (see above), but not
+        // every map marks all the metal: a shield's leaves its boss dark. Two
+        // more things can tell, map or no map: the material's specular brightness,
+        // which the engine sets high for whatever should shine, and colour,
+        // since steel is grey where the leather, cloth and painted wood that
+        // share its textures are not. The texture's class limits how far that
+        // guess is believed (see k_xl_material_uniform); an unknown texture is
+        // believed most of the way.
         extra += std::string("uniform vec4 ") + k_xl_material_uniform + ";\n" +
                  "void wbm_classify()\n{\n"
+                 "    float known = " + k_xl_material_uniform + ".w;\n"
                  "    float hi = max(max(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b), lo = min(min(wbm_albedo.r, wbm_albedo.g), wbm_albedo.b);\n"
                  "    float grey = 1.0 - smoothstep(0.2, 0.5, (hi - lo) / max(hi, 0.08));\n"
                  "    float shiny = smoothstep(0.12, 0.3, wbm_debug_gloss);\n"
-                 "    float known = " + k_xl_material_uniform + ".w;\n"
                  "    float most = known > 0.0 ? known - 1.0 : 0.8;\n"
-                 "    float factor = known > 0.0 ? " + k_xl_material_uniform + ".x : 1.0;\n"
+                 "    float factor = known > 0.0 || wbm_metal_map >= 0.0 ? 1.0 : " + k_xl_material_uniform + ".x;\n"
                  "    wbm_metal = clamp(max(wbm_metal * factor, most * grey * shiny), 0.0, 1.0);\n"
                  "    wbm_dim = 0.8;\n"
                  "}\n";

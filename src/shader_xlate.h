@@ -84,9 +84,8 @@ struct XlOptions {
     // strength per material class from the backend, which knows what each
     // texture is. Adds the wbm_material uniform (see k_xl_material_uniform).
     bool materials = false;
-    // For tuning: shaders with an environment reflection show, in place of
-    // their colour, red = estimated metalness, green = the specular mask,
-    // blue = the material's specular brightness / 40.
+    // For tuning: shaders with an environment reflection show their estimated
+    // metalness in place of their colour, white for metal and black for none.
     bool debug_materials = false;
     // In the engine's final post-processing shader: replace its tone-mapping
     // operator with a filmic curve.
