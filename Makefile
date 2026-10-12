@@ -69,11 +69,17 @@ build/xlate_test: tools/xlate_test.mm src/shader_xlate.cpp src/shader_xlate.h $(
 	$(CXX) -arch x86_64 -std=c++17 -O1 -mmacosx-version-min=11.0 -fobjc-arc $(INCLUDES) \
 	    tools/xlate_test.mm src/shader_xlate.cpp $(DEPS) -framework Metal -framework Foundation -o $@
 
+# Plays back a frame captured with scripts/capture.sh, without the game:
+#   build/replay traces/latest/capture_000123.wbcap [--png out.png]
+REPLAY_OBJS := build/metal_backend.o build/shader_xlate.o build/shader_cache.o build/gl_enums.o build/capture.o
+build/replay: tools/replay.mm $(REPLAY_OBJS) $(DEPS)
+	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -Isrc tools/replay.mm $(REPLAY_OBJS) $(DEPS) $(FRAMEWORKS) -o $@
+
 build:
 	mkdir -p build
 
 clean:
-	rm -f build/*.o build/*.dylib build/xlate_test build/*.zip
+	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/*.zip
 	rm -rf "$(APP)"
 
 distclean:

@@ -105,6 +105,8 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_OUT` | Output directory. `run.sh` sets it to `traces/<timestamp>`; otherwise `~/Library/Logs/warband-metal` |
 | `WBM_TRACE_FRAMES` | Frames to log call by call and capture, for example `1-3,600` |
 | `WBM_SNAP_EVERY` | Captures a frame to `frames/` every this many seconds, for example `10`. In trace mode each captured frame is also logged call by call |
+
+A single frame can also be captured whole and looked at later without the game. While the game runs in Metal mode, `scripts/capture.sh [delay-seconds]` writes the next frame and everything it depends on to `capture_<n>.wbcap` in the run's output directory (several hundred MB). `make build/replay` builds a player for such files: `build/replay file.wbcap` shows the frame in a window, and `build/replay file.wbcap --png out.png` saves it as an image. The `WBM_*` variables apply to the player as they do to the game, so one captured frame can be compared across settings. Capture with the features of interest switched on: the player can turn them off, but cannot supply what the game was never asked for.
 | `WBM_GLERR` | `1` checks `glGetError` after every setup call |
 | `WBM_LOG_MAX_MB` | Size limit of `trace.log` outside call-by-call frames. Default 256 |
 | `WBM_MODULE` | Module to load, for `run.sh`, for example `Native`. Works like the launcher's choice: it stays selected for later launches |

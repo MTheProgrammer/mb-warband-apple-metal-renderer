@@ -15,10 +15,12 @@
 #include <dirent.h>
 #include <mach-o/dyld.h>
 #include <cmath>
+#include <csignal>
 #include <cstdarg>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +46,10 @@ struct Buffer {
 struct Texture {
     id<MTLTexture> mtl;
     uint8_t material = 0; // what the texture shows, when its file was recognised: see MaterialClass
+    // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
+    GLint gl_internal = 0;
+    GLenum gl_format = 0, gl_type = 0;
+    int gl_w = 0, gl_h = 0;
     MTLPixelFormat format = MTLPixelFormatInvalid;
     int top_level = -1; // highest mip level that has content
     int scale = 1;      // storage is this many times the size the game asked for (see s_scale)
@@ -60,6 +66,8 @@ struct Texture {
 struct Renderbuffer {
     id<MTLTexture> mtl; // multisampled itself when it belongs to a multisampled target
     int scale = 1;
+    GLenum gl_internal = 0; // as the game asked for it, for frame captures
+    int gl_w = 0, gl_h = 0;
 };
 
 struct Framebuffer {
@@ -2870,6 +2878,8 @@ void save_capture(id<MTLTexture> copy, uint32_t frame, const char *name = "frame
     wb_save_frame_png(pixels.data(), w, h, frame, true, name);
 }
 
+#include "frame_capture.inc"
+
 } // namespace
 
 // ---- window and frame ------------------------------------------------------------------------
@@ -2877,6 +2887,7 @@ void save_capture(id<MTLTexture> copy, uint32_t frame, const char *name = "frame
 void mtl_attach_window(void *nswindow, int width, int height)
 {
     s_debug_clear = getenv("WBM_DEBUG_CLEAR") != nullptr;
+    signal(SIGUSR2, [](int) { s_capture_requested = 1; }); // scripts/capture.sh
     s_device = MTLCreateSystemDefaultDevice();
     s_queue = [s_device newCommandQueue];
     s_viewport = {0, 0, width, height};
@@ -3113,7 +3124,40 @@ void mtl_present(bool capture, uint32_t frame)
               s_headroom.store(std::min(s_hdr_peak, std::max(1.0f, (float)available)));
             });
         }
+        capture_at_frame_end();
     }
+}
+
+// ---- frame capture and playback (see frame_capture.inc) -------------------------------------------
+
+void mtl_request_capture() { s_capture_requested = 1; }
+
+bool mtl_replay_open(const char *path, int *width, int *height)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    s_replay.file.resize((size_t)std::max(size, 0L));
+    bool read = fread(s_replay.file.data(), 1, s_replay.file.size(), f) == s_replay.file.size();
+    fclose(f);
+    size_t at = 0;
+    uint32_t kind;
+    Rd r{};
+    if (!read || !next_record(s_replay.file, &at, &kind, &r) || kind != CAP_HEADER || r.i() != CAP_VERSION) return false;
+    s_replay.width = *width = (int)r.i();
+    s_replay.height = *height = (int)r.i();
+    s_replay.state_at = at;
+    return r.ok;
+}
+
+bool mtl_replay_restore() { return restore_state(); }
+
+void mtl_replay_frame(bool capture, uint32_t frame)
+{
+    replay_calls();
+    mtl_present(capture, frame);
 }
 
 // ---- clears, viewport, fixed-function state ------------------------------------------------------
@@ -3122,22 +3166,24 @@ void mtl_present(bool capture, uint32_t frame)
 // draws that follow on the same target go into that pass.
 void mtl_glClear(GLbitfield mask)
 {
+    REC(FN_glClear).i(mask);
     @autoreleasepool {
         Target t;
         if (resolve_target(t)) start_pass(t, mask);
     }
 }
 
-void mtl_glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) { s_clear_color = MTLClearColorMake(r, g, b, a); }
-void mtl_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { s_viewport = {x, y, width, height}; }
-void mtl_glDepthMask(GLboolean flag) { s_depth_mask = flag; }
-void mtl_glDepthFunc(GLenum func) { s_depth_func = func; }
-void mtl_glCullFace(GLenum mode) { s_cull_face = mode; }
-void mtl_glBlendEquation(GLenum mode) { s_blend_eq = mode; }
-void mtl_glPolygonMode(GLenum, GLenum mode) { s_polygon_mode = mode; }
+void mtl_glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) { REC(FN_glClearColor).f(r).f(g).f(b).f(a); s_clear_color = MTLClearColorMake(r, g, b, a); }
+void mtl_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { REC(FN_glViewport).i(x).i(y).i(width).i(height); s_viewport = {x, y, width, height}; }
+void mtl_glDepthMask(GLboolean flag) { REC(FN_glDepthMask).i(flag); s_depth_mask = flag; }
+void mtl_glDepthFunc(GLenum func) { REC(FN_glDepthFunc).i(func); s_depth_func = func; }
+void mtl_glCullFace(GLenum mode) { REC(FN_glCullFace).i(mode); s_cull_face = mode; }
+void mtl_glBlendEquation(GLenum mode) { REC(FN_glBlendEquation).i(mode); s_blend_eq = mode; }
+void mtl_glPolygonMode(GLenum, GLenum mode) { REC(FN_glPolygonMode).i(mode); s_polygon_mode = mode; }
 
 void mtl_glBlendFunc(GLenum sfactor, GLenum dfactor)
 {
+    REC(FN_glBlendFunc).i(sfactor).i(dfactor);
     s_blend_src = sfactor;
     s_blend_dst = dfactor;
 }
@@ -3152,8 +3198,8 @@ static void set_capability(GLenum cap, bool on)
     }
 }
 
-void mtl_glEnable(GLenum cap) { set_capability(cap, true); }
-void mtl_glDisable(GLenum cap) { set_capability(cap, false); }
+void mtl_glEnable(GLenum cap) { REC(FN_glEnable).i(cap); set_capability(cap, true); }
+void mtl_glDisable(GLenum cap) { REC(FN_glDisable).i(cap); set_capability(cap, false); }
 
 // ---- queries ------------------------------------------------------------------------------------------
 
@@ -3179,7 +3225,7 @@ void mtl_glGetFloatv(GLenum pname, GLfloat *params)
 
 // ---- buffers -------------------------------------------------------------------------------------------
 
-void mtl_glGenBuffers(GLsizei n, GLuint *buffers) { gen_ids(s_next_buffer, n, buffers); }
+void mtl_glGenBuffers(GLsizei n, GLuint *buffers) { gen_ids(s_next_buffer, n, buffers); REC(FN_glGenBuffers).i(n).i(n > 0 ? buffers[0] : 0); }
 
 void mtl_glDeleteBuffers(GLsizei n, const GLuint *buffers)
 {
@@ -3188,6 +3234,7 @@ void mtl_glDeleteBuffers(GLsizei n, const GLuint *buffers)
 
 void mtl_glBindBuffer(GLenum target, GLuint buffer)
 {
+    REC(FN_glBindBuffer).i(target).i(buffer);
     if (target == GL_ARRAY_BUFFER) s_array_buffer = buffer;
     else if (target == GL_ELEMENT_ARRAY_BUFFER) s_element_buffer = buffer;
 }
@@ -3196,6 +3243,7 @@ void mtl_glBindBuffer(GLenum target, GLuint buffer)
 // for: draws already encoded keep the old contents alive.
 void mtl_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum)
 {
+    REC(FN_glBufferData).i(target).i(size).blob(data, (size_t)std::max<GLsizeiptr>(size, 0));
     GLuint id = target == GL_ARRAY_BUFFER ? s_array_buffer : s_element_buffer;
     if (!id || size <= 0) return;
     @autoreleasepool {
@@ -3209,16 +3257,19 @@ void mtl_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum)
 
 void mtl_glEnableVertexAttribArray(GLuint index)
 {
+    REC(FN_glEnableVertexAttribArray).i(index);
     if (index < MAX_ATTRIBS) s_attribs[index].enabled = true;
 }
 
 void mtl_glDisableVertexAttribArray(GLuint index)
 {
+    REC(FN_glDisableVertexAttribArray).i(index);
     if (index < MAX_ATTRIBS) s_attribs[index].enabled = false;
 }
 
 void mtl_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer)
 {
+    REC(FN_glVertexAttribPointer).i(index).i(size).i(type).i(normalized).i(stride).i((int64_t)(uintptr_t)pointer);
     if (index >= MAX_ATTRIBS) return;
     Attrib &a = s_attribs[index];
     a.buffer = s_array_buffer;
@@ -3231,17 +3282,18 @@ void mtl_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean 
 
 // ---- textures ------------------------------------------------------------------------------------------------
 
-void mtl_glGenTextures(GLsizei n, GLuint *textures) { gen_ids(s_next_texture, n, textures); }
+void mtl_glGenTextures(GLsizei n, GLuint *textures) { gen_ids(s_next_texture, n, textures); REC(FN_glGenTextures).i(n).i(n > 0 ? textures[0] : 0); }
 
 void mtl_glDeleteTextures(GLsizei n, const GLuint *textures)
 {
     for (GLsizei i = 0; i < n; i++) s_textures.erase(textures[i]);
 }
 
-void mtl_glActiveTexture(GLenum texture) { s_unit = texture - GL_TEXTURE0; }
+void mtl_glActiveTexture(GLenum texture) { REC(FN_glActiveTexture).i(texture); s_unit = texture - GL_TEXTURE0; }
 
 void mtl_glBindTexture(GLenum target, GLuint texture)
 {
+    REC(FN_glBindTexture).i(target).i(texture);
     if (target != GL_TEXTURE_2D) {
         complain("texture target %s is not supported", E(target));
         return;
@@ -3260,6 +3312,9 @@ void mtl_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei 
         complain("unsupported texture format: internalformat %s, format %s, type %s", E_ifmt(internalformat), E(format), E(type));
         return;
     }
+    REC(FN_glTexImage2D).i(target).i(level).i(internalformat).i(width).i(height).i(format).i(type).blob(
+        pixels, (((size_t)width * (size_t)f.bytes_per_pixel + 3) & ~(size_t)3) * (size_t)height);
+    if (level == 0) t->gl_internal = internalformat, t->gl_format = format, t->gl_type = type, t->gl_w = width, t->gl_h = height;
     @autoreleasepool {
         // Without data this is a render target: screen-sized ones get the screen's scale.
         int k = (!pixels && level == 0) ? scale_for(width, height) : 1;
@@ -3303,6 +3358,7 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
         complain("unsupported compressed texture format %s", E(internalformat));
         return;
     }
+    REC(FN_glCompressedTexImage2D).i(target).i(level).i(internalformat).i(width).i(height).blob(data, (size_t)std::max(imageSize, 0));
     @autoreleasepool {
         if (!ensure_storage(*t, f, level, width, height) || !data) return;
         if (s_materials && level == 0) {
@@ -3365,11 +3421,12 @@ static void set_texture_parameter(GLenum pname, GLint value, GLfloat fvalue)
     t->sampler = nil;
 }
 
-void mtl_glTexParameteri(GLenum, GLenum pname, GLint param) { set_texture_parameter(pname, param, (GLfloat)param); }
-void mtl_glTexParameterf(GLenum, GLenum pname, GLfloat param) { set_texture_parameter(pname, (GLint)param, param); }
+void mtl_glTexParameteri(GLenum, GLenum pname, GLint param) { REC(FN_glTexParameteri).i(pname).i(param); set_texture_parameter(pname, param, (GLfloat)param); }
+void mtl_glTexParameterf(GLenum, GLenum pname, GLfloat param) { REC(FN_glTexParameterf).i(pname).f(param); set_texture_parameter(pname, (GLint)param, param); }
 
 void mtl_glGenerateMipmap(GLenum)
 {
+    REC(FN_glGenerateMipmap);
     Texture *t = bound_texture();
     if (!t || !t->mtl || t->mtl.mipmapLevelCount < 2) return;
     @autoreleasepool {
@@ -3386,18 +3443,20 @@ void mtl_glGenerateMipmap(GLenum)
 // only ever sets the unpack alignment to 4, which the uploads assume.
 void mtl_glTexEnvf(GLenum, GLenum pname, GLfloat param)
 {
+    REC(FN_glTexEnvf).i(pname).f(param);
     if (pname != GL_TEXTURE_LOD_BIAS || param != 0) complain("glTexEnvf(%s, %g) is ignored", E(pname), param);
 }
 
 void mtl_glPixelStorei(GLenum pname, GLint param)
 {
+    REC(FN_glPixelStorei).i(pname).i(param);
     if (pname != GL_UNPACK_ALIGNMENT || param != 4) complain("glPixelStorei(%s, %d) is ignored", E(pname), param);
 }
 
 // ---- framebuffers ---------------------------------------------------------------------------------------------
 
-void mtl_glGenFramebuffers(GLsizei n, GLuint *framebuffers) { gen_ids(s_next_framebuffer, n, framebuffers); }
-void mtl_glGenRenderbuffers(GLsizei n, GLuint *renderbuffers) { gen_ids(s_next_renderbuffer, n, renderbuffers); }
+void mtl_glGenFramebuffers(GLsizei n, GLuint *framebuffers) { gen_ids(s_next_framebuffer, n, framebuffers); REC(FN_glGenFramebuffers).i(n).i(n > 0 ? framebuffers[0] : 0); }
+void mtl_glGenRenderbuffers(GLsizei n, GLuint *renderbuffers) { gen_ids(s_next_renderbuffer, n, renderbuffers); REC(FN_glGenRenderbuffers).i(n).i(n > 0 ? renderbuffers[0] : 0); }
 
 void mtl_glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)
 {
@@ -3411,15 +3470,17 @@ void mtl_glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers)
 
 void mtl_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
+    REC(FN_glBindFramebuffer).i(target).i(framebuffer);
     if (target == GL_READ_FRAMEBUFFER) return;
     s_fbo = framebuffer;
     if (framebuffer) s_framebuffers[framebuffer];
 }
 
-void mtl_glBindRenderbuffer(GLenum, GLuint renderbuffer) { s_rbo = renderbuffer; }
+void mtl_glBindRenderbuffer(GLenum, GLuint renderbuffer) { REC(FN_glBindRenderbuffer).i(renderbuffer); s_rbo = renderbuffer; }
 
 void mtl_glRenderbufferStorage(GLenum, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    REC(FN_glRenderbufferStorage).i(internalformat).i(width).i(height);
     if (!s_rbo || width <= 0 || height <= 0) return;
     FormatInfo f = pick_format((GLint)internalformat, 0, 0);
     if (f.format != MTLPixelFormatDepth32Float) {
@@ -3428,6 +3489,7 @@ void mtl_glRenderbufferStorage(GLenum, GLenum internalformat, GLsizei width, GLs
     }
     @autoreleasepool {
         Renderbuffer &rb = s_renderbuffers[s_rbo];
+        rb.gl_internal = internalformat, rb.gl_w = width, rb.gl_h = height;
         rb.scale = scale_for(width, height);
         rb.mtl = new_depth_texture((NSUInteger)(width * rb.scale), (NSUInteger)(height * rb.scale),
                                    is_screen_sized(width, height) ? s_msaa : 1);
@@ -3436,6 +3498,7 @@ void mtl_glRenderbufferStorage(GLenum, GLenum internalformat, GLsizei width, GLs
 
 void mtl_glFramebufferTexture2D(GLenum, GLenum attachment, GLenum, GLuint texture, GLint level)
 {
+    REC(FN_glFramebufferTexture2D).i(attachment).i(texture).i(level);
     Framebuffer *fb = find(s_framebuffers, s_fbo);
     if (!fb) return;
     if (level != 0) complain("rendering to mip level %d is not supported", level);
@@ -3446,6 +3509,7 @@ void mtl_glFramebufferTexture2D(GLenum, GLenum attachment, GLenum, GLuint textur
 
 void mtl_glFramebufferRenderbuffer(GLenum, GLenum attachment, GLenum, GLuint renderbuffer)
 {
+    REC(FN_glFramebufferRenderbuffer).i(attachment).i(renderbuffer);
     Framebuffer *fb = find(s_framebuffers, s_fbo);
     if (!fb) return;
     if (attachment == GL_DEPTH_ATTACHMENT) fb->depth_renderbuffer = renderbuffer, fb->depth_texture = 0;
@@ -3459,6 +3523,7 @@ GLuint mtl_glCreateShader(GLenum type)
     GLuint id = ++s_next_object;
     s_shaders[id] = std::make_shared<Shader>();
     s_shaders[id]->type = type;
+    REC(FN_glCreateShader).i(type).i(id);
     return id;
 }
 
@@ -3466,6 +3531,7 @@ GLuint mtl_glCreateProgram(void)
 {
     GLuint id = ++s_next_object;
     s_programs[id];
+    REC(FN_glCreateProgram).i(id);
     return id;
 }
 
@@ -3480,6 +3546,7 @@ void mtl_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *strin
         if (length && length[i] >= 0) src.append(string[i], (size_t)length[i]);
         else src.append(string[i]);
     }
+    REC(FN_glShaderSource).i(shader).s(src);
 }
 
 // Translation needs both stages, so the work happens in glLinkProgram.
@@ -3487,6 +3554,7 @@ void mtl_glCompileShader(GLuint) {}
 
 void mtl_glAttachShader(GLuint program, GLuint shader)
 {
+    REC(FN_glAttachShader).i(program).i(shader);
     Program *p = find(s_programs, program);
     auto it = s_shaders.find(shader);
     if (p && it != s_shaders.end()) p->shaders.push_back(it->second);
@@ -3494,11 +3562,13 @@ void mtl_glAttachShader(GLuint program, GLuint shader)
 
 void mtl_glBindAttribLocation(GLuint program, GLuint index, const GLchar *name)
 {
+    REC(FN_glBindAttribLocation).i(program).i(index).s(name ? name : "");
     if (Program *p = find(s_programs, program)) p->attribs[name] = (int)index;
 }
 
 void mtl_glLinkProgram(GLuint program)
 {
+    REC(FN_glLinkProgram).i(program);
     Program *p = find(s_programs, program);
     if (!p) return;
     @autoreleasepool {
@@ -3512,7 +3582,7 @@ void mtl_glDeleteProgram(GLuint program)
     s_programs.erase(program);
     s_last_key_program = 0;
 }
-void mtl_glUseProgram(GLuint program) { s_program = program; }
+void mtl_glUseProgram(GLuint program) { REC(FN_glUseProgram).i(program); s_program = program; }
 
 // Compile and link status are always reported as success: a program that
 // failed to translate is logged and its draws are skipped, which keeps the
@@ -3544,13 +3614,14 @@ GLint mtl_glGetUniformLocation(GLuint program, const GLchar *name)
     return it == p->location_by_name.end() ? -1 : it->second;
 }
 
-void mtl_glUniform1f(GLint location, GLfloat v0) { set_uniform(location, &v0, 1, 1, false); }
-void mtl_glUniform1i(GLint location, GLint v0) { set_uniform(location, &v0, 1, 1, true); }
-void mtl_glUniform1iv(GLint location, GLsizei count, const GLint *value) { set_uniform(location, value, count, 1, true); }
-void mtl_glUniform4fv(GLint location, GLsizei count, const GLfloat *value) { set_uniform(location, value, count, 4, false); }
+void mtl_glUniform1f(GLint location, GLfloat v0) { REC(FN_glUniform1f).s(uniform_name(location)).f(v0); set_uniform(location, &v0, 1, 1, false); }
+void mtl_glUniform1i(GLint location, GLint v0) { REC(FN_glUniform1i).s(uniform_name(location)).i(v0); set_uniform(location, &v0, 1, 1, true); }
+void mtl_glUniform1iv(GLint location, GLsizei count, const GLint *value) { REC(FN_glUniform1iv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 4); set_uniform(location, value, count, 1, true); }
+void mtl_glUniform4fv(GLint location, GLsizei count, const GLfloat *value) { REC(FN_glUniform4fv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 16); set_uniform(location, value, count, 4, false); }
 
 void mtl_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
+    REC(FN_glUniformMatrix4fv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 64);
     if (transpose) complain("glUniformMatrix4fv with transpose is not supported");
     set_uniform(location, value, count, 16, false);
 }
@@ -3559,6 +3630,7 @@ void mtl_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, 
 
 void mtl_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
+    REC(FN_glDrawArrays).i(mode).i(first).i(count);
     if (count <= 0) return;
     @autoreleasepool {
         if (mode == GL_QUADS) {
@@ -3586,6 +3658,7 @@ void mtl_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 
 void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
 {
+    REC(FN_glDrawElements).i(mode).i(count).i(type).i((int64_t)(uintptr_t)indices);
     if (count <= 0) return;
     @autoreleasepool {
         MTLPrimitiveType primitive;

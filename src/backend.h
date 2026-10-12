@@ -19,3 +19,14 @@ void mtl_set_vsync(bool on);
 void mtl_dump_stats(FILE *f); // shader translation and compile timings, for the summary
 // Ends the frame and presents it; saves it to frames/ first when capture is set.
 void mtl_present(bool capture, uint32_t frame);
+
+// Frame captures (see frame_capture.inc). mtl_request_capture may be called
+// from a signal handler: the frame after the current one is written, with all
+// the state it depends on, to capture_<frame>.wbcap in the output directory.
+void mtl_request_capture();
+// Playback, for tools/replay.mm: open a capture to learn the size the game
+// rendered at, attach a window of that size, restore, then run the frame as
+// often as wanted. Each run ends with mtl_present.
+bool mtl_replay_open(const char *path, int *width, int *height);
+bool mtl_replay_restore();
+void mtl_replay_frame(bool capture, uint32_t frame);
