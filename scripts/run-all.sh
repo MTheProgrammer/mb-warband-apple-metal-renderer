@@ -6,6 +6,7 @@
 export WBM_PBR=${WBM_PBR:-2}          # microfacet highlights, metalness, environment reflection
 export WBM_SRGB=${WBM_SRGB:-1}        # hardware sRGB texture decoding
 export WBM_AO=${WBM_AO:-1}            # ambient occlusion
+export WBM_CONTACT_SHADOWS=${WBM_CONTACT_SHADOWS:-1}  # screen-space contact shadows
 export WBM_TONEMAP=${WBM_TONEMAP:-1}  # filmic tone map
 export WBM_HDR=${WBM_HDR:-1}          # extended-range output on HDR displays
 exec "$(dirname "$0")/run.sh" "$@"

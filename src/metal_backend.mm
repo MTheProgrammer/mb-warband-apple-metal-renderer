@@ -89,6 +89,7 @@ struct UniformLocation {
     int texture_index[2] = {-1, -1};                  // set for samplers
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
     bool is_view_proj = false;                        // the uniform named matViewProj, which ambient occlusion reads
+    bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
 };
 
@@ -254,6 +255,13 @@ bool s_ao;
 float s_ao_radius = 0.6f, s_ao_strength = 0.5f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
 float s_view_proj[16];                          // the camera's matViewProj, as last set while drawing the scene
 bool s_view_proj_valid;
+// Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
+// pass as ambient occlusion. They need the sun: its direction and colour as
+// last given to a shader while the scene was being drawn.
+bool s_contact_shadows;
+float s_contact_strength = 0.5f, s_contact_length = 0.4f; // WBM_CONTACT_STRENGTH; WBM_CONTACT_LENGTH in metres
+float s_sun_dir[4], s_sun_color[4];
+bool s_sun_valid;
 void apply_ambient_occlusion();
 
 void reset_pass_state()
@@ -413,7 +421,8 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     end_pass();
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
-    if (s_ao && s_last.scene && s_last.color != t.color && s_last.draws > 100 && s_last.occluded_in_frame != s_frame_serial) {
+    if ((s_ao || s_contact_shadows) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
+        s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         apply_ambient_occlusion();
     }
@@ -712,6 +721,8 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.emplace_back();
                 p.locations.back().name = name;
                 p.locations.back().is_view_proj = name == "matViewProj";
+                p.locations.back().is_sun_dir = name == "vSunDir";
+                p.locations.back().is_sun_color = name == "vSunColor";
             }
             return p.locations[(size_t)it->second];
         };
@@ -760,13 +771,20 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (!p || loc < 0 || (size_t)loc >= p->locations.size()) return;
     UniformLocation &l = p->locations[(size_t)loc];
     if ((l.texture_index[0] >= 0 || l.texture_index[1] >= 0) && data_is_int) l.unit = *(const GLint *)data;
-    if (s_ao && l.is_view_proj && components == 16 && count >= 1) {
-        // Other cameras (shadows, water reflection) set this uniform too; only the
-        // one in use while the scene buffer is bound is the player's view.
+    if ((s_ao || s_contact_shadows) && (l.is_view_proj || l.is_sun_dir || l.is_sun_color) && count >= 1) {
+        // Other cameras (shadows, water reflection) and the UI set these too; only
+        // the values in use while the scene buffer is bound describe the scene.
         Target t;
         if (s_fbo != 0 && resolve_target(t) && t.scene) {
-            memcpy(s_view_proj, data, sizeof s_view_proj);
-            s_view_proj_valid = true;
+            if (l.is_view_proj && components == 16) {
+                memcpy(s_view_proj, data, sizeof s_view_proj);
+                s_view_proj_valid = true;
+            } else if (l.is_sun_dir && components == 4) {
+                memcpy(s_sun_dir, data, sizeof s_sun_dir);
+                s_sun_valid = true;
+            } else if (l.is_sun_color && components == 4) {
+                memcpy(s_sun_color, data, sizeof s_sun_color);
+            }
         }
     }
     for (int s = 0; s < 2; s++) {
@@ -988,6 +1006,8 @@ struct Params {
     float2 depth_size; // of the depth buffer, in pixels
     float2 ao_size;    // of the half-resolution textures
     float radius, strength, reversed, fade_start;
+    float4 sun;        // xyz: direction to the sun in view space
+    float shadow_strength, shadow_length;
 };
 
 #if WBM_MSAA
@@ -1072,6 +1092,36 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
     }
     float occlusion = sum * p.radius * 2.0 / float(directions * steps);
     float ao = saturate(1.0 - p.strength * occlusion);
+
+    // Contact shadows: walk a short way from the surface towards the sun and see
+    // whether something on screen is in the way. This catches what the shadow
+    // map is too coarse for: feet on the ground, gear against a body, grass.
+    // Only surfaces facing the sun are tested, since the others are unlit
+    // already, and a hit counts only if the blocker is thin enough to plausibly
+    // be in front of the ray instead of merely nearer to the camera.
+    if (p.shadow_strength > 0.0) {
+        float3 L = normalize(p.sun.xyz);
+        float facing = dot(n, L);
+        if (facing > 0.05) {
+            float3 origin = P + n * (0.015 + 0.004 * P.z);
+            float hit = 0.0;
+            const int shadow_steps = 10;
+            for (int s = 0; s < shadow_steps; s++) {
+                float t = (float(s) + noise) / float(shadow_steps) * p.shadow_length;
+                float3 S = origin + L * t;
+                if (S.z <= 0.05) break;
+                float2 ndc = float2(S.x * p.p00, S.y * p.p11) / S.z;
+                int2 sc = int2((ndc * 0.5 + 0.5) * p.ao_size);
+                if (any(sc < int2(0)) || any(sc >= int2(p.ao_size))) break;
+                float behind = S.z - z.read(uint2(sc)).x;
+                if (behind > 0.02 + 0.003 * S.z && behind < 0.25 + 0.01 * S.z) {
+                    hit = 1.0 - 0.5 * t / p.shadow_length;
+                    break;
+                }
+            }
+            ao *= 1.0 - p.shadow_strength * hit * smoothstep(0.05, 0.3, facing);
+        }
+    }
     return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
 }
 
@@ -1105,10 +1155,12 @@ fragment float4 ao_apply(VertexOut in [[stage_in]], texture2d<float> ao [[textur
 }
 )";
 
-struct AOParams {
+struct AOParams { // must match Params in k_ao_source
     float a, b, p00, p11;
     float depth_size[2], ao_size[2];
     float radius, strength, reversed, fade_start;
+    float sun[4];
+    float shadow_strength, shadow_length, pad[2];
 };
 
 id<MTLLibrary> s_ao_library;
@@ -1126,7 +1178,7 @@ bool ao_setup()
     s_ao_library = [s_device newLibraryWithSource:@(k_ao_source) options:options error:&error];
     if (!s_ao_library) {
         complain("ambient occlusion shaders did not compile: %s", error.localizedDescription.UTF8String);
-        return s_ao = false;
+        return s_ao = s_contact_shadows = false;
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [s_ao_library newFunctionWithName:@"ao_vertex"];
@@ -1140,7 +1192,7 @@ bool ao_setup()
     s_ao_blur_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
     if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline || !s_ao_blur_pipeline) {
         complain("ambient occlusion pipeline failed: %s", error.localizedDescription.UTF8String);
-        return s_ao = false;
+        return s_ao = s_contact_shadows = false;
     }
     return true;
 }
@@ -1198,7 +1250,23 @@ void apply_ambient_occlusion()
     params.depth_size[0] = (float)w, params.depth_size[1] = (float)h;
     params.ao_size[0] = (float)aw, params.ao_size[1] = (float)ah;
     params.radius = s_ao_radius;
-    params.strength = s_ao_strength;
+    params.strength = s_ao ? s_ao_strength : 0.0f;
+    // The sun in view space: rows 0, 1 and 3 of view-projection are the camera's
+    // right, up and forward axes, each scaled. vSunDir points the way the light
+    // travels, so the direction to the sun is its negative. No sun (night,
+    // interiors) means no contact shadows.
+    memset(params.sun, 0, sizeof params.sun);
+    params.shadow_strength = 0;
+    params.shadow_length = s_contact_length;
+    params.pad[0] = params.pad[1] = 0;
+    float sun_brightness = s_sun_color[0] + s_sun_color[1] + s_sun_color[2];
+    if (s_contact_shadows && s_sun_valid && sun_brightness > 0.05f) {
+        float to_sun[3] = {-s_sun_dir[0], -s_sun_dir[1], -s_sun_dir[2]};
+        params.sun[0] = dot3(r0, to_sun) / sqrtf(dot3(r0, r0));
+        params.sun[1] = dot3(r1, to_sun) / sqrtf(dot3(r1, r1));
+        params.sun[2] = dot3(r3, to_sun) / sqrtf(forward2);
+        params.shadow_strength = s_contact_strength;
+    }
     params.reversed = s_reverse_depth ? 1.0f : 0.0f;
     params.fade_start = 60.0f; // metres: beyond this the effect fades out, and is gone at twice it
 
@@ -1476,6 +1544,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_ao = ao_env && atoi(ao_env) != 0; // off unless set
     if (const char *v = getenv("WBM_AO_RADIUS")) s_ao_radius = (float)atof(v);
     if (const char *v = getenv("WBM_AO_STRENGTH")) s_ao_strength = (float)atof(v);
+    const char *contact_env = getenv("WBM_CONTACT_SHADOWS");
+    s_contact_shadows = contact_env && atoi(contact_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_CONTACT_STRENGTH")) s_contact_strength = (float)atof(v);
+    if (const char *v = getenv("WBM_CONTACT_LENGTH")) s_contact_length = (float)atof(v);
     const char *pbr_env = getenv("WBM_PBR");
     s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) >= 1;    // off unless set
     s_shader_options.pbr_environment = pbr_env && atoi(pbr_env) >= 2; // 2: metalness and environment reflection too
@@ -1530,11 +1602,12 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "filmic tone map %s; extended-range output %s",
+            "contact shadows %s; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_shader_options.filmic_tonemap ? "on" : "off", s_hdr ? "on" : "off");
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_shader_options.filmic_tonemap ? "on" : "off",
+            s_hdr ? "on" : "off");
 }
 
 const char *mtl_device_name()
