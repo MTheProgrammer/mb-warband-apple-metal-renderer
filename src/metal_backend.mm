@@ -9,6 +9,7 @@
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CABase.h>
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <atomic>
@@ -46,6 +47,7 @@ struct Buffer {
 struct Texture {
     id<MTLTexture> mtl;
     uint8_t material = 0; // what the texture shows, when its file was recognised: see MaterialClass
+    bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
     GLint gl_internal = 0;
     GLenum gl_format = 0, gl_type = 0;
@@ -351,18 +353,34 @@ const float k_material_params[MAT_COUNT][4] = {
     {0.0f, 1.2f, 0.9f, 1.0f},   // a horse's coat
 };
 bool s_materials;
-std::unordered_map<uint64_t, uint8_t> s_material_by_content; // filled once at start, read-only afterwards
+// The game's texture files, keyed by content: filled once at start, read-only afterwards.
+struct KnownTexture {
+    uint8_t cls;     // MaterialClass
+    bool flipped;    // this is the file's content turned upside down, as the game uploads most textures
+    uint32_t name;   // index into s_texture_names
+};
+std::unordered_map<uint64_t, KnownTexture> s_material_by_content;
+std::vector<std::string> s_texture_names; // lower case, without the extension
+std::vector<std::string> s_texture_paths; // where each was found
 struct {
     std::atomic<int> uploads{0}, matched{0}, recognised{0}, strangers{0};
     int files = 0, classed[MAT_COUNT] = {}, dumped = 0;
 } s_material_stats;
 
+// A key for one level of a block-compressed texture, from 32 blocks in each of
+// 8 rows of blocks spread over the image. (The start of the data alone will
+// not do: many textures begin with the same empty margin.) rows[i] points to
+// the whole of row key_row(i).
+//
 // alpha: 0 for DXT1, 3 for DXT3, 5 for DXT5. The alpha half of a block is
 // left out of the key except for DXT5's two alpha values: the game's way of
 // turning the alpha indices upside down does not always give what turning the
 // image does (measured: a few bits differ in some blocks), so they cannot be
 // predicted from the file.
-uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t size, int alpha)
+enum { KEY_ROWS = 8, KEY_COLUMNS = 32 };
+size_t key_row(uint32_t height, int i) { return (size_t)((height + 3) / 4) * (size_t)(2 * i + 1) / (2 * KEY_ROWS); }
+
+uint64_t content_key_rows(uint32_t width, uint32_t height, int alpha, const uint8_t *const *rows)
 {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](const uint8_t *p, size_t n) {
@@ -370,17 +388,29 @@ uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t s
     };
     mix((const uint8_t *)&width, 4);
     mix((const uint8_t *)&height, 4);
-    const uint8_t *p = (const uint8_t *)data;
-    size = std::min<size_t>(size, 1024);
-    if (!alpha) {
-        mix(p, size);
-    } else {
-        for (size_t b = 0; b + 16 <= size; b += 16) {
-            if (alpha == 5) mix(p + b, 2);
-            mix(p + b + 8, 8);
+    size_t block = alpha ? 16 : 8, across = (width + 3) / 4;
+    for (int i = 0; i < KEY_ROWS; i++) {
+        for (int j = 0; j < KEY_COLUMNS; j++) {
+            const uint8_t *b = rows[i] + across * (size_t)(2 * j + 1) / (2 * KEY_COLUMNS) * block;
+            if (!alpha) {
+                mix(b, 8);
+            } else {
+                if (alpha == 5) mix(b, 2);
+                mix(b + 8, 8);
+            }
         }
     }
     return h;
+}
+
+// The same for a level held whole in memory; 0 if it is shorter than its size requires.
+uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t size, int alpha)
+{
+    size_t row_bytes = (size_t)((width + 3) / 4) * (alpha ? 16 : 8);
+    if (size < row_bytes * ((height + 3) / 4)) return 0;
+    const uint8_t *rows[KEY_ROWS];
+    for (int i = 0; i < KEY_ROWS; i++) rows[i] = (const uint8_t *)data + key_row(height, i) * row_bytes;
+    return content_key_rows(width, height, alpha, rows);
 }
 
 int classify_texture_name(std::string name)
@@ -426,6 +456,10 @@ void scan_texture_folder(const std::string &dir)
         if (name.size() < 5 || strcasecmp(name.c_str() + name.size() - 4, ".dds")) continue;
         int cls = classify_texture_name(name.substr(0, name.size() - 4));
         s_material_stats.files++;
+        uint32_t name_index = (uint32_t)s_texture_names.size();
+        s_texture_names.push_back(name.substr(0, name.size() - 4));
+        s_texture_paths.push_back(dir + "/" + name);
+        for (char &c : s_texture_names.back()) c = (char)tolower((unsigned char)c);
         FILE *f = fopen((dir + "/" + name).c_str(), "rb");
         if (!f) continue;
         uint8_t header[128];
@@ -440,37 +474,37 @@ void scan_texture_folder(const std::string &dir)
             long at = sizeof header;
             for (uint32_t level = 0; block && level < std::min<uint32_t>(std::max<uint32_t>(mips, 1), 4) && width && height; level++) {
                 size_t size = (size_t)((width + 3) / 4) * ((height + 3) / 4) * block;
-                uint8_t head[1024];
-                size_t want = std::min(size, sizeof head);
-                if (fseek(f, at, SEEK_SET) || fread(head, 1, want, f) != want) break;
-                s_material_by_content[content_key(width, height, head, want, alpha)] = (uint8_t)cls; // unknown ones too, to tell them from strangers
-                // The game turns most textures upside down before handing them to
-                // OpenGL, whose rows run bottom to top: the rows of blocks in
-                // reverse order, and the four rows inside each block reversed too.
-                // What it then uploads starts with the file's last rows of blocks.
                 size_t row_bytes = (size_t)((width + 3) / 4) * block, rows = (size_t)((height + 3) / 4);
-                size_t rows_wanted = std::min(rows, (want + row_bytes - 1) / row_bytes);
-                std::vector<uint8_t> flipped;
-                bool ok = true;
-                for (size_t r = 0; r < rows_wanted && ok; r++) {
-                    std::vector<uint8_t> row(row_bytes);
-                    ok = !fseek(f, at + (long)((rows - 1 - r) * row_bytes), SEEK_SET) && fread(row.data(), 1, row_bytes, f) == row_bytes;
-                    for (size_t b = 0; ok && b + block <= row_bytes && flipped.size() + b < want + block; b += block) {
-                        uint8_t *q = row.data() + b;
-                        if (block == 16 && !memcmp(&fourcc, "DXT3", 4)) { // four rows of explicit alpha, two bytes each
-                            std::swap(q[0], q[6]), std::swap(q[1], q[7]), std::swap(q[2], q[4]), std::swap(q[3], q[5]);
-                        } else if (block == 16) { // DXT5: sixteen 3-bit alpha indices after the two alpha values
-                            uint64_t bits = 0;
-                            for (int i = 0; i < 6; i++) bits |= (uint64_t)q[2 + i] << (8 * i);
-                            uint64_t turned = ((bits & 0xFFF) << 36) | ((bits >> 12 & 0xFFF) << 24) | ((bits >> 24 & 0xFFF) << 12) | (bits >> 36 & 0xFFF);
-                            for (int i = 0; i < 6; i++) q[2 + i] = (uint8_t)(turned >> (8 * i));
+                // Once as the file has it, and once upside down: the game turns most
+                // textures over before handing them to OpenGL, whose rows run bottom
+                // to top. Upside down, row r is the file's row from the other end,
+                // with the four rows inside each of its blocks reversed too.
+                for (int flipped = 0; flipped < 2; flipped++) {
+                    std::vector<uint8_t> data[KEY_ROWS];
+                    const uint8_t *pointers[KEY_ROWS];
+                    bool ok = true;
+                    for (int k = 0; k < KEY_ROWS && ok; k++) {
+                        size_t r = key_row(height, k);
+                        data[k].resize(row_bytes);
+                        ok = !fseek(f, at + (long)((flipped ? rows - 1 - r : r) * row_bytes), SEEK_SET) && fread(data[k].data(), 1, row_bytes, f) == row_bytes;
+                        for (size_t b = 0; ok && flipped && b + block <= row_bytes; b += block) {
+                            uint8_t *q = data[k].data() + b;
+                            if (alpha == 3) { // four rows of explicit alpha, two bytes each
+                                std::swap(q[0], q[6]), std::swap(q[1], q[7]), std::swap(q[2], q[4]), std::swap(q[3], q[5]);
+                            } else if (alpha == 5) { // sixteen 3-bit alpha indices after the two alpha values
+                                uint64_t bits = 0;
+                                for (int n = 0; n < 6; n++) bits |= (uint64_t)q[2 + n] << (8 * n);
+                                uint64_t turned = ((bits & 0xFFF) << 36) | ((bits >> 12 & 0xFFF) << 24) | ((bits >> 24 & 0xFFF) << 12) | (bits >> 36 & 0xFFF);
+                                for (int n = 0; n < 6; n++) q[2 + n] = (uint8_t)(turned >> (8 * n));
+                            }
+                            uint8_t *colour = q + (block == 16 ? 8 : 0); // two colours, then four rows of indices, a byte each
+                            std::swap(colour[4], colour[7]), std::swap(colour[5], colour[6]);
                         }
-                        uint8_t *colour = q + (block == 16 ? 8 : 0); // two colours, then four rows of indices, a byte each
-                        std::swap(colour[4], colour[7]), std::swap(colour[5], colour[6]);
+                        pointers[k] = data[k].data();
                     }
-                    if (ok) flipped.insert(flipped.end(), row.begin(), row.end());
+                    // Unknown ones go in too, to tell them from strangers.
+                    if (ok) s_material_by_content[content_key_rows(width, height, alpha, pointers)] = {(uint8_t)cls, flipped != 0, name_index};
                 }
-                if (ok && flipped.size() >= want) s_material_by_content[content_key(width, height, flipped.data(), want, alpha)] = (uint8_t)cls;
                 at += (long)size;
                 width = std::max<uint32_t>(width / 2, 1);
                 height = std::max<uint32_t>(height / 2, 1);
@@ -484,14 +518,22 @@ void scan_texture_folder(const std::string &dir)
 
 void scan_game_textures()
 {
+    // The game's folder: four levels above its executable when this is the
+    // game; for the frame player, WBM_GAME or where Steam puts it.
     char path[4096];
     uint32_t size = sizeof path;
-    if (_NSGetExecutablePath(path, &size)) return;
-    std::string root = path; // <game>/Mount and Blade.app/Contents/MacOS/Mount and Blade
-    for (int up = 0; up < 4; up++) {
-        size_t slash = root.rfind('/');
-        if (slash == std::string::npos) return;
-        root.resize(slash);
+    std::string root;
+    if (const char *game = getenv("WBM_GAME")) {
+        root = game;
+    } else if (!_NSGetExecutablePath(path, &size) && strstr(path, "/Mount and Blade.app/Contents/MacOS/")) {
+        root = path; // <game>/Mount and Blade.app/Contents/MacOS/Mount and Blade
+        for (int up = 0; up < 4; up++) {
+            size_t slash = root.rfind('/');
+            if (slash == std::string::npos) return;
+            root.resize(slash);
+        }
+    } else if (const char *home = getenv("HOME")) {
+        root = std::string(home) + "/Library/Application Support/Steam/steamapps/common/MountBlade Warband";
     }
     scan_texture_folder(root + "/Textures");
     scan_texture_folder(root + "/TexturesHD");
@@ -1992,6 +2034,8 @@ void apply_motion_blur()
     s_blur_frames++;
 }
 
+#include "texture_packs.inc"
+
 // Binds a buffer to a vertex (stage 0) or fragment (stage 1) slot, doing only
 // as much as changed: nothing, the offset alone, or the whole binding.
 void bind_buffer(int stage, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index)
@@ -2932,7 +2976,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_BOUNCE")) s_bounce_strength = std::max(0.0f, (float)atof(v));
     const char *mat_env = getenv("WBM_MATERIALS");
     s_materials = s_shader_options.materials = mat_env && atoi(mat_env) != 0 && s_shader_options.pbr_environment; // off unless set; needs WBM_PBR=2 or 3
-    if (s_materials) scan_game_textures();
+    index_texture_packs();
+    if (s_materials || !s_pack_files.empty() || s_pack_self_test) scan_game_textures();
     s_shader_options.debug_materials = getenv("WBM_DEBUG_MATERIALS") != nullptr && s_shader_options.pbr_environment;
     const char *blur_env = getenv("WBM_MOTION_BLUR");
     s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
@@ -3020,6 +3065,12 @@ void mtl_dump_stats(FILE *f)
         fprintf(f, "\n== sky ambient ==\napplied in %llu frames; tint now towards +X %.2f %.2f %.2f, -X %.2f %.2f %.2f, up %.2f %.2f %.2f; bounce %.3f %.3f %.3f\n",
                 (unsigned long long)s_amb_stats_frames, s_amb[0], s_amb[1], s_amb[2], s_amb[4], s_amb[5], s_amb[6], s_amb[16], s_amb[17], s_amb[18],
                 s_amb[20], s_amb[21], s_amb[22]);
+    }
+    if (!s_pack_files.empty() || s_pack_stats.replaced.load()) {
+        fprintf(f, "\n== texture packs ==\n%zu files on offer; %d textures replaced, %d could not be loaded\n", s_pack_files.size(), s_pack_stats.replaced.load(),
+                s_pack_stats.failed.load());
+        std::lock_guard<std::mutex> lock(s_pack_stats.mu);
+        for (const std::string &name : s_pack_stats.names) fprintf(f, "  %s\n", name.c_str());
     }
     if (s_materials) {
         fprintf(f, "\n== material classes ==\n%d texture files seen, classed by name:", s_material_stats.files);
@@ -3374,13 +3425,22 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
     }
     REC(FN_glCompressedTexImage2D).i(target).i(level).i(internalformat).i(width).i(height).blob(data, (size_t)std::max(imageSize, 0));
     @autoreleasepool {
-        if (!ensure_storage(*t, f, level, width, height) || !data) return;
-        if (s_materials && level == 0) {
+        if (t->replaced && level > 0) return; // the pack's image came with its own smaller levels
+        if (level == 0) t->replaced = false;
+        if (!s_material_by_content.empty() && level == 0 && data) {
             int alpha = internalformat == 0x83F2 ? 3 : internalformat == 0x83F3 ? 5 : 0; // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, ..._DXT5_EXT
             auto it = s_material_by_content.find(content_key((uint32_t)width, (uint32_t)height, data, (size_t)imageSize, alpha));
             // The game loads some textures small first and in full later; whatever
             // was recognised stays until something else is.
-            if (it != s_material_by_content.end()) t->material = it->second;
+            if (it != s_material_by_content.end()) {
+                t->material = it->second.cls;
+                if (replace_from_pack(*t, it->second)) return;
+            }
+        }
+        if (!ensure_storage(*t, f, level, width, height) || !data) return;
+        if (s_materials && level == 0) {
+            int alpha = internalformat == 0x83F2 ? 3 : internalformat == 0x83F3 ? 5 : 0;
+            auto it = s_material_by_content.find(content_key((uint32_t)width, (uint32_t)height, data, (size_t)imageSize, alpha));
             s_material_stats.uploads++;
             if (it != s_material_by_content.end()) s_material_stats.matched++;
             else if (s_material_stats.strangers++ < 60 && imageSize >= 32) {

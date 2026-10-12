@@ -36,7 +36,7 @@ std::atomic<uint32_t> g_frame{0};
 std::atomic<uint64_t> g_frame_draws{0};
 bool g_metal = true, g_fast = true, g_native = false, g_glerr = false;
 const char *g_out_dir = ".";
-static bool s_quiet;
+static bool s_quiet, s_stats;
 
 int wb_thread() { return 0; }
 void wb_count(int) {}
@@ -76,11 +76,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-ui")) s_view.interface = false;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) s_quiet = true;
+        else if (!strcmp(argv[i], "--stats")) s_stats = true;
         else path = argv[i];
     }
     int width = 0, height = 0;
     if (!path || !mtl_replay_open(path, &width, &height)) {
-        fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet]\n"
+        fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet] [--stats]\n"
                         "              [--yaw deg] [--pitch deg] [--pan x y] [--forward m] [--pivot m] [--no-ui]\n%s\n",
                 path ? "that file is not a frame capture" : "");
         return 2;
@@ -143,6 +144,7 @@ int main(int argc, char **argv)
                 mtl_replay_show_interface(s_view.interface);
                 mtl_replay_frame(png && n == (uint32_t)frames, n);
             }
+            if (s_stats) mtl_dump_stats(stdout);
             if (png) {
                 char saved[1200];
                 snprintf(saved, sizeof saved, "%s/frames/frame_%06u.png", g_out_dir, (unsigned)frames);

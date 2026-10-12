@@ -11,7 +11,7 @@ CXXFLAGS := -arch x86_64 -std=c++17 -O2 -g -Wall -Wextra -Wno-deprecated-declara
 FRAMEWORKS := -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
               -framework Metal -framework QuartzCore -framework AppKit
 
-HDRS := $(wildcard src/*.h) src/gl_api.def
+HDRS := $(wildcard src/*.h) $(wildcard src/*.inc) src/gl_api.def
 DEPS := build/deps/libdeps.a
 INCLUDES := -Ithird_party/glew-2.1.0/include/GL -Ithird_party/SDL/include \
             -Ithird_party/glslang -Ithird_party/SPIRV-Cross -Ibuild/deps/include

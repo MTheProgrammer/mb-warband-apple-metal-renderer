@@ -375,7 +375,7 @@ bool restore_state()
     // had no use for it under the options then, takes the value another got.
     std::unordered_map<std::string, SavedUniform> by_name;
     std::vector<std::pair<GLuint, std::set<std::string>>> given;
-    int textures = 0, programs = 0, buffers = 0;
+    int textures = 0, programs = 0, buffers = 0, replaced = 0, resized = 0;
     while (next_record(rp.file, &at, &kind, &r)) {
         if (kind == CAP_FRAME) break;
         @autoreleasepool {
@@ -427,6 +427,17 @@ bool restore_state()
                     int64_t levels = r.i();
                     for (int64_t level = 0; level < levels; level++) {
                         auto data = r.blob();
+                        // A texture pack applies to a played-back frame as it does to the
+                        // game: the largest level says which of the game's files this is.
+                        if (level == 0 && data.first && !s_material_by_content.empty()) {
+                            int alpha = format == MTLPixelFormatBC2_RGBA ? 3 : format == MTLPixelFormatBC3_RGBA ? 5 : format == MTLPixelFormatBC1_RGBA ? 0 : -1;
+                            auto it = alpha < 0 ? s_material_by_content.end() : s_material_by_content.find(content_key((uint32_t)w, (uint32_t)h, data.first, data.second, alpha));
+                            if (it != s_material_by_content.end() && replace_from_pack(t, it->second)) {
+                                replaced++;
+                                if (t.mtl.width != w || t.mtl.height != h) resized++;
+                            }
+                        }
+                        if (t.replaced) continue;
                         NSUInteger lw = std::max<NSUInteger>(1, w >> level), lh = std::max<NSUInteger>(1, h >> level), row, size;
                         if (!data.first || !t.mtl || !level_layout(format, lw, lh, &row, &size) || data.second < size) continue;
                         [t.mtl replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:(NSUInteger)level withBytes:data.first bytesPerRow:row];
@@ -533,6 +544,7 @@ bool restore_state()
         }
     }
     wb_note("replay: %d buffers, %d textures, %d programs restored", buffers, textures, programs);
+    if (replaced) wb_note("replay: %d textures taken from texture packs, %d of them at another size than the game's", replaced, resized);
     return true;
 }
 
