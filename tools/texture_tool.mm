@@ -455,7 +455,25 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     }
     for (size_t i = 0; i < count; i++) xx[i] *= grows[i], xy[i] *= grows[i], yy[i] *= grows[i];
     int radius = std::max(2, w / 110);
-    blur(xx, w, h, radius), blur(xy, w, h, radius), blur(yy, w, h, radius);
+    // The coat's strokes are short and point every way, so there the reading
+    // is smoothed over a much wider area, into paths, and leant towards the
+    // way a coat lies anyhow: down the picture, which on these textures is down
+    // the horse. (A strand running down has all its change across: xx.)
+    {
+        std::vector<float> cxx = xx, cxy = xy, cyy = yy;
+        double strength = 0, area = 0;
+        for (size_t i = 0; i < count; i++)
+            if (grows[i] > 0.25f && mask[i] <= 0.5f) strength += xx[i] + yy[i], area += 1;
+        float lean = area > 0 ? (float)(0.5 * strength / area) : 0;
+        for (size_t i = 0; i < count; i++) cxx[i] += lean * grows[i];
+        int wide = std::max(4, w / 22);
+        blur(cxx, w, h, wide), blur(cxy, w, h, wide), blur(cyy, w, h, wide);
+        blur(xx, w, h, radius), blur(xy, w, h, radius), blur(yy, w, h, radius);
+        for (size_t i = 0; i < count; i++) {
+            float m = mask[i]; // long hair keeps its own, finer reading
+            xx[i] = xx[i] * m + cxx[i] * (1 - m), xy[i] = xy[i] * m + cxy[i] * (1 - m), yy[i] = yy[i] * m + cyy[i] * (1 - m);
+        }
+    }
     std::vector<float> dx(count), dy(count), trust(count);
     for (size_t i = 0; i < count; i++) {
         float angle = 0.5f * atan2f(2 * xy[i], xx[i] - yy[i]) + 1.5707963f; // a right angle from the steepest change
