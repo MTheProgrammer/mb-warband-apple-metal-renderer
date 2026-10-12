@@ -71,7 +71,7 @@ build/xlate_test: tools/xlate_test.mm src/shader_xlate.cpp src/shader_xlate.h $(
 
 # Plays back a frame captured with scripts/capture.sh, without the game:
 #   build/replay traces/latest/capture_000123.wbcap [--png out.png]
-REPLAY_OBJS := build/metal_backend.o build/shader_xlate.o build/shader_cache.o build/gl_enums.o build/capture.o
+REPLAY_OBJS := build/metal_backend.o build/shader_xlate.o build/shader_cache.o build/gl_enums.o build/capture.o build/brf.o
 build/replay: tools/replay.mm $(REPLAY_OBJS) $(DEPS)
 	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -Isrc tools/replay.mm $(REPLAY_OBJS) $(DEPS) $(FRAMEWORKS) -o $@
 

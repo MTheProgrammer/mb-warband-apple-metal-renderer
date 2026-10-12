@@ -36,3 +36,13 @@ void mtl_replay_frame(bool capture, uint32_t frame);
 // and brought nearer by `forward`, all in metres. Zeros restore the capture's own view.
 void mtl_replay_orbit(double yaw, double pitch, double pan_x, double pan_y, double forward, double pivot);
 void mtl_replay_show_interface(bool show);
+
+// The model previewer (model_preview.inc), for the frame player. After
+// mtl_replay_restore, and between frames: shows the named mesh of the game's
+// resource files in the captured frame in place of its scene (or with it, for
+// keep_scene), `lod` 0 being the full mesh. An empty name goes back to the
+// frame as captured. *distance receives how far ahead of the camera the model
+// is, for the camera to turn about.
+bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *distance);
+int mtl_preview_list(const char *pattern, FILE *out); // prints mesh names containing the pattern
+const char *mtl_preview_neighbour(const char *name, int by);

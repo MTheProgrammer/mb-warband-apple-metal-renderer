@@ -364,6 +364,9 @@ void restore_uniform(Program &p, const SavedUniform &u)
     }
 }
 
+// What each uniform was last given in the captured run, under its name, whichever program it was.
+std::unordered_map<std::string, SavedUniform> s_stage_uniforms;
+
 bool restore_state()
 {
     Replay &rp = s_replay;
@@ -373,7 +376,7 @@ bool restore_state()
     // Engine uniforms are global in effect (the sun, the fog, the camera): a
     // program that never received one in the captured run, because its shader
     // had no use for it under the options then, takes the value another got.
-    std::unordered_map<std::string, SavedUniform> by_name;
+    std::unordered_map<std::string, SavedUniform> &by_name = s_stage_uniforms;
     std::vector<std::pair<GLuint, std::set<std::string>>> given;
     int textures = 0, programs = 0, buffers = 0, replaced = 0, resized = 0;
     while (next_record(rp.file, &at, &kind, &r)) {
@@ -437,6 +440,7 @@ bool restore_state()
                             auto it = alpha < 0 ? s_material_by_content.end() : s_material_by_content.find(content_key((uint32_t)w, (uint32_t)h, data.first, data.second, alpha));
                             if (it != s_material_by_content.end()) {
                                 t.material = it->second.cls; // as this build classes it, whatever the capturing one did
+                                t.radial_wind = s_texture_names[it->second.name].find("palm") != std::string::npos;
                                 attach_pbr_map(t, it->second);
                             }
                             if (it != s_material_by_content.end() && replace_from_pack(t, it->second)) {
@@ -685,6 +689,10 @@ GLint replay_location(const std::string &name)
     return loc;
 }
 
+// The model previewer (model_preview.inc) stands a model in for the scene.
+bool preview_wanted(bool *keep_scene);
+void preview_draw(bool prepass);
+
 // Issues the captured frame's calls once.
 void replay_calls()
 {
@@ -692,6 +700,7 @@ void replay_calls()
     if (!rp.counters.empty()) apply_counters(Rd{rp.counters.data(), rp.counters.data() + rp.counters.size()});
     if (!rp.gl_state.empty()) apply_gl_state(Rd{rp.gl_state.data(), rp.gl_state.data() + rp.gl_state.size()});
     update_camera();
+    bool keep_scene = false, previewing = preview_wanted(&keep_scene), preview_drawn[2] = {false, false};
     int screen_draws = 0;
     size_t at = rp.frame_at;
     uint32_t kind;
@@ -701,6 +710,20 @@ void replay_calls()
         // Without the interface: on the screen itself, only the first draw, which
         // is the finished scene, is let through.
         if (rp.hide_ui && s_fbo == 0 && (kind == FN_glDrawElements || kind == FN_glDrawArrays) && screen_draws++ > 0) continue;
+        // With a model to show: it goes in where the first of the scene's own
+        // depth-tested draws would, in the pre-pass and in the main pass, and
+        // those draws are left out. The sky, drawn without a depth test, stays.
+        if (previewing && (kind == FN_glDrawElements || kind == FN_glDrawArrays) && s_fbo != 0 && s_depth_test) {
+            Target t;
+            if (resolve_target(t) && (t.scene || t.prepass)) {
+                bool &done = preview_drawn[t.prepass ? 1 : 0];
+                if (!done) {
+                    done = true;
+                    preview_draw(t.prepass);
+                }
+                if (!keep_scene) continue;
+            }
+        }
         switch (kind) {
         case FN_glClear: mtl_glClear((GLbitfield)r.i()); break;
         case FN_glClearColor: {

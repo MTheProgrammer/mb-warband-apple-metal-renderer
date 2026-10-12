@@ -4,6 +4,7 @@
 // window setup, which runs on the main thread before rendering starts.
 
 #include "backend.h"
+#include "brf.h"
 #include "material_names.h"
 #include "shader_xlate.h"
 
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <dirent.h>
+#include <unistd.h>
 #include <mach-o/dyld.h>
 #include <cmath>
 #include <csignal>
@@ -51,6 +53,7 @@ struct Buffer {
 struct Texture {
     id<MTLTexture> mtl;
     uint8_t material = 0; // what the texture shows, when its file was recognised: see MaterialClass
+    bool radial_wind = false; // foliage that hangs from a crown (a palm's leaves): the wind takes hold by distance from the middle, not by height
     bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
     id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
@@ -541,6 +544,8 @@ bool s_motion_blur;
 float s_motion_blur_strength = 1.0f; // WBM_MOTION_BLUR_STRENGTH: exposure time in units of 1/48 s
 void apply_motion_blur();
 // Anti-aliasing after the fact (WBM_FXAA=1): see apply_fxaa.
+bool s_previewing; // the frame player is showing a model (model_preview.inc)
+bool s_preview_keeps_scene;
 bool s_fxaa;
 void apply_fxaa();
 // Frame-rate limits (WBM_MAX_FPS, and WBM_MENU_FPS for frames without a 3D scene); 0 for none.
@@ -709,7 +714,8 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     end_pass();
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
+    // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_previewing) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         if (s_ao || s_contact_shadows || s_light_shafts) apply_ambient_occlusion();
@@ -1657,7 +1663,8 @@ void apply_ambient_occlusion()
             params.sun[r] = (float)-(s_camera.view[r][0] * s_sun_dir[0] + s_camera.view[r][1] * s_sun_dir[1] + s_camera.view[r][2] * s_sun_dir[2]);
         if (s_contact_shadows) params.shadow_strength = s_contact_strength;
         if (s_dyn_shadows && s_dyn_near[2] > 0) params.sun[3] = s_dyn_near_range * 1.5f; // as far ahead as the fine window reaches
-        if (s_light_shafts && params.sun[2] > 0.05f) { // the sun is in front of the camera
+        // (Not around a previewed model on an empty stage: with nothing but sky, the whole picture would be shaft.)
+        if (s_light_shafts && params.sun[2] > 0.05f && !(s_previewing && !s_preview_keeps_scene)) { // the sun is in front of the camera
             float nx = params.sun[0] * params.p00 / params.sun[2], ny = params.sun[1] * params.p11 / params.sun[2];
             float off_screen = std::max(fabsf(nx), fabsf(ny));
             float visible = 1.0f - std::min(1.0f, std::max(0.0f, (off_screen - 1.0f) / 0.8f)); // fades out as the sun leaves the view
@@ -2194,8 +2201,10 @@ void apply_fxaa()
 // with the mesh's vertex count, which gives the plants; a vertex's height above
 // the lowest point of its plant, in decimetres, is then written into the alpha
 // of its colour, which foliage leaves at full. The vertex shaders read it from
-// there and take the alpha as full (see k_wind_function).
-bool weigh_foliage(Buffer &b)
+// there and take the alpha as full (see k_wind_function). For leaves that hang
+// from a crown (palms) the lowest point is a leaf's tip, so there the distance
+// from the plant's middle is used instead.
+bool weigh_foliage(Buffer &b, bool radial)
 {
     if (b.wind_weights == (__bridge void *)b.mtl) return true;
     const Attrib &pos = s_attribs[0], &col = s_attribs[2], &tex = s_attribs[4];
@@ -2224,9 +2233,22 @@ bool weigh_foliage(Buffer &b)
     }
     for (size_t first = 0; first < n; first += period) {
         float lowest = 1e30f;
-        for (size_t i = first; i < first + period; i++) lowest = std::min(lowest, z(i));
-        for (size_t i = first; i < first + period; i++)
-            base[i * stride + col.offset + 3] = (uint8_t)std::min(255.0f, std::max(0.0f, (z(i) - lowest) * 10.0f + 0.5f));
+        double middle[2] = {0, 0};
+        for (size_t i = first; i < first + period; i++) {
+            float xy[2];
+            memcpy(xy, base + i * stride + pos.offset, 8);
+            lowest = std::min(lowest, z(i));
+            middle[0] += xy[0] / (double)period, middle[1] += xy[1] / (double)period;
+        }
+        for (size_t i = first; i < first + period; i++) {
+            float metres = z(i) - lowest;
+            if (radial) { // leaves that hang from a crown are held at the middle and free at their tips, wherever those are
+                float xy[2];
+                memcpy(xy, base + i * stride + pos.offset, 8);
+                metres = 1.6f * (float)hypot(xy[0] - middle[0], xy[1] - middle[1]);
+            }
+            base[i * stride + col.offset + 3] = (uint8_t)std::min(255.0f, std::max(0.0f, metres * 10.0f + 0.5f));
+        }
     }
     b.wind_weights = (__bridge void *)b.mtl;
     return true;
@@ -2881,7 +2903,8 @@ bool prepare_draw()
                 const float *w = (const float *)(p->uniform_data[0].data() + p->u_world->offset);
                 phase = w[12] * 0.37f + w[13] * 0.71f;
             }
-            bool ready = !batch || weigh_foliage(*vb);
+            // A palm's leaves in their own space would need the same treatment; there the crown's height is not known. They are batched in practice.
+            bool ready = !batch || weigh_foliage(*vb, diffuse->radial_wind);
             wind[0] = (float)s_wind_time, wind[1] = ready ? s_wind_strength : 0.0f, wind[2] = batch ? 1.0f : 0.0f, wind[3] = fmodf(phase, 6.2831853f);
             // Once a buffer's alpha holds heights, every shader has to be told, sway or not.
             if (vb && vb->wind_weights == (__bridge void *)vb->mtl) wind[2] = 1.0f;
@@ -3230,6 +3253,7 @@ void save_capture(id<MTLTexture> copy, uint32_t frame, const char *name = "frame
 }
 
 #include "frame_capture.inc"
+#include "model_preview.inc"
 
 } // namespace
 
@@ -3541,6 +3565,57 @@ void mtl_replay_orbit(double yaw, double pitch, double pan_x, double pan_y, doub
 
 void mtl_replay_show_interface(bool show) { s_replay.hide_ui = !show; }
 
+bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *distance)
+{
+    s_preview.keep_scene = s_preview_keeps_scene = keep_scene;
+    s_previewing = false;
+    if (!name || !*name) {
+        s_preview.active = false;
+        return true;
+    }
+    bool ok = preview_load(name, lod);
+    s_previewing = ok;
+    if (ok && distance) *distance = preview_distance();
+    return ok;
+}
+
+int mtl_preview_list(const char *pattern, FILE *out)
+{
+    preview_read_library();
+    std::string want = lower_case(pattern ? pattern : "");
+    int found = 0;
+    for (auto &m : s_preview.library.meshes) {
+        if (m.first.find(".lod") != std::string::npos || m.first.find(want) == std::string::npos) continue;
+        const std::string &file = s_preview.library.files[(size_t)m.second.file];
+        fprintf(out, "%-44s %s\n", m.first.c_str(), file.substr(file.rfind('/') + 1).c_str());
+        found++;
+    }
+    return found;
+}
+
+// The mesh `by` places after (or before) the named one in its resource file's list; lods and further parts passed over.
+const char *mtl_preview_neighbour(const char *name, int by)
+{
+    preview_read_library();
+    static std::string result;
+    auto &meshes = s_preview.library.meshes;
+    auto it = meshes.find(lower_case(name ? name : ""));
+    if (it == meshes.end()) return nullptr;
+    int file = it->second.file;
+    std::vector<std::string> names;
+    for (auto &m : meshes) {
+        size_t dot = m.first.rfind('.');
+        bool part = dot != std::string::npos && dot + 1 < m.first.size() && isdigit((unsigned char)m.first[dot + 1]);
+        if (m.second.file == file && m.first.find(".lod") == std::string::npos && !part) names.push_back(m.first);
+    }
+    auto at = std::find(names.begin(), names.end(), it->first);
+    if (at == names.end() || names.empty()) return nullptr;
+    long index = ((at - names.begin()) + by) % (long)names.size();
+    if (index < 0) index += (long)names.size();
+    result = names[(size_t)index];
+    return result.c_str();
+}
+
 void mtl_replay_frame(bool capture, uint32_t frame)
 {
     replay_calls();
@@ -3757,6 +3832,7 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
             if (level == 0) t->pbr = nil;
             if (it != s_material_by_content.end()) {
                 t->material = it->second.cls;
+                t->radial_wind = s_texture_names[it->second.name].find("palm") != std::string::npos;
                 attach_pbr_map(*t, it->second);
                 if (replace_from_pack(*t, it->second)) return;
             }
