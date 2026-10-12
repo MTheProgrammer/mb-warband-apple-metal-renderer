@@ -379,6 +379,55 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         for (int x = 0; x < w; x++) mask[(size_t)y * w + x] = picture_at(x, y) > floor_ ? 1.0f : 0.0f;
     blur(mask, w, h, std::max(2, w / 130));
     for (float &m : mask) m = smoothstep(0.42f, 0.58f, m); // neither wider nor narrower than the picture has it
+    // A picture made for one horse is used for others of the same layout, whose
+    // manes do not end in quite the same places; and a hand may slip. So within
+    // the marked area, what has the colour of the coat next to it rather than
+    // of the hair is left out.
+    {
+        std::vector<float> around = mask;
+        blur(around, w, h, std::max(3, w / 40));
+        std::vector<uint8_t> hair_c[3], coat_c[3];
+        for (size_t i = 0; i < count; i += 3) {
+            const uint8_t *c = &base.px[i * 4];
+            if (std::max({c[0], c[1], c[2]}) <= 10) continue; // not painted
+            if (mask[i] > 0.5f)
+                for (int k = 0; k < 3; k++) hair_c[k].push_back(c[k]);
+            else if (around[i] > 0.05f)
+                for (int k = 0; k < 3; k++) coat_c[k].push_back(c[k]);
+        }
+        if (hair_c[0].size() > 50 && coat_c[0].size() > 50) {
+            float hair_m[3], coat_m[3], apart = 0;
+            for (int k = 0; k < 3; k++) {
+                std::nth_element(hair_c[k].begin(), hair_c[k].begin() + (long)hair_c[k].size() / 2, hair_c[k].end());
+                std::nth_element(coat_c[k].begin(), coat_c[k].begin() + (long)coat_c[k].size() / 2, coat_c[k].end());
+                hair_m[k] = hair_c[k][hair_c[k].size() / 2], coat_m[k] = coat_c[k][coat_c[k].size() / 2];
+                apart += (hair_m[k] - coat_m[k]) * (hair_m[k] - coat_m[k]);
+            }
+            if (apart > 30.0f * 30.0f) { // the two can be told apart
+                // Judged on the texture smoothed a little, or single strands and the gaps between them would decide.
+                std::vector<float> smooth[3];
+                for (int k = 0; k < 3; k++) {
+                    smooth[k].resize(count);
+                    for (size_t i = 0; i < count; i++) smooth[k][i] = base.px[i * 4 + k];
+                    blur(smooth[k], w, h, std::max(1, w / 250));
+                }
+                size_t dropped = 0, kept = 0;
+                for (size_t i = 0; i < count; i++) {
+                    if (mask[i] <= 0.5f) continue;
+                    float to_hair = 0, to_coat = 0;
+                    for (int k = 0; k < 3; k++) {
+                        to_hair += (smooth[k][i] - hair_m[k]) * (smooth[k][i] - hair_m[k]);
+                        to_coat += (smooth[k][i] - coat_m[k]) * (smooth[k][i] - coat_m[k]);
+                    }
+                    if (to_coat < to_hair) mask[i] = 0, dropped++;
+                    else kept++;
+                }
+                blur(mask, w, h, std::max(1, w / 300));
+                for (float &m : mask) m = smoothstep(0.42f, 0.58f, m);
+                printf("  %.0f%% of the marked area has the coat's colour and is left out\n", 100.0 * (double)dropped / (double)std::max<size_t>(dropped + kept, 1));
+            }
+        }
+    }
     // Which way the strands run: across a strand brightness changes fast, along
     // it hardly at all. Summed over a neighbourhood, the squared gradients say
     // which direction that is (the one they vary least in).
