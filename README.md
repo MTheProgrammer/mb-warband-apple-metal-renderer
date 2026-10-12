@@ -37,15 +37,15 @@ The Metal renderer draws the whole game and passes Metal's API validation (`MTL_
 
 ## Build
 
-Needs the Xcode Command Line Tools, git, python3 and the game installed through Steam.
+Needs the Xcode Command Line Tools, git and python3. The game does not have to be installed to build, only to run.
 
     make
 
-The first build downloads glslang and SPIRV-Cross at pinned versions into `third_party/` and compiles them (`scripts/build_deps.sh`); cmake is not needed.
+The first build downloads its dependencies at pinned versions into `third_party/` and compiles the two shader libraries, glslang and SPIRV-Cross (`scripts/build_deps.sh`); cmake is not needed. It also fetches the headers of GLEW 2.1.0 and SDL 2.0.8, the versions the game bundles; `stubs/*.tbd` stand in for those two libraries at link time.
 
-This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2). If the game is not in the default Steam library, pass `GAME=/path/to/MountBlade\ Warband`.
+This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2). `make app` builds `build/Warband Metal.app` and `make dist` zips it.
 
-`make app` builds `build/Warband Metal.app` and `make dist` zips it for a release.
+Releases are built by GitHub Actions (`.github/workflows/build.yml`): pushing a tag that starts with `v` publishes the zip on the Releases page.
 
 ## Run
 
@@ -82,7 +82,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_GLERR` | `1` checks `glGetError` after every setup call |
 | `WBM_LOG_MAX_MB` | Size limit of `trace.log` outside call-by-call frames. Default 256 |
 | `WBM_MODULE` | Module to load, for `run.sh`, for example `Native`. Works like the launcher's choice: it stays selected for later launches |
-| `WBM_GAME` | Game directory, for `run.sh` |
+| `WBM_GAME` | Game directory, for `run.sh` and the launcher app, when the game is not in the default Steam library |
 
 ## How it works
 

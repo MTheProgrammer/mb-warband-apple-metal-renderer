@@ -1,0 +1,28 @@
+--- !tapi-tbd
+# Link-time stand-in for the GLEW 2.1.0 library that ships inside the game's app
+# bundle. It lets the shim be built without the game installed: it names the
+# install path the game uses and the symbols the shim refers to, nothing more.
+tbd-version:     4
+targets:         [ x86_64-macos ]
+install-name:    '@rpath/GLEW.framework/Versions/2.1.0/GLEW'
+current-version: 2.1.0
+compatibility-version: 2.1.0
+exports:
+  - targets:         [ x86_64-macos ]
+    symbols:
+      [
+      ___glewActiveTexture, ___glewAttachShader, ___glewBindAttribLocation, ___glewBindBuffer,
+      ___glewBindFramebuffer, ___glewBindRenderbuffer, ___glewBlendEquation, ___glewBufferData,
+      ___glewCompileShader, ___glewCompressedTexImage2D, ___glewCreateProgram, ___glewCreateShader,
+      ___glewDeleteBuffers, ___glewDeleteFramebuffers, ___glewDeleteProgram,
+      ___glewDeleteRenderbuffers, ___glewDeleteShader, ___glewDisableVertexAttribArray,
+      ___glewEnableVertexAttribArray, ___glewFramebufferRenderbuffer, ___glewFramebufferTexture2D,
+      ___glewGenBuffers, ___glewGenFramebuffers, ___glewGenRenderbuffers, ___glewGenerateMipmap,
+      ___glewGetActiveAttrib, ___glewGetActiveUniform, ___glewGetAttribLocation,
+      ___glewGetProgramInfoLog, ___glewGetProgramiv, ___glewGetShaderInfoLog, ___glewGetShaderiv,
+      ___glewGetUniformLocation, ___glewLinkProgram, ___glewRenderbufferStorage,
+      ___glewShaderSource, ___glewUniform1f, ___glewUniform1i, ___glewUniform1iv, ___glewUniform4fv,
+      ___glewUniformMatrix4fv, ___glewUseProgram, ___glewVertexAttribPointer, _glewExperimental,
+      _glewInit
+      ]
+...

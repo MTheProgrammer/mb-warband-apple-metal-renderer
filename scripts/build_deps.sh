@@ -1,6 +1,7 @@
 #!/bin/sh
 # Compiles glslang and SPIRV-Cross for x86_64 into build/deps/libdeps.a.
-# Their sources are compiled directly, so cmake is not needed.
+# Their sources are compiled directly, so cmake is not needed. Also fetches the
+# GLEW and SDL headers the shim itself is compiled against.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 "$ROOT/scripts/fetch_deps.sh"

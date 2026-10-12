@@ -1,12 +1,7 @@
 # Builds build/libwbmetal.dylib for x86_64 (the game runs under Rosetta 2).
-# Headers and link targets come from the game's own GLEW and SDL2 frameworks.
-# Steam ships their top-level symlinks as plain files, so the Versions/ paths
-# are used directly instead of -F/-framework.
-
-GAME ?= $(HOME)/Library/Application Support/Steam/steamapps/common/MountBlade Warband
-RES  := $(GAME)/Mount and Blade.app/Contents/Resources
-GLEW := $(RES)/GLEW.framework/Versions/2.1.0
-SDL  := $(RES)/SDL2.framework/Versions/A
+# The game does not have to be installed: headers for the GLEW and SDL2 it
+# bundles are fetched into third_party/, and stubs/*.tbd stand in for the two
+# libraries at link time.
 
 # -fno-c++-static-destructors: the render thread keeps calling into the shim
 # while the process exits, so its locks and tables must never be destroyed.
@@ -18,7 +13,8 @@ FRAMEWORKS := -framework OpenGL -framework CoreGraphics -framework ImageIO -fram
 
 HDRS := $(wildcard src/*.h) src/gl_api.def
 DEPS := build/deps/libdeps.a
-INCLUDES := -I"$(GLEW)/Headers" -I"$(SDL)/Headers" -Ithird_party/glslang -Ithird_party/SPIRV-Cross -Ibuild/deps/include
+INCLUDES := -Ithird_party/glew-2.1.0/include/GL -Ithird_party/SDL/include \
+            -Ithird_party/glslang -Ithird_party/SPIRV-Cross -Ibuild/deps/include
 OBJS := $(patsubst src/%.cpp,build/%.o,$(wildcard src/*.cpp)) \
         $(patsubst src/%.mm,build/%.o,$(wildcard src/*.mm))
 LIB  := build/libwbmetal.dylib
@@ -31,9 +27,9 @@ all: $(LIB)
 # into that launcher first, which has neither, and must load there harmlessly.
 # Linked under a temporary name and renamed, so that rebuilding does not
 # disturb a game that is running with the old library mapped.
-$(LIB): $(OBJS) $(DEPS)
+$(LIB): $(OBJS) $(DEPS) stubs/GLEW.tbd stubs/SDL2.tbd
 	$(CXX) -arch x86_64 -dynamiclib -mmacosx-version-min=11.0 -o $@.tmp $(OBJS) $(DEPS) \
-	    -Wl,-weak_library,"$(GLEW)/GLEW" -Wl,-weak_library,"$(SDL)/SDL2" $(FRAMEWORKS) \
+	    -Wl,-weak_library,stubs/GLEW.tbd -Wl,-weak_library,stubs/SDL2.tbd $(FRAMEWORKS) \
 	    -Wl,-rpath,@executable_path/../Resources -install_name @rpath/libwbmetal.dylib
 	mv $@.tmp $@
 
@@ -62,7 +58,8 @@ dist: app
 	cd build && ditto -c -k --norsrc --noextattr --keepParent "Warband Metal.app" "warband-metal-$(VERSION).zip"
 	@echo "build/warband-metal-$(VERSION).zip"
 
-# glslang and SPIRV-Cross, fetched into third_party/ and compiled without cmake.
+# Fetches third_party/ (glslang, SPIRV-Cross, GLEW and SDL headers) and
+# compiles glslang and SPIRV-Cross, without cmake.
 $(DEPS):
 	scripts/build_deps.sh
 

@@ -1,0 +1,18 @@
+--- !tapi-tbd
+# Link-time stand-in for the SDL 2.0.8 library that ships inside the game's app
+# bundle. It lets the shim be built without the game installed: it names the
+# install path the game uses and the symbols the shim refers to, nothing more.
+tbd-version:     4
+targets:         [ x86_64-macos ]
+install-name:    '@rpath/SDL2.framework/Versions/A/SDL2'
+current-version: 8.0.0
+compatibility-version: 1.0.0
+exports:
+  - targets:         [ x86_64-macos ]
+    symbols:
+      [
+      _SDL_CreateWindow, _SDL_GL_CreateContext, _SDL_GL_DeleteContext, _SDL_GL_GetDrawableSize,
+      _SDL_GL_MakeCurrent, _SDL_GL_SetAttribute, _SDL_GL_SetSwapInterval, _SDL_GL_SwapWindow,
+      _SDL_GetError, _SDL_GetWindowWMInfo
+      ]
+...
