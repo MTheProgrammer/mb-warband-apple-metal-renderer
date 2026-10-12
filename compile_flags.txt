@@ -1,0 +1,14 @@
+-std=c++17
+-arch
+x86_64
+-mmacosx-version-min=11.0
+-fobjc-arc
+-Wall
+-Wextra
+-Wno-deprecated-declarations
+-Isrc
+-Ithird_party/glew-2.1.0/include/GL
+-Ithird_party/SDL/include
+-Ithird_party/glslang
+-Ithird_party/SPIRV-Cross
+-Ibuild/deps/include
