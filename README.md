@@ -45,7 +45,7 @@ The first build downloads its dependencies at pinned versions into `third_party/
 
 This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2). `make app` builds `build/Warband Metal.app` and `make dist` zips it.
 
-Releases are built by GitHub Actions (`.github/workflows/build.yml`): pushing a tag that starts with `v` publishes the zip on the Releases page.
+Releases are built by GitHub Actions (`.github/workflows/build.yml`): pushing a tag that starts with `v` publishes the zip on the Releases page. The steps are in `docs/releasing.md`.
 
 ## Run
 
