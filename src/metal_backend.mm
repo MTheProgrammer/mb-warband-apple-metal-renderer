@@ -249,7 +249,7 @@ float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macO
 // Ambient occlusion (WBM_AO=1), applied to the engine's HDR scene buffer when
 // the engine moves on from it to post-processing.
 bool s_ao;
-float s_ao_radius = 0.6f, s_ao_strength = 1.0f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
+float s_ao_radius = 0.6f, s_ao_strength = 0.5f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
 float s_view_proj[16];                          // the camera's matViewProj, as last set while drawing the scene
 bool s_view_proj_valid;
 void apply_ambient_occlusion();
@@ -950,11 +950,15 @@ id<MTLDepthStencilState> depth_state(bool has_depth)
 
 // ---- ambient occlusion ---------------------------------------------------------------
 
-// Two full-screen passes written directly in Metal's shading language.
+// Three full-screen passes written directly in Metal's shading language.
+//
+// ao_linearize, at half resolution: turn the depth buffer into distances. The
+// depth buffer is multisampled and at Retina size; reading it dozens of times
+// per pixel is what made the first version of this halve the frame rate.
 //
 // ao_compute, at half resolution: for each pixel, rebuild its position in view
-// space from the depth buffer, estimate the surface normal from neighbouring
-// depths, and look at 16 nearby points on a rotated spiral. Points that rise
+// space, estimate the surface normal from neighbouring distances, and look at
+// 16 nearby points on a rotated spiral. Points that rise
 // above the surface's tangent plane within the radius occlude it; the closer,
 // the more. This is the "Alchemy" estimator, a horizon-based method that needs
 // only depth.
@@ -970,7 +974,7 @@ struct Params {
     float a, b;        // clip z = a * w + b, from the camera's projection
     float p00, p11;    // projection scale in x and y
     float2 depth_size; // of the depth buffer, in pixels
-    float2 ao_size;    // of the half-resolution occlusion texture
+    float2 ao_size;    // of the half-resolution textures
     float radius, strength, reversed, fade_start;
 };
 
@@ -980,24 +984,16 @@ typedef depth2d_ms<float> DepthTexture;
 typedef depth2d<float> DepthTexture;
 #endif
 
-static float load_depth(DepthTexture t, int2 c, float2 size)
+// Distance in front of the camera for a pixel of the depth buffer; a very
+// large value for the sky.
+static float view_z(DepthTexture t, int2 c, Params p)
 {
-    c = clamp(c, int2(0), int2(size) - 1);
-    return t.read(uint2(c), 0);
-}
-
-// Distance in front of the camera, from a stored depth value.
-static float view_z(float d, Params p)
-{
+    c = clamp(c, int2(0), int2(p.depth_size) - 1);
+    float d = t.read(uint2(c), 0);
+    bool sky = p.reversed > 0.5 ? d <= 0.0 : d >= 1.0;
+    if (sky) return 1.0e6;
     float ndc = p.reversed > 0.5 ? 1.0 - 2.0 * d : 2.0 * d - 1.0;
     return p.b / (ndc - p.a);
-}
-
-static float3 view_position(DepthTexture t, int2 c, Params p)
-{
-    float w = view_z(load_depth(t, c, p.depth_size), p);
-    float2 ndc = (float2(c) + 0.5) / p.depth_size * 2.0 - 1.0;
-    return float3(ndc.x * w / p.p00, ndc.y * w / p.p11, w);
 }
 
 struct VertexOut {
@@ -1012,25 +1008,42 @@ vertex VertexOut ao_vertex(uint id [[vertex_id]])
     return out;
 }
 
-fragment float4 ao_compute(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], constant Params &p [[buffer(0)]])
+// Pass 1, half resolution: distances, so that the passes after it read a small
+// single-sample texture instead of the multisampled depth buffer.
+fragment float4 ao_linearize(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], constant Params &p [[buffer(0)]])
 {
-    int2 c = int2(in.position.xy) * 2 + 1;
-    float d = load_depth(depth, c, p.depth_size);
-    bool sky = p.reversed > 0.5 ? d <= 0.0 : d >= 1.0;
-    if (sky) return float4(1.0);
-    float3 P = view_position(depth, c, p);
-    if (P.z > p.fade_start * 2.0) return float4(1.0);
+    return float4(view_z(depth, int2(in.position.xy) * 2 + 1, p));
+}
+
+static float load_z(texture2d<float> z, int2 c, Params p)
+{
+    return z.read(uint2(clamp(c, int2(0), int2(p.ao_size) - 1))).x;
+}
+
+static float3 view_position(texture2d<float> z, int2 c, Params p)
+{
+    float w = load_z(z, c, p);
+    float2 ndc = (float2(c) + 0.5) / p.ao_size * 2.0 - 1.0;
+    return float3(ndc.x * w / p.p00, ndc.y * w / p.p11, w);
+}
+
+// Pass 2, half resolution: occlusion.
+fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    int2 c = int2(in.position.xy);
+    float3 P = view_position(z, c, p);
+    if (P.z > p.fade_start * 2.0) return float4(1.0); // far away, or sky
 
     // The normal, from whichever neighbour on each axis is closer in depth, so
     // that it is not taken across an edge.
-    float3 right = view_position(depth, c + int2(1, 0), p) - P, left = P - view_position(depth, c - int2(1, 0), p);
-    float3 down = view_position(depth, c + int2(0, 1), p) - P, up = P - view_position(depth, c - int2(0, 1), p);
+    float3 right = view_position(z, c + int2(1, 0), p) - P, left = P - view_position(z, c - int2(1, 0), p);
+    float3 down = view_position(z, c + int2(0, 1), p) - P, up = P - view_position(z, c - int2(0, 1), p);
     float3 dx = abs(right.z) < abs(left.z) ? right : left;
     float3 dy = abs(down.z) < abs(up.z) ? down : up;
     float3 n = normalize(cross(dy, dx));
     if (dot(n, P) > 0.0) n = -n; // towards the camera
 
-    float radius_px = clamp(p.radius * p.p00 / P.z * 0.5 * p.depth_size.x, 3.0, 96.0);
+    float radius_px = clamp(p.radius * p.p00 / P.z * 0.5 * p.ao_size.x, 2.0, 48.0);
     float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
     float bias = 0.02 + 0.004 * P.z;
     float sum = 0.0;
@@ -1040,7 +1053,7 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], DepthTexture depth [[textu
         float2 dir = float2(cos(angle), sin(angle));
         for (int s = 0; s < steps; s++) {
             float t = (float(s) + fract(noise * 7.0 + 0.37 * float(i)) + 0.2) / float(steps);
-            float3 v = view_position(depth, c + int2(dir * radius_px * t), p) - P;
+            float3 v = view_position(z, c + int2(dir * radius_px * t), p) - P;
             float dd = dot(v, v);
             sum += max(0.0, dot(v, n) - bias) / (dd + 0.0001) * saturate(1.0 - dd / (p.radius * p.radius));
         }
@@ -1050,18 +1063,19 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], DepthTexture depth [[textu
     return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
 }
 
+// Pass 3, full resolution, blended onto the scene: the occlusion blurred over
+// 3x3 half-resolution texels, skipping those at a different distance.
 fragment float4 ao_apply(VertexOut in [[stage_in]], DepthTexture depth [[texture(0)]], texture2d<float> ao [[texture(1)]],
-                         constant Params &p [[buffer(0)]])
+                         texture2d<float> z [[texture(2)]], constant Params &p [[buffer(0)]])
 {
     int2 c = int2(in.position.xy);
-    float zc = view_z(load_depth(depth, c, p.depth_size), p);
+    float zc = view_z(depth, c, p);
     int2 h = c / 2;
     float total = 0.0, weight = 0.0;
     for (int j = -1; j <= 1; j++) {
         for (int i = -1; i <= 1; i++) {
             int2 t = clamp(h + int2(i, j), int2(0), int2(p.ao_size) - 1);
-            float zs = view_z(load_depth(depth, t * 2 + 1, p.depth_size), p);
-            float w = exp(-abs(zs - zc) / (0.03 * zc + 0.02)) / (1.0 + abs(float(i)) + abs(float(j)));
+            float w = exp(-abs(load_z(z, t, p) - zc) / (0.03 * zc + 0.02)) / (1.0 + abs(float(i)) + abs(float(j)));
             total += ao.read(uint2(t)).x * w;
             weight += w;
         }
@@ -1078,7 +1092,8 @@ struct AOParams {
 };
 
 id<MTLLibrary> s_ao_library;
-id<MTLRenderPipelineState> s_ao_compute_pipeline;
+id<MTLRenderPipelineState> s_ao_linearize_pipeline, s_ao_compute_pipeline;
+id<MTLTexture> s_ao_z_texture;
 std::map<std::pair<int, int>, id<MTLRenderPipelineState>> s_ao_apply_pipelines; // by colour format and sample count
 id<MTLTexture> s_ao_texture;
 
@@ -1095,10 +1110,13 @@ bool ao_setup()
     }
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [s_ao_library newFunctionWithName:@"ao_vertex"];
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_linearize"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
+    s_ao_linearize_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
     d.fragmentFunction = [s_ao_library newFunctionWithName:@"ao_compute"];
     d.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
     s_ao_compute_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
-    if (!s_ao_compute_pipeline) {
+    if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline) {
         complain("ambient occlusion pipeline failed: %s", error.localizedDescription.UTF8String);
         return s_ao = false;
     }
@@ -1163,24 +1181,32 @@ void apply_ambient_occlusion()
     params.fade_start = 60.0f; // metres: beyond this the effect fades out, and is gone at twice it
 
     if (!s_ao_texture || s_ao_texture.width != aw || s_ao_texture.height != ah) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:aw height:ah mipmapped:NO];
-        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        td.storageMode = MTLStorageModePrivate;
-        s_ao_texture = [s_device newTextureWithDescriptor:td];
+        auto make = [&](MTLPixelFormat format) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:aw height:ah mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            return [s_device newTextureWithDescriptor:td];
+        };
+        s_ao_texture = make(MTLPixelFormatR8Unorm);
+        s_ao_z_texture = make(MTLPixelFormatR32Float);
     }
     id<MTLRenderPipelineState> apply = ao_apply_pipeline(s_last.color.pixelFormat, s_last.samples);
     if (!apply) return;
 
-    MTLRenderPassDescriptor *compute = [MTLRenderPassDescriptor renderPassDescriptor];
-    compute.colorAttachments[0].texture = s_ao_texture;
-    compute.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-    compute.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:compute];
-    [pass setRenderPipelineState:s_ao_compute_pipeline];
-    [pass setFragmentTexture:s_last.depth atIndex:0];
-    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
-    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [pass endEncoding];
+    auto half_pass = [&](id<MTLTexture> target, id<MTLRenderPipelineState> pipeline, id<MTLTexture> input) {
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        d.colorAttachments[0].texture = target;
+        d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+        [pass setRenderPipelineState:pipeline];
+        [pass setFragmentTexture:input atIndex:0];
+        [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+        [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [pass endEncoding];
+    };
+    half_pass(s_ao_z_texture, s_ao_linearize_pipeline, s_last.depth);
+    half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture);
 
     MTLRenderPassDescriptor *onto = [MTLRenderPassDescriptor renderPassDescriptor];
     onto.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -1192,10 +1218,11 @@ void apply_ambient_occlusion()
         onto.colorAttachments[0].texture = s_last.color;
         onto.colorAttachments[0].storeAction = MTLStoreActionStore;
     }
-    pass = [command_buffer() renderCommandEncoderWithDescriptor:onto];
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:onto];
     [pass setRenderPipelineState:apply];
     [pass setFragmentTexture:s_last.depth atIndex:0];
     [pass setFragmentTexture:s_ao_texture atIndex:1];
+    [pass setFragmentTexture:s_ao_z_texture atIndex:2];
     [pass setFragmentBytes:&params length:sizeof params atIndex:0];
     [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [pass endEncoding];
