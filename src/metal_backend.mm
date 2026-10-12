@@ -1424,9 +1424,15 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
     float3 n = normalize(cross(dy, dx));
     if (dot(n, P) > 0.0) n = -n; // towards the camera
 
-    float radius_px = clamp(p.radius * abs(p.p00) / P.z * 0.5 * p.ao_size.x, 2.0, 96.0 * p.ao_size.x / p.depth_size.x);
+    float wanted_px = p.radius * abs(p.p00) / P.z * 0.5 * p.ao_size.x;
+    float radius_px = clamp(wanted_px, 2.0, 96.0 * p.ao_size.x / p.depth_size.x);
+    // Close to the camera the radius does not fit on screen and is cut short.
+    // The distance it then really covers is what the weights below go by, and
+    // the bias with it; kept at the full radius, a face seen close up had its
+    // eye sockets and the sides of its nose blackened as if they were pits.
+    float radius = p.radius * min(1.0, radius_px / max(wanted_px, 0.001));
     float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
-    float bias = 0.02 + 0.004 * P.z;
+    float bias = (0.02 + 0.004 * P.z) * radius / p.radius;
     float sum = 0.0;
     const int directions = 4, steps = 4;
     for (int i = 0; i < directions; i++) {
@@ -1436,10 +1442,10 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
             float t = (float(s) + fract(noise * 7.0 + 0.37 * float(i)) + 0.2) / float(steps);
             float3 v = view_position(z, c + int2(dir * radius_px * t), p) - P;
             float dd = dot(v, v);
-            sum += max(0.0, dot(v, n) - bias) / (dd + 0.0001) * saturate(1.0 - dd / (p.radius * p.radius));
+            sum += max(0.0, dot(v, n) - bias) / (dd + 0.0001 * radius * radius) * saturate(1.0 - dd / (radius * radius));
         }
     }
-    float occlusion = sum * p.radius * 2.0 / float(directions * steps);
+    float occlusion = sum * radius * 2.0 / float(directions * steps);
     float ao = saturate(1.0 - p.strength * occlusion);
 
     // Contact shadows: walk a short way from the surface towards the sun and see
