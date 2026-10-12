@@ -872,10 +872,10 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     // place, in tufts, as well as from hair to hair.
     // A hair smaller than a pixel is haze. Farther off, where the pixels are
     // larger on the horse, there are fewer hairs and they are thicker: the
-    // count is halved as often as it takes for a hair's cell to span a pixel
-    // and a half, the two nearest counts being blended by which hairs are let through.
+    // count is halved as often as it takes for a hair's cell to span three
+    // pixels (nearer one pixel, cutting the hairs out looks like dither), the two nearest counts being blended by which hairs are let through.
     float pixel = max(length(dFdx(root)), length(dFdy(root))) * density; // cells to the pixel
-    float halvings = max(0.0, log2(max(pixel * 1.5, 1e-6)));
+    float halvings = max(0.0, log2(max(pixel * 3.0, 1e-6)));
     float coarser = floor(halvings), between = halvings - coarser;
     density /= exp2(coarser);
     vec2 at = root * density;
