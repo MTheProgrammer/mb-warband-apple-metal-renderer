@@ -405,7 +405,7 @@ double s_wind_time;        // the same for every draw of a frame
 int s_fur_shells;
 float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its texture a metre of its surface covers
 float s_hair_length = 0.07f; // WBM_HAIR_LENGTH: how far mane and tail stand off the body, metres; 0 for no layers of their own
-float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 800.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per metre
+float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 1400.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per metre
 float s_shell_now[4];  // the shaders' wbm_shell for the draw being prepared
 uint64_t s_shell_draws;
 float s_fur_strength; // WBM_FUR: the coat of horses, 0 for none

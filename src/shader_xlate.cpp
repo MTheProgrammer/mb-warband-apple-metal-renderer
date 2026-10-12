@@ -785,7 +785,7 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
 {
     if (wbm_shell.y <= 0.0) return false;
     bool long_ = wbm_shell.z < 0.0;
-    float share = wbm_shell.y, density = abs(wbm_shell.z) / max(abs(wbm_fur.w), 0.02) * (long_ ? 0.3 : 1.0);
+    float share = wbm_shell.y, density = abs(wbm_shell.z) / max(abs(wbm_fur.w), 0.02) * (long_ ? 0.17 : 1.0); // long hair is coarser than the coat
     vec2 grows;
     // What grows is asked where the hair is rooted, not where it has got to.
     vec2 root = wbm_shell_root(uv, down);
@@ -814,7 +814,7 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     float chance = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
     float length_ = (0.35 + 0.65 * chance) * mix(0.6, 1.0, grows.y);
     if (share > length_) return true;
-    float thickness = 0.5 * (1.0 - 0.75 * share / length_);
+    float thickness = 0.42 * (1.0 - 0.75 * share / length_);
     return dot(within, within) > thickness * thickness;
 }
 
