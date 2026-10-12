@@ -1078,7 +1078,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.srgb_textures = srgb_env && atoi(srgb_env) != 0;                            // off unless set
     s_state_cache = !(cache_env && atoi(cache_env) == 0);
     const char *pbr_env = getenv("WBM_PBR");
-    s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) != 0; // off unless set
+    s_shader_options.pbr_specular = pbr_env && atoi(pbr_env) >= 1;    // off unless set
+    s_shader_options.pbr_environment = pbr_env && atoi(pbr_env) >= 2; // 2: metalness and environment reflection too
 
     const uint8_t white[4] = {255, 255, 255, 255};
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -1124,7 +1125,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
-            s_shader_options.pbr_specular ? "on" : "off");
+            s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off");
 }
 
 const char *mtl_device_name()

@@ -159,7 +159,44 @@ float wbm_specular(vec3 view, vec3 light, vec3 normal, float shininess)
     float gv = 2.0 * nv / (nv + sqrt(a2 + (1.0 - a2) * nv * nv));
     const float f0 = 0.25;
     float fresnel = (f0 + (1.0 - f0) * pow(1.0 - vh, 5.0)) / f0;
+    wbm_n = n;
+    wbm_a2 = a2;
     return lobe * gl * gv * fresnel;
+}
+)";
+
+// Shared between the pieces below. wbm_specular records the shading normal and
+// roughness it was called with, which the environment term reuses.
+const char k_pbr_globals[] = R"(
+vec3 wbm_n = vec3(0.0, 0.0, 1.0);
+float wbm_a2 = 0.25;
+vec3 wbm_albedo = vec3(0.5);
+float wbm_mask = 0.0;
+float wbm_metal = 0.0;
+)";
+
+// What a surface reflects besides the sun. The engine renders no environment
+// map for objects, so one is made from what every lit shader is given anyway:
+// the sky's light colour above the horizon and the ground's below it, blended
+// more softly on rougher surfaces. `up` may be a zero vector when the shader
+// has no sky direction, in which case the two are averaged.
+//
+// The reflection is weighted by Fresnel, with a base reflectance that goes
+// from 4% (non-metals) to the surface's own colour (metals), and by the
+// material's specular mask, so that matt surfaces keep their look.
+const char k_pbr_environment_function[] = R"(
+vec3 wbm_environment(vec3 view, vec3 up, vec3 sky, vec3 ground)
+{
+    vec3 v = normalize(view), n = wbm_n;
+    float nv = clamp(dot(n, v), 0.0, 1.0);
+    vec3 r = reflect(-v, n);
+    float ul = length(up);
+    float t = ul > 0.001 ? dot(r, up / ul) * 0.5 + 0.5 : 0.5;
+    float blur = 0.08 + 0.42 * sqrt(wbm_a2);
+    vec3 env = mix(ground, sky, smoothstep(0.5 - blur, 0.5 + blur, t));
+    vec3 f0 = mix(vec3(0.04), wbm_albedo, wbm_metal);
+    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
+    return env * fresnel * wbm_mask;
 }
 )";
 
@@ -171,6 +208,59 @@ bool use_pbr_specular(std::string &fs)
         R"(pow \(\s*clamp \(\s*dot \(normalize\(\s*\(([\w.]+) ([+-]) ([\w.]+)\)\s*\), ([\w.]+)\)\s*, 0\.0, 1\.0\)\s*, fMaterialPower\))");
     if (!std::regex_search(fs, lobe)) return false;
     fs = std::regex_replace(fs, lobe, "wbm_specular(vec3($1), $2vec3($3), vec3($4), fMaterialPower)");
+    return true;
+}
+
+// Adds estimated metalness and the environment reflection to a shader whose
+// highlight was already rewritten. Three places are touched, and the shader is
+// left alone unless all of them are found:
+//
+//   - the start of main: read the specular mask (a specular map, or the base
+//     texture's alpha, whichever the shader uses) and derive metalness from it;
+//   - where the base colour is decoded: remember it, and darken it for metals,
+//     which in this model show reflection instead of diffuse colour;
+//   - just before the colour is encoded for display: add the reflection.
+bool add_pbr_environment(std::string &fs)
+{
+    static const std::regex decode(R"((\w+)\.xyz = pow \((\w+)\.xyz, vec3\(2\.2, 2\.2, 2\.2\)\);)");
+    static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
+    static const std::regex specular_map(R"(texture2D \(specular_texture, ([\w.]+)\))");
+    static const std::regex alpha_mask(R"(spec_coef\) \* \w+\) \* (\w+)\.w\))");
+    auto has = [&](const char *text) { return fs.find(text) != std::string::npos; };
+
+    if (std::distance(std::sregex_iterator(fs.begin(), fs.end(), decode), std::sregex_iterator()) != 1) return false;
+    if (!std::regex_search(fs, encode) || !has("varying vec3 ViewDir;")) return false;
+    // The opening brace of main. The engine's shader files have CRLF line ends,
+    // so the brace is looked for separately from the signature.
+    size_t body = fs.find("void main ()");
+    if (body != std::string::npos) body = fs.find('{', body);
+    if (body == std::string::npos) return false;
+
+    std::string mask;
+    std::smatch m;
+    if (std::regex_search(fs, m, specular_map)) {
+        mask = "dot(texture2D(specular_texture, " + std::string(m[1]) + ").xyz, vec3(0.33))";
+    } else if (std::regex_search(fs, m, alpha_mask)) {
+        std::smatch uv;
+        std::regex sample("\\b" + std::string(m[1]) + " = texture2D \\(diffuse_texture, ([\\w.]+)\\);");
+        if (!std::regex_search(fs, uv, sample)) return false;
+        mask = "texture2D(diffuse_texture, " + std::string(uv[1]) + ").w";
+    } else {
+        return false;
+    }
+
+    // The direction of the sky, in whatever space the shader's normal is in.
+    std::string up = has("uniform vec4 vSkyLightDir;") ? "-vSkyLightDir.xyz" : has("varying vec3 SkyLightDir;") ? "SkyLightDir" : "vec3(0.0)";
+    std::string sky = has("uniform vec4 vSkyLightColor;") ? "(vAmbientColor.xyz + vSkyLightColor.xyz)" : "vAmbientColor.xyz";
+    std::string ground = has("uniform vec4 vGroundAmbientColor;") ? "vGroundAmbientColor.xyz" : "(vAmbientColor.xyz * 0.4)";
+    if (!has("uniform vec4 vAmbientColor;")) return false;
+
+    fs = std::regex_replace(fs, encode, "$1.xyz += wbm_environment(ViewDir, " + up + ", " + sky + ", " + ground + ");\n  $&",
+                            std::regex_constants::format_first_only);
+    fs = std::regex_replace(fs, decode,
+                            "wbm_albedo = pow ($2.xyz, vec3(2.2, 2.2, 2.2));\n  $1.xyz = (wbm_albedo * (1.0 - (0.65 * wbm_metal)));");
+    body = fs.find('{', fs.find("void main ()")) + 1; // again: the replacements above moved it
+    fs.insert(body, "\n  wbm_mask = clamp(" + mask + ", 0.0, 1.0);\n  wbm_metal = smoothstep(0.3, 0.7, wbm_mask);");
     return true;
 }
 
@@ -221,8 +311,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     std::string glsl = source;
     bool soft_shadows = !vertex && options.soft_shadows && soften_shadows(glsl);
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
-    if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers);
-    bool pbr_specular = !vertex && options.pbr_specular && use_pbr_specular(glsl);
+    bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment) && use_pbr_specular(glsl);
+    bool pbr_environment = pbr_specular && options.pbr_environment && add_pbr_environment(glsl);
+    if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
@@ -233,7 +324,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
     if (soft_shadows) out << k_soft_shadow_function;
-    if (pbr_specular) out << k_pbr_specular_function;
+    if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
+    if (pbr_environment) out << k_pbr_environment_function;
     if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
 
     std::istringstream in(glsl);

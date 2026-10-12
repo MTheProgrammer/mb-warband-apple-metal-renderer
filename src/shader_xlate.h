@@ -60,6 +60,10 @@ struct XlOptions {
     // distribution, Smith shadowing, Schlick Fresnel), keeping each material's
     // highlight strength and deriving roughness from its shininess exponent.
     bool pbr_specular = false;
+    // On top of pbr_specular: estimate metalness from the specular mask, darken
+    // the base colour of metals, and add a reflection of a sky-and-ground
+    // environment built from the scene's own light colours.
+    bool pbr_environment = false;
 };
 
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space
