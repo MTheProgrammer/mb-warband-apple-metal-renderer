@@ -158,6 +158,7 @@ struct Program {
     int skin_offset[2] = {-1, -1}; // per stage, see k_xl_skin_uniform
     int wind_offset = -1;          // vertex stage, see k_xl_wind_uniform
     int horse_eye_offset = -1; // fragment stage, the same
+    int shell_offset[2] = {-1, -1}; // per stage: wbm_shell, see k_fur_function
     int fur_offset = -1;      // fragment stage, see k_fur_function in shader_xlate.cpp
     int gaze_offset = -1;     // fragment stage, see k_eye_function in shader_xlate.cpp
     int leaf_sun_offset = -1; // vertex stage, see k_leaf_function in shader_xlate.cpp // fragment stage, see k_xl_dyn_sampler
@@ -396,6 +397,11 @@ uint64_t s_eye_frame;
 float s_foliage_backlight; // WBM_FOLIAGE: how much sunlight comes through leaves, 0 for none
 float s_wind_strength;     // WBM_WIND, 0 for none
 double s_wind_time;        // the same for every draw of a frame
+// Shells of fur (WBM_FUR_SHELLS): how many layers a coat near the camera is drawn in, 0 for none.
+int s_fur_shells;
+float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 2600.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per unit of texture coordinate
+float s_shell_now[4];  // the shaders' wbm_shell for the draw being prepared
+uint64_t s_shell_draws;
 float s_fur_strength; // WBM_FUR: the coat of horses, 0 for none
 float s_gaze_strength = 1.0f; // WBM_EYES_MOVE: how far the eyes wander; 0 keeps them still
 float s_skin_backlight = 0.6f; // WBM_SSS_BACKLIGHT: sunlight through thin skin; 0 for none
@@ -1002,7 +1008,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.horse_eye_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1076,6 +1082,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
             else if (u.name == "wbm_fur") p.fur_offset = u.offset;
             else if (u.name == "wbm_horse_eye") p.horse_eye_offset = u.offset;
+            else if (u.name == "wbm_shell") p.shell_offset[s] = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -2931,6 +2938,11 @@ bool prepare_draw()
             complain("%s without scattering, program %u %s: %s", unlit_leaf ? "foliage" : "skin", s_program, sh->type == GL_VERTEX_SHADER ? "vs" : "fs", lines.c_str());
         }
     }
+    for (int stage = 0; stage < 2; stage++) {
+        if (p->shell_offset[stage] < 0 || !memcmp(p->uniform_data[stage].data() + p->shell_offset[stage], s_shell_now, 16)) continue;
+        memcpy(p->uniform_data[stage].data() + p->shell_offset[stage], s_shell_now, 16);
+        p->uniform_dirty[stage] = true;
+    }
     if (p->fur_offset >= 0) {
         const float fur[4] = {diffuse && diffuse->pbr ? s_fur_strength : 0.0f, s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f,
                               s_skin_backlight, 0};
@@ -3411,6 +3423,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.skin_scattering = sss_env && atoi(sss_env) != 0; // off unless set
     s_shader_options.eyes = getenv("WBM_EYES") && atoi(getenv("WBM_EYES")) != 0; // off unless set
     if (const char *v = getenv("WBM_FUR")) s_fur_strength = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_FUR_SHELLS")) s_fur_shells = std::min(24, std::max(0, atoi(v)));
+    if (const char *v = getenv("WBM_FUR_LENGTH")) s_fur_length = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_FUR_RANGE")) s_fur_range = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     if (const char *v = getenv("WBM_EYES_MOVE")) s_gaze_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
@@ -3507,6 +3523,7 @@ void mtl_dump_stats(FILE *f)
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
+    if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
     if (s_fxaa_frames) fprintf(f, "\nanti-aliasing (FXAA) applied in %llu frames\n", (unsigned long long)s_fxaa_frames);
     if (s_max_fps > 0 || s_menu_fps > 0) fprintf(f, "\nframe rate limited to %.0f, %.0f without a 3D scene (0: no limit)\n", s_max_fps, s_menu_fps);
     if (s_sky_ambient) {
@@ -4290,9 +4307,33 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             complain("glDrawElements reads past the end of its element buffer");
             return;
         }
+        // A coat near the camera is drawn again in layers, as fur (see k_fur_function).
+        int shells = 0;
+        if (s_fur_shells > 0 && s_fur_strength > 0 && s_pass_scene && !s_blend) {
+            Program *fp = find(s_programs, s_program);
+            if (fp && fp->shell_offset[0] >= 0 && fp->shell_offset[1] >= 0 && fp->u_wvp && fp->alpha_texture_location >= 0) {
+                UniformLocation &l = fp->locations[(size_t)fp->alpha_texture_location];
+                Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+                float distance; // of the object's origin ahead of the camera
+                memcpy(&distance, fp->uniform_data[0].data() + fp->u_wvp->offset + 60, 4);
+                if (coat && coat->pbr && distance > 0 && distance < s_fur_range)
+                    shells = std::max(2, (int)lroundf((float)s_fur_shells * std::min(1.0f, 1.6f * (1.0f - distance / s_fur_range))));
+            }
+        }
+        const float surface[4] = {0, 0, s_fur_density, shells ? 1.0f : 0.0f};
+        memcpy(s_shell_now, surface, sizeof surface);
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
+        for (int layer = 1; layer <= shells; layer++) {
+            float share = (float)layer / (float)shells;
+            const float now[4] = {s_fur_length * share, share, s_fur_density, 1.0f};
+            memcpy(s_shell_now, now, sizeof now);
+            if (!prepare_draw()) break;
+            [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
+            s_shell_draws++;
+        }
+        if (shells) memset(s_shell_now, 0, sizeof s_shell_now);
         if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
         if (s_dyn_shadows && s_pass_scene && primitive == MTLPrimitiveTypeTriangle && s_depth_test && s_depth_mask)
             record_caster((NSUInteger)count, index_type, b->mtl, offset, true);

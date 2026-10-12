@@ -641,6 +641,23 @@ bool add_leaf_glow(std::string &vs)
     return true;
 }
 
+// Shells of fur: the backend draws a coat again a few times over, each time a
+// little farther out along the surface's normal (wbm_shell.x, in metres), and
+// the fragment shader lets through only the strands that reach that far (see
+// k_fur_function). Every skinned vertex shader can do the pushing; it is zero
+// for all but those draws.
+bool add_shell_push(std::string &vs)
+{
+    static const std::regex skinned(
+        R"((\w+) = \(\(\(\s*\(\(matWorldArray\[(\w+)\] \* (\w+)\)\s*\* inBlendWeight\.x\)\s*\+\s*\(\(matWorldArray\[(\w+)\] \* \3\)\s*\* inBlendWeight\.y\)\s*\)\s*\+\s*\(\s*\(matWorldArray\[(\w+)\] \* \3\)\s*\* inBlendWeight\.z\)\)\s*\+\s*\(\(matWorldArray\[(\w+)\] \* \3\)\s*\* inBlendWeight\.w\)\);)");
+    if (vs.find("attribute vec3 inNormal;") == std::string::npos || !std::regex_search(vs, skinned)) return false;
+    vs = std::regex_replace(vs, skinned,
+                            "$&\n  if (wbm_shell.x > 0.0) $1.xyz += wbm_shell.x * normalize(mat3(matWorldArray[$2]) * inNormal * inBlendWeight.x + mat3(matWorldArray[$4]) * inNormal * "
+                            "inBlendWeight.y + mat3(matWorldArray[$5]) * inNormal * inBlendWeight.z + mat3(matWorldArray[$6]) * inNormal * inBlendWeight.w);",
+                            std::regex_constants::format_first_only);
+    return true;
+}
+
 // Shaders that light per vertex get the wrap alone, from the vertex normal.
 const char k_skin_vertex_function[] = R"(
 uniform vec4 wbm_skin;
@@ -695,6 +712,31 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
     return mix(plain, coat, fur);
 }
 
+// wbm_shell. x: how far out this layer is, metres (vertex stage); y: the same
+// as a share of the longest hair, 0 for the surface itself; z: hairs per unit
+// of texture coordinate; w: 1 on the surface when layers will follow.
+uniform vec4 wbm_shell;
+
+// Whether this layer has a hair here: each cell of a fine grid over the
+// texture holds one, of a length of its own, thinner towards its tip.
+bool wbm_shell_bare(vec2 uv)
+{
+    if (wbm_shell.y <= 0.0) return false;
+    if (texture2D(wbm_fur_map, uv).z < 0.5) return true; // not coat
+    vec2 cell = floor(uv * wbm_shell.z), within = fract(uv * wbm_shell.z) - 0.5;
+    float length_ = 0.35 + 0.65 * fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+    if (wbm_shell.y > length_) return true;
+    float thickness = 0.5 * (1.0 - 0.75 * wbm_shell.y / length_);
+    return dot(within, within) > thickness * thickness;
+}
+
+// Hairs shade one another: dark at the roots, full at the tips.
+float wbm_shell_shade(vec2 uv)
+{
+    if (wbm_shell.y > 0.0) return 0.6 + 0.4 * wbm_shell.y;
+    return wbm_shell.w > 0.5 && texture2D(wbm_fur_map, uv).z >= 0.5 ? 0.6 : 1.0;
+}
+
 // A wet eye: a sharp highlight from the sun and a little of the sky, on top of
 // whatever glint is painted there.
 vec3 wbm_horse_glint(vec2 uv, vec3 view, vec3 normal, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
@@ -733,6 +775,10 @@ bool add_fur(std::string &fs)
     } else {
         return false;
     }
+    fs = std::regex_replace(fs, encode, "$1.xyz *= wbm_shell_shade(Tex0);\n  $&", std::regex_constants::format_first_only);
+    size_t body = fs.find("void main ()");
+    if (body != std::string::npos) body = fs.find('{', body);
+    if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0)) discard;");
     if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos)
         fs = std::regex_replace(fs, encode, "$1.xyz += wbm_horse_glint(Tex0, ViewDir, " + normal + ", SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz);\n  $&",
                                 std::regex_constants::format_first_only);
@@ -1125,6 +1171,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool fur = !vertex && options.fur && add_fur(glsl);
     bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
     bool wind = vertex && options.wind && add_wind(glsl);
+    bool shell_push = vertex && options.fur && add_shell_push(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
@@ -1147,6 +1194,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (fur) out << k_fur_function;
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
+    if (shell_push) out << "uniform vec4 wbm_shell;\n";
     if (skin && vertex) out << k_skin_vertex_function;
     if (skin && !vertex) { // with the materials debug view, skin that scatters is painted red
         std::string f = k_skin_function;
