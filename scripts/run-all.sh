@@ -3,6 +3,7 @@
 # of the ones that are on by default (soft shadows, 4x multisampling, reversed
 # depth). Anything set in the environment already is kept, so one option can be
 # turned off for a comparison:   WBM_AO=0 scripts/run-all.sh
+export WBM_MSAA=${WBM_MSAA:-1}        # no multisampling: it is the costliest setting for the GPU (4 restores it)
 export WBM_SHADOWS=${WBM_SHADOWS:-2}  # shadows that soften with distance (PCSS)
 export WBM_DYNAMIC_SHADOWS=${WBM_DYNAMIC_SHADOWS:-1}  # characters cast shadows on everything
 export WBM_PBR=${WBM_PBR:-3}          # microfacet highlights, metalness, reflection of the scene's sky
