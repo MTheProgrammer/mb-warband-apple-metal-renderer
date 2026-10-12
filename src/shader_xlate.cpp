@@ -696,6 +696,7 @@ uniform sampler2D wbm_fur_map;  // blue: how much of the surface is coat (a text
 uniform sampler2D wbm_hair_map; // a texture's _hair map: red and green the way the hair is combed, in the picture; blue 1 long hair, about 0.5 coat, 0 none
 uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts; w: how much of the texture a metre of the surface covers, negated without a hair map
 uniform vec4 wbm_hair_colour; // the long hair's own colour; w 0 when it is not known
+float wbm_hair_cover = 1.0; // of the pixel, by this layer's hair (wbm_shell_cover)
 vec3 wbm_hair_shine = vec3(0.0); // what long hair reflects and lets through, per unit of sunlight; added to the finished colour
 uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size there; w: strength, 0 for none
 // wbm_shell. x: how far out this layer is, metres (vertex stage); y: the same
@@ -830,20 +831,23 @@ vec2 wbm_shell_root(vec2 uv, vec3 down)
     return uv - lean * per_metre;
 }
 
-bool wbm_shell_bare(vec2 uv, vec3 down)
+// How much of the pixel a layer's hair covers here: 1 on the surface itself, 0
+// where the layer is bare. A hair's edge, and a hair thinner than a pixel,
+// cover part of it and are blended in; cut out whole or not at all they dither.
+float wbm_shell_cover(vec2 uv, vec3 down)
 {
-    if (wbm_shell.y <= 0.0) return false;
+    if (wbm_shell.y <= 0.0) return 1.0;
     bool long_ = wbm_shell.z < 0.0;
     float share = wbm_shell.y, density = abs(wbm_shell.z) / max(abs(wbm_fur.w), 0.02) * (long_ ? 0.17 : 1.0); // long hair is coarser than the coat
     vec2 grows;
     // What grows is asked where the hair is rooted, not where it has got to.
     vec2 root = wbm_shell_root(uv, down);
     grows = wbm_grows(root);
-    if (long_ ? grows.y < 0.5 : grows.x < 0.5) return true;
+    if (long_ ? grows.y < 0.5 : grows.x < 0.5) return 0.0;
     // Long hair is drawn only over what the map itself marks as long hair. Its
     // layers hang by being moved (see add_shell_push), not by reaching across
     // the texture, where a leg may be painted beside the tail.
-    if (long_ && wbm_grows(uv).y < 0.5) return true;
+    if (long_ && wbm_grows(uv).y < 0.5) return 0.0;
     if (long_) {
         // Seen close, a hair cut through by a layer must not show as a dot: in
         // each layer a long hair is a streak lying the way it is combed, many
@@ -861,10 +865,11 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
         float lock_chance = fract(sin(lock * 78.233) * 43758.5453);
         float edge = abs(fract(across / 7.0 + 0.6 * wbm_noise(vec2(across / 23.0, run * 0.08))) - 0.5) * 2.0; // 0 mid-lock, 1 at its edge
         float length_ = (0.45 + 0.55 * lock_chance) * (0.85 + 0.15 * chance);
-        if (share > length_) return true;
-        if (edge > 1.0 - 0.35 * share / length_) return chance > 0.12; // the gap, but for a stray hair
+        if (share > length_) return 0.0;
+        if (edge > 1.0 - 0.35 * share / length_ && chance > 0.12) return 0.0; // the gap, but for a stray hair
         float thick = mix(0.25, 0.5, fract(lock_chance * 13.7)) * (1.0 - 0.5 * share / length_);
-        return abs(fract(across) - 0.5) > thick;
+        float wide = max(fwidth(across), 1e-4); // strands to the pixel
+        return clamp(0.5 + (thick - abs(fract(across) - 0.5)) / wide, 0.0, 1.0) * min(1.0, 2.0 * thick / wide + 0.35);
     }
     // Hairs on a plain grid make stripes with the layers and with the mesh's
     // own triangles. So each hair stands off the middle of its cell by a
@@ -872,10 +877,10 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     // place, in tufts, as well as from hair to hair.
     // A hair smaller than a pixel is haze. Farther off, where the pixels are
     // larger on the horse, there are fewer hairs and they are thicker: the
-    // count is halved as often as it takes for a hair's cell to span three
-    // pixels (nearer one pixel, cutting the hairs out looks like dither), the two nearest counts being blended by which hairs are let through.
+    // count is halved as often as it takes for a hair's cell to span two
+    // pixels, the two nearest counts being blended by which hairs are let through.
     float pixel = max(length(dFdx(root)), length(dFdy(root))) * density; // cells to the pixel
-    float halvings = max(0.0, log2(max(pixel * 3.0, 1e-6)));
+    float halvings = max(0.0, log2(max(pixel * 2.0, 1e-6)));
     float coarser = floor(halvings), between = halvings - coarser;
     density /= exp2(coarser);
     vec2 at = root * density;
@@ -893,11 +898,11 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
     }
     float tufts = 0.6 * wbm_noise(at / 9.0) + 0.4 * wbm_noise(at / 3.5 + 17.0);
     float length_ = (0.45 + 0.15 * chance + 0.4 * tufts) * mix(0.6, 1.0, grows.y); // neighbours are much of a length; it is the tufts that differ
-    if (share > length_) return true;
+    if (share > length_) return 0.0;
     // Towards the next halving, the hairs that will not survive it go, and the rest grow to fill in.
-    if (fract(chance * 5.31) < between * 0.75 && (mod(cell.x, 2.0) > 0.5 || mod(cell.y, 2.0) > 0.5)) return true;
+    if (fract(chance * 5.31) < between * 0.75 && (mod(cell.x, 2.0) > 0.5 || mod(cell.y, 2.0) > 0.5)) return 0.0;
     float thickness = (0.36 + 0.1 * between) * (1.0 - 0.75 * share / length_);
-    return dot(within, within) > thickness * thickness;
+    return clamp(0.5 + (thickness - length(within)) / max(pixel / exp2(coarser), 1e-4), 0.0, 1.0);
 }
 
 // Hairs shade one another: dark at the roots, full at the tips.
@@ -970,7 +975,9 @@ bool add_fur(std::string &fs)
     fs = std::regex_replace(fs, encode, "$1.xyz += wbm_hair_shine * vSunColor.xyz * (" + lit + " * wbm_shell_shade(Tex0));\n  $&", std::regex_constants::format_first_only);
     size_t body = fs.find("void main ()");
     if (body != std::string::npos) body = fs.find('{', body);
-    if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0, " + down + ")) discard;");
+    if (body != std::string::npos) fs.insert(body + 1, "\n  wbm_hair_cover = wbm_shell_cover(Tex0, " + down + ");\n  if (wbm_hair_cover < 0.02) discard;");
+    // A layer is blended in by how much of the pixel its hair covers (the renderer turns blending on for layers).
+    fs = std::regex_replace(fs, std::regex(R"(gl_FragColor = (\w+);)"), "$1.w = wbm_shell.y > 0.0 ? wbm_hair_cover : $1.w;\n  $&");
     // A hair has the colour of the place it grows from, not of what it hangs over.
     fs = std::regex_replace(fs, std::regex(R"(texture2D \(diffuse_texture, Tex0\))"), "wbm_hair_tint(texture2D (diffuse_texture, wbm_shell_root(Tex0, " + down + ")))");
     if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos && fs.find("uniform vec4 vSkyLightColor;") != std::string::npos &&

@@ -4498,8 +4498,11 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         // The coat's layers are tested against the depth of the body but leave
         // none of their own: ambient occlusion and contact shadows, which work
         // from depth, would take the gaps between hairs for pits and speckle the horse.
-        bool depth_mask = s_depth_mask;
-        if (shells) s_depth_mask = false;
+        // Each layer is blended over what lies beneath it, by how much of the
+        // pixel its hairs cover (wbm_shell_cover): the layers go from the body outwards.
+        bool depth_mask = s_depth_mask, blend = s_blend;
+        GLenum blend_src = s_blend_src, blend_dst = s_blend_dst, blend_eq = s_blend_eq;
+        if (shells) s_depth_mask = false, s_blend = true, s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD;
         for (int layer = 1; layer <= shells; layer++) {
             float share = (float)layer / (float)shells;
             const float now[4] = {s_fur_length * share, share, s_fur_density, clock};
@@ -4518,6 +4521,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
             s_shell_draws++;
         }
+        s_blend = blend, s_blend_src = blend_src, s_blend_dst = blend_dst, s_blend_eq = blend_eq;
         if (shells) memset(s_shell_now, 0, sizeof s_shell_now);
         if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
         if (s_dyn_shadows && s_pass_scene && primitive == MTLPrimitiveTypeTriangle && s_depth_test && s_depth_mask)
