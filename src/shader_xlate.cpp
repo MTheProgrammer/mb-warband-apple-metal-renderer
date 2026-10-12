@@ -767,10 +767,17 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
         hue *= mix(0.2, 1.0, fair);
         float lit_side = clamp(facing * 0.7 + 0.5, 0.0, 1.0);
         float through = pow(clamp(dot(-v, l), 0.0, 1.0), 7.0) * (1.0 - abs(dot(t, l))) ;
-        wbm_hair_shine = grows.y * wbm_fur.x * (lit_side * (0.10 * off_surface + 0.16 * from_inside * hue) + 0.22 * through * hue);
+        // Hair shadows hair: sunlight reaching a layer has come through those
+        // above it, and through more of them the lower the sun stands over the
+        // surface. (The shadow map adds what the mane casts on the body and on itself as a whole.)
+        float outer = wbm_shell.z < 0.0 ? wbm_shell.y : 0.0; // 1 at the tips, 0 on the skin under the hair
+        float through_hair = exp(-0.9 * (1.0 - outer) / max(normalize(l).z, 0.35));
+        wrapped *= mix(1.0, through_hair, grows.y);
+        rim *= mix(1.0, through_hair, grows.y);
+        wbm_hair_shine = through_hair * grows.y * wbm_fur.x * (lit_side * (0.10 * off_surface + 0.16 * from_inside * hue) + 0.22 * through * hue);
         // A strand is lit by how far it lies across the light, not by which way the skin under it faces.
         float c = dot(t, l);
-        strands = grows.y * (0.8 * sqrt(max(1.0 - c * c, 0.0)) * clamp(facing * 0.5 + 0.6, 0.0, 1.0) - wrapped) * 0.25;
+        strands = grows.y * (0.8 * sqrt(max(1.0 - c * c, 0.0)) * clamp(facing * 0.5 + 0.6, 0.0, 1.0) - wrapped) * 0.25 * through_hair;
     }
     vec4 coat = vec4(vec3(wrapped + rim + strands) + back, plain.w) + vec4(highlight.xyz * mix(0.45, 0.0, grows.y), 0.0);
     return mix(plain, coat, fur);
@@ -896,8 +903,25 @@ bool wbm_shell_bare(vec2 uv, vec3 down)
 // Hairs shade one another: dark at the roots, full at the tips.
 float wbm_shell_shade(vec2 uv)
 {
-    if (wbm_shell.y > 0.0) return (wbm_shell.z < 0.0 ? 0.5 : 0.6) + (wbm_shell.z < 0.0 ? 0.5 : 0.4) * wbm_shell.y;
+    if (wbm_shell.y > 0.0) return (wbm_shell.z < 0.0 ? 0.72 : 0.6) + (wbm_shell.z < 0.0 ? 0.28 : 0.4) * wbm_shell.y; // long hair: the sun's part is in wbm_fur_lit
     return wbm_shell.w > 0.5 && wbm_grows(uv).x >= 0.5 ? 0.6 : 1.0;
+}
+
+// What long hair reflects of the sky: a broad sheen where the strands lie
+// across the line halfway between the eye and straight up, strongest seen
+// edge-on, white with a little of the hair's colour. Per unit of sky light.
+vec3 wbm_hair_sky(vec2 uv, vec3 view, vec3 normal, vec3 up)
+{
+    vec2 grows = wbm_grows(uv);
+    vec3 combed = wbm_combed(uv);
+    if (grows.y <= 0.0 || dot(combed, combed) <= 0.04 || dot(up, up) < 0.0001) return vec3(0.0);
+    vec3 v = normalize(view), n = normalize(normal), t = normalize(normalize(combed) - n * 0.05);
+    float along = dot(t, normalize(v + normalize(up)));
+    float sheen = pow(sqrt(max(1.0 - along * along, 0.0)), 14.0);
+    float edge = 0.25 + 0.75 * pow(1.0 - clamp(dot(v, n), 0.0, 1.0), 3.0);
+    vec3 hue = wbm_hair_colour.w > 0.0 ? wbm_hair_colour.xyz / max(max(wbm_hair_colour.x, max(wbm_hair_colour.y, wbm_hair_colour.z)), 0.02) : vec3(1.0);
+    float outer = wbm_shell.z < 0.0 ? wbm_shell.y : 0.0;
+    return grows.y * wbm_fur.x * 0.5 * sheen * edge * (0.35 + 0.65 * outer) * mix(vec3(1.0), hue, 0.35);
 }
 
 // A wet eye: a sharp highlight from the sun and a little of the sky, on top of
@@ -947,6 +971,10 @@ bool add_fur(std::string &fs)
     if (body != std::string::npos) fs.insert(body + 1, "\n  if (wbm_shell_bare(Tex0, " + down + ")) discard;");
     // A hair has the colour of the place it grows from, not of what it hangs over.
     fs = std::regex_replace(fs, std::regex(R"(texture2D \(diffuse_texture, Tex0\))"), "wbm_hair_tint(texture2D (diffuse_texture, wbm_shell_root(Tex0, " + down + ")))");
+    if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos && fs.find("uniform vec4 vSkyLightColor;") != std::string::npos &&
+        fs.find("varying vec3 SkyLightDir;") != std::string::npos)
+        fs = std::regex_replace(fs, encode, "$1.xyz += wbm_hair_sky(Tex0, ViewDir, " + normal + ", SkyLightDir) * (vAmbientColor.xyz + vSkyLightColor.xyz);\n  $&",
+                                std::regex_constants::format_first_only);
     if (fs.find("uniform vec4 vAmbientColor;") != std::string::npos)
         fs = std::regex_replace(fs, encode, "$1.xyz += wbm_horse_glint(Tex0, ViewDir, " + normal + ", SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz);\n  $&",
                                 std::regex_constants::format_first_only);

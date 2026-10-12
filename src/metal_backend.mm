@@ -2424,6 +2424,12 @@ struct CasterDraw {
     int bones;                // index into s_caster_bones of 32 matrices, or -1
     id<MTLTexture> alpha;     // set for alpha-tested geometry
     id<MTLSamplerState> alpha_sampler;
+    // A layer of long hair (see record_hair_casters): the mesh pushed out by
+    // `push` metres, hanging as the drawn hair does at `share` of its length,
+    // casting only where `alpha`, here the hair map, says long hair.
+    bool hair = false;
+    float push = 0, share = 0, down[3] = {0, 0, 0};
+    std::shared_ptr<std::vector<float>> own_bones; // 32 matrices, kept with the record: it outlives the frame's own
 };
 std::vector<CasterDraw> s_casters;
 std::vector<float> s_caster_bones;
@@ -2478,13 +2484,22 @@ using namespace metal;
 struct Caster {
     float4x4 m;
     float4 window[2]; // the wide window and the fine one. xy: centre, zw: 2 / (width, height), all in map coordinates
-    float4 params;    // x: alpha below which a cut-out texel casts nothing
+    float4 params;    // x: alpha below which a cut-out texel casts nothing; for hair, y: metres out, z: share of the hair's length
+    float4 hang;      // for hair, xyz: which way is down, in the space the bones leave the vertex in
 };
 struct SkinnedCaster {
     float4x4 m;
     float4 window[2];
     float4 params;
+    float4 hang;
     float4x4 bones[32];
+};
+struct HairIn {
+    float3 position [[attribute(0)]];
+    float3 normal [[attribute(1)]];
+    float2 uv [[attribute(4)]];
+    float4 weights [[attribute(7)]];
+    float4 indices [[attribute(8)]];
 };
 struct StaticIn {
     float3 position [[attribute(0)]];
@@ -2532,6 +2547,29 @@ vertex Out caster_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster &c [
     return finish(c.m * skinned, in.uv, c.window[side], c.params);
 }
 
+// A layer of long hair, moved as the renderer's own layers are (add_shell_push in shader_xlate.cpp).
+vertex Out caster_hair(HairIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]], ushort side [[amplification_id]])
+{
+    float4 p = float4(in.position, 1.0), q = float4(in.normal, 0.0);
+    float4 skinned = c.bones[int(in.indices.x)] * p * in.weights.x + c.bones[int(in.indices.y)] * p * in.weights.y +
+                     c.bones[int(in.indices.z)] * p * in.weights.z + c.bones[int(in.indices.w)] * p * in.weights.w;
+    float3 n = normalize((c.bones[int(in.indices.x)] * q * in.weights.x + c.bones[int(in.indices.y)] * q * in.weights.y +
+                          c.bones[int(in.indices.z)] * q * in.weights.z + c.bones[int(in.indices.w)] * q * in.weights.w).xyz);
+    skinned.xyz += c.params.y * (n * (1.0 - 0.55 * c.params.z) + c.hang.xyz * (2.2 * c.params.z));
+    return finish(c.m * skinned, in.uv, c.window[side], c.params);
+}
+
+fragment float4 caster_hair_only(Out in [[stage_in]], texture2d<float> hair [[texture(0)]], sampler s [[sampler(0)]])
+{
+    if (hair.sample(s, in.uv).b < 0.8) discard_fragment(); // long hair is 1 in a hair map's blue
+    // Hair lets about half the light past it: every other strand casts, which
+    // the receiving filter turns into half a shadow. Solid, a mane would put
+    // itself and the neck under it in the dark.
+    float strand = fract(sin(floor(in.uv.x * 700.0) * 12.9898 + floor(in.uv.y * 700.0) * 78.233) * 43758.5453);
+    if (strand > 0.45) discard_fragment();
+    return float4(in.depth);
+}
+
 fragment float4 caster_opaque(Out in [[stage_in]])
 {
     return float4(in.depth);
@@ -2547,7 +2585,7 @@ fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[te
 id<MTLLibrary> s_caster_library;
 id<MTLDepthStencilState> s_caster_depth_state;
 NSUInteger s_caster_halves = 1; // 2 when the fine window is drawn too
-std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[4]; // [skinned * 2 + cutout]
+std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[5]; // [skinned * 2 + cutout], and 4 for hair
 
 // Called for each draw of the engine's depth pre-pass, after it has been issued.
 void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset, bool late)
@@ -2619,18 +2657,56 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
     (late ? s_late_casters : s_casters).push_back(c);
 }
 
-id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout)
+// Long hair casts shadows too. Its layers exist only as draws of the main
+// pass, so that is where they are taken from: a few of them per coat, to be
+// drawn into the next frame's map like the grass (see s_late_casters).
+void record_hair_casters(Program &p, Texture &coat, NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset)
 {
-    auto &cache = s_caster_pipelines[skinned * 2 + cutout];
+    if (!p.u_world || !p.u_bones || !coat.hair || s_late_casters.size() >= 4000) return;
+    CasterDraw c{};
+    memcpy(c.key.format, s_last_key.format, sizeof c.key.format);
+    memcpy(c.key.slot, s_last_key.slot, sizeof c.key.slot);
+    memcpy(c.key.offset, s_last_key.offset, sizeof c.key.offset);
+    memcpy(c.key.stride, s_last_key.stride, sizeof c.key.stride);
+    if (!c.key.format[0] || !c.key.format[1] || !c.key.format[7] || !c.key.format[8]) return;
+    c.slots = s_draw_binding.slots;
+    for (int i = 0; i < c.slots; i++) {
+        Buffer *b = find(s_buffers, s_draw_binding.buffer[i]);
+        if (!b || !b->mtl) return;
+        c.vertex[i] = b->mtl;
+        c.vertex_offset[i] = s_draw_binding.base[i];
+    }
+    c.indices = indices, c.index_offset = index_offset, c.index_count = count, c.index_type = index_type;
+    memcpy(c.wvp, p.uniform_data[0].data() + p.u_world->offset, sizeof c.wvp);
+    c.world = true;
+    c.bones = -1;
+    c.own_bones = std::make_shared<std::vector<float>>(32 * 16, 0.0f);
+    memcpy(c.own_bones->data(), p.uniform_data[0].data() + p.u_bones->offset, std::min<size_t>(32 * 64, p.uniform_data[0].size() - (size_t)p.u_bones->offset));
+    c.alpha = coat.hair;
+    c.alpha_sampler = sampler_for(coat);
+    c.hair = true;
+    // Down, in the space the world matrix starts from: the world's, turned back by the matrix's rotation.
+    float len = sqrtf(c.wvp[2] * c.wvp[2] + c.wvp[6] * c.wvp[6] + c.wvp[10] * c.wvp[10]);
+    if (len > 1e-6f) c.down[0] = -c.wvp[2] / len, c.down[1] = -c.wvp[6] / len, c.down[2] = -c.wvp[10] / len;
+    for (int layer = 1; layer <= 2; layer++) {
+        c.share = (float)layer / 2.0f;
+        c.push = s_hair_length * c.share;
+        s_late_casters.push_back(c);
+    }
+}
+
+id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout, bool hair = false)
+{
+    auto &cache = s_caster_pipelines[hair ? 4 : skinned * 2 + cutout];
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = [s_caster_library newFunctionWithName:skinned ? @"caster_skinned" : @"caster_static"];
-    d.fragmentFunction = [s_caster_library newFunctionWithName:cutout ? @"caster_cutout" : @"caster_opaque"];
+    d.vertexFunction = [s_caster_library newFunctionWithName:hair ? @"caster_hair" : skinned ? @"caster_skinned" : @"caster_static"];
+    d.fragmentFunction = [s_caster_library newFunctionWithName:hair ? @"caster_hair_only" : cutout ? @"caster_cutout" : @"caster_opaque"];
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-    const int wanted[4] = {0, 4, 7, 8};
+    const int wanted[5] = {0, 4, 7, 8, 1};
     bool uses_constant = false;
-    for (int n = 0; n < (skinned ? 4 : 2); n++) {
+    for (int n = 0; n < (hair ? 5 : skinned ? 4 : 2); n++) {
         int i = wanted[n];
         if (key.format[i] && key.slot[i] != CONSTANT_SLOT) {
             vd.attributes[i].format = (MTLVertexFormat)key.format[i];
@@ -2776,9 +2852,9 @@ void render_dynamic_shadows(Program &p)
     mat_mul(sun, inv_frame, to_shadow);
 
     // All the casters' uniforms go into one buffer.
-    const size_t static_size = 256, skinned_size = 2304; // 112 and 2160 bytes, rounded up to the offset alignment
+    const size_t static_size = 256, skinned_size = 2304; // 128 and 2176 bytes, rounded up to the offset alignment
     size_t total = 0;
-    for (const CasterDraw &c : casters) total += c.bones >= 0 ? skinned_size : static_size;
+    for (const CasterDraw &c : casters) total += c.bones >= 0 || c.own_bones ? skinned_size : static_size;
     if (!total) return;
     id<MTLBuffer> uniforms = [s_device newBufferWithLength:total options:MTLResourceStorageModeShared];
     uint8_t *base = (uint8_t *)uniforms.contents;
@@ -2810,9 +2886,9 @@ void render_dynamic_shadows(Program &p)
     size_t at = 0;
     void *last_pipeline = nullptr;
     for (const CasterDraw &c : casters) {
-        bool skinned = c.bones >= 0;
+        bool skinned = c.bones >= 0 || c.own_bones;
         size_t size = skinned ? skinned_size : static_size;
-        id<MTLRenderPipelineState> pipeline = caster_pipeline(c.key, skinned, c.alpha != nil);
+        id<MTLRenderPipelineState> pipeline = caster_pipeline(c.key, skinned, c.alpha != nil, c.hair);
         if (!pipeline) {
             at += size;
             continue;
@@ -2825,9 +2901,10 @@ void render_dynamic_shadows(Program &p)
         for (int i = 0; i < 16; i++) m32[i] = (float)m[i];
         memcpy(base + at, m32, 64);
         memcpy(base + at + 64, window, 32);
-        const float params[4] = {c.cutoff, 0, 0, 0};
+        const float params[4] = {c.cutoff, c.push, c.share, 0}, hang[4] = {c.down[0], c.down[1], c.down[2], 0};
         memcpy(base + at + 96, params, 16);
-        if (skinned) memcpy(base + at + 112, &bones[(size_t)c.bones * 32 * 16], 32 * 64);
+        memcpy(base + at + 112, hang, 16);
+        if (skinned) memcpy(base + at + 128, c.own_bones ? c.own_bones->data() : &bones[(size_t)c.bones * 32 * 16], 32 * 64);
         if (last_pipeline != (__bridge void *)pipeline) {
             [pass setRenderPipelineState:pipeline];
             last_pipeline = (__bridge void *)pipeline;
@@ -4398,6 +4475,12 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
+        if (long_hair && s_dyn_shadows && primitive == MTLPrimitiveTypeTriangle) {
+            Program *fp = find(s_programs, s_program);
+            UniformLocation &l = fp->locations[(size_t)fp->alpha_texture_location];
+            if (Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr)
+                record_hair_casters(*fp, *coat, (NSUInteger)count, index_type, b->mtl, offset);
+        }
         for (int layer = 1; layer <= shells; layer++) {
             float share = (float)layer / (float)shells;
             const float now[4] = {s_fur_length * share, share, s_fur_density, clock};
