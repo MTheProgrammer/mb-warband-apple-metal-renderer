@@ -27,6 +27,7 @@ struct Preview {
     bool active = false, keep_scene = false, library_read = false;
     BrfLibrary library;
     std::string root, name;
+    std::string material; // when set, used in place of the one the mesh names (heads name none: the game picks a face's by its own rules)
     std::vector<PreviewPart> parts;
     float centre[3] = {0, 0, 0}, radius = 1;
     GLuint next_id = 0x40000000; // far from anything a capture numbers
@@ -175,6 +176,7 @@ bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
     if (!pv.library.load_mesh(mesh_name, &mesh) || mesh.vertices.empty() || mesh.indices.empty()) return false;
     PreviewPart part;
     part.skinned = mesh.skinned;
+    if (!pv.material.empty()) mesh.material = pv.material;
     auto material = pv.library.materials.find(lower_case(mesh.material));
     if (material != pv.library.materials.end()) part.material = material->second;
     else complain("preview: mesh %s names a material, %s, that no resource file has", mesh_name.c_str(), mesh.material.c_str());

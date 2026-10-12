@@ -44,5 +44,6 @@ void mtl_replay_show_interface(bool show);
 // frame as captured. *distance receives how far ahead of the camera the model
 // is, for the camera to turn about.
 bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *distance);
+void mtl_preview_material(const char *name); // before mtl_preview_model: a material to use in place of the mesh's own; empty for the mesh's own
 int mtl_preview_list(const char *pattern, FILE *out); // prints mesh names containing the pattern
 const char *mtl_preview_neighbour(const char *name, int by);

@@ -3579,6 +3579,8 @@ bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *dista
     return ok;
 }
 
+void mtl_preview_material(const char *name) { s_preview.material = name ? name : ""; }
+
 int mtl_preview_list(const char *pattern, FILE *out)
 {
     preview_read_library();
@@ -3589,6 +3591,11 @@ int mtl_preview_list(const char *pattern, FILE *out)
         const std::string &file = s_preview.library.files[(size_t)m.second.file];
         fprintf(out, "%-44s %s\n", m.first.c_str(), file.substr(file.rfind('/') + 1).c_str());
         found++;
+    }
+    for (auto &m : s_preview.library.materials) {
+        if (m.first.find(want) == std::string::npos) continue;
+        fprintf(out, "%-44s material: shader %s, textures %s %s %s %s\n", m.first.c_str(), m.second.shader.c_str(), m.second.diffuse.c_str(), m.second.diffuse2.c_str(),
+                m.second.normal.c_str(), m.second.specular.c_str());
     }
     return found;
 }

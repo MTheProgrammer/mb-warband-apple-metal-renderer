@@ -87,6 +87,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--pivot") && i + 1 < argc) s_view.pivot = atof(argv[++i]), pivot_given = true;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--lod") && i + 1 < argc) lod = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--material") && i + 1 < argc) mtl_preview_material(argv[++i]);
         else if (!strcmp(argv[i], "--keep-scene")) keep_scene = true;
         else if (!strcmp(argv[i], "--list") && i + 1 < argc) list = argv[++i];
         else if (!strcmp(argv[i], "--no-ui")) s_view.interface = false;
@@ -105,7 +106,7 @@ int main(int argc, char **argv)
     if (!path || !mtl_replay_open(path, &width, &height)) {
         fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet] [--stats]\n"
                         "              [--yaw deg] [--pitch deg] [--pan x y] [--forward m] [--pivot m] [--no-ui]\n"
-                        "              [--model mesh [--lod n] [--keep-scene]]\n       replay --list word\n%s\n",
+                        "              [--model mesh [--material name] [--lod n] [--keep-scene]]\n       replay --list word\n%s\n",
                 path ? "that file is not a frame capture" : "");
         return 2;
     }
