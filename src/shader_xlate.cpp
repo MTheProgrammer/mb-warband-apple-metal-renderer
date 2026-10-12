@@ -18,6 +18,8 @@ const char *const k_xl_samples_uniform = "wbm_samples";
 const char *const k_xl_headroom_uniform = "wbm_headroom";
 const char *const k_xl_limit_uniform = "wbm_limit";
 const char *const k_xl_sky_sampler = "wbm_sky";
+const char *const k_xl_ambient_uniform = "wbm_amb";
+const char *const k_xl_material_uniform = "wbm_material";
 const char *const k_xl_dyn_sampler = "wbm_dyn_map";
 const char *const k_xl_dyn_window_uniform = "wbm_dyn";
 const char *const k_xl_dyn_near_uniform = "wbm_dyn_near";
@@ -291,7 +293,7 @@ float wbm_specular(vec3 view, vec3 light, vec3 normal, float shininess)
     vec3 h = normalize(v + l);
     float nh = clamp(dot(n, h), 0.0, 1.0), nl = clamp(dot(n, l), 0.0, 1.0);
     float nv = clamp(abs(dot(n, v)), 0.001, 1.0), vh = clamp(dot(v, h), 0.0, 1.0);
-    float a2 = clamp(2.0 / (shininess + 2.0), 0.0004, 1.0);
+    float a2 = clamp(2.0 / (shininess + 2.0) * wbm_rough, 0.0004, 1.0);
     float d = nh * nh * (a2 - 1.0) + 1.0;
     float lobe = (a2 * a2) / (d * d);
     float gl = 2.0 * nl / (nl + sqrt(a2 + (1.0 - a2) * nl * nl));
@@ -300,7 +302,7 @@ float wbm_specular(vec3 view, vec3 light, vec3 normal, float shininess)
     float fresnel = (f0 + (1.0 - f0) * pow(1.0 - vh, 5.0)) / f0;
     wbm_n = n;
     wbm_a2 = a2;
-    return lobe * gl * gv * fresnel;
+    return lobe * gl * gv * fresnel * wbm_gain;
 }
 )";
 
@@ -312,6 +314,8 @@ float wbm_a2 = 0.25;
 vec3 wbm_albedo = vec3(0.5);
 float wbm_mask = 0.0;
 float wbm_metal = 0.0;
+float wbm_rough = 1.0; // factors from the material class, see k_xl_material_uniform
+float wbm_gain = 1.0;
 )";
 
 // What a surface reflects besides the sun. The engine renders no environment
@@ -395,6 +399,65 @@ vec3 wbm_environment_sky(vec3 view, vec3 reflection, vec3 ground)
 }
 )";
 
+// Ambient light with a direction to it. The engine lights what the sun does
+// not reach with one flat colour plus a "sky light" from straight above, both
+// set per scene. Two things are added (see k_xl_ambient_uniform):
+//
+//   - the sum is tinted by the colour of the captured sky on the side the
+//     surface faces, relative to the sky's mean, so that a wall facing a
+//     sunset is lit warmer than one facing away from it;
+//   - surfaces that face sideways or down receive sunlight bounced off the
+//     ground, in proportion to how much of the ground they see.
+//
+// Shaders that light per vertex have the world-space normal. The normal-mapped
+// ones work in tangent space and know only which way is up there, so they get
+// the tint by elevation alone.
+const char k_ambient_functions[] = R"(
+uniform vec4 wbm_amb[6];
+
+vec3 wbm_amb_horizon()
+{
+    return 0.25 * (wbm_amb[0].xyz + wbm_amb[1].xyz + wbm_amb[2].xyz + wbm_amb[3].xyz);
+}
+
+vec3 wbm_ambient(vec3 light, vec3 normal)
+{
+    float k = wbm_amb[5].w;
+    if (k <= 0.0) return light;
+    vec3 n = normalize(normal), q = n * n;
+    vec3 tint = q.x * (n.x > 0.0 ? wbm_amb[0].xyz : wbm_amb[1].xyz) + q.y * (n.y > 0.0 ? wbm_amb[2].xyz : wbm_amb[3].xyz) +
+                q.z * (n.z > 0.0 ? wbm_amb[4].xyz : wbm_amb_horizon());
+    return light * mix(vec3(1.0), tint, k) + wbm_amb[5].xyz * (0.5 - 0.5 * n.z);
+}
+
+// sky: the engine's sky-light term; ambient: its flat ambient colour, added
+// elsewhere; up: the normal's component along the world's up axis.
+vec4 wbm_ambient_up(vec4 sky, vec4 ambient, float up)
+{
+    float k = wbm_amb[5].w;
+    if (k <= 0.0) return sky;
+    up = clamp(up, -1.0, 1.0);
+    vec3 horizon = wbm_amb_horizon();
+    vec3 tint = mix(horizon, up > 0.0 ? wbm_amb[4].xyz : horizon, up * up);
+    return vec4(sky.xyz + (ambient.xyz + sky.xyz) * (mix(vec3(1.0), tint, k) - 1.0) + wbm_amb[5].xyz * (0.5 - 0.5 * up), sky.w);
+}
+)";
+
+bool add_sky_ambient(std::string &glsl, bool vertex)
+{
+    if (vertex) {
+        static const std::regex term(
+            R"(\(([\w.]+) \+ \(clamp \(\s*dot \(([\w.]+), -\(vSkyLightDir\.xyz\)\)\s*, 0\.0, 1\.0\) \* vSkyLightColor\.xyz\)\))");
+        if (!std::regex_search(glsl, term)) return false;
+        glsl = std::regex_replace(glsl, term, "wbm_ambient($&, vec3($2))");
+        return true;
+    }
+    static const std::regex term(R"(\(clamp \(\s*dot \(SkyLightDir, ([\w.]+)\)\s*, 0\.0, 1\.0\) \* vSkyLightColor\))");
+    if (glsl.find("uniform vec4 vAmbientColor;") == std::string::npos || !std::regex_search(glsl, term)) return false;
+    glsl = std::regex_replace(glsl, term, "wbm_ambient_up($&, vAmbientColor, dot(normalize(SkyLightDir), vec3($1)))");
+    return true;
+}
+
 // Finds pow(clamp(dot(normalize(V +/- L), N), 0, 1), fMaterialPower) and
 // replaces it with wbm_specular(V, +/-L, N, fMaterialPower).
 bool use_pbr_specular(std::string &fs)
@@ -417,7 +480,7 @@ bool use_pbr_specular(std::string &fs)
 //   - just before the colour is encoded for display: add the reflection.
 // `sky` asks for the captured sky where the shader allows it; `extra` receives
 // declarations the shader then needs in front of it.
-bool add_pbr_environment(std::string &fs, bool sky, std::string &extra)
+bool add_pbr_environment(std::string &fs, bool sky, bool materials, std::string &extra)
 {
     static const std::regex decode(R"((\w+)\.xyz = pow \((\w+)\.xyz, vec3\(2\.2, 2\.2, 2\.2\)\);)");
     static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
@@ -483,10 +546,21 @@ bool add_pbr_environment(std::string &fs, bool sky, std::string &extra)
     // colour, whose brightness runs from under 1 (stone, cloth) through 3-15
     // (leather, wood, mail) to 50 and more (plate), so that is what separates
     // metal from non-metal here.
-    fs.insert(body, "\n  float wbm_gloss = dot(vSpecularColor.xyz, vec3(0.3333));"
-                    "\n  float wbm_raw_mask = clamp(" + mask + ", 0.0, 1.0);"
-                    "\n  wbm_mask = wbm_raw_mask * clamp(wbm_gloss / 40.0, 0.0, 1.0);"
-                    "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);");
+    std::string start = "\n  float wbm_gloss = dot(vSpecularColor.xyz, vec3(0.3333));"
+                        "\n  float wbm_raw_mask = clamp(" + mask + ", 0.0, 1.0);"
+                        "\n  wbm_mask = wbm_raw_mask * clamp(wbm_gloss / 40.0, 0.0, 1.0);"
+                        "\n  wbm_metal = smoothstep(0.2, 0.6, wbm_raw_mask) * smoothstep(6.0, 30.0, wbm_gloss);";
+    if (materials) {
+        // What the texture is says more than the two numbers above can.
+        extra += std::string("uniform vec4 ") + k_xl_material_uniform + ";\n";
+        start += std::string("\n  if (") + k_xl_material_uniform + ".w > 0.0) {"
+                 "\n    wbm_metal = clamp(wbm_metal * " + k_xl_material_uniform + ".x, 0.0, 1.0);"
+                 "\n    wbm_rough = " + k_xl_material_uniform + ".y;"
+                 "\n    wbm_gain = " + k_xl_material_uniform + ".z;"
+                 "\n    wbm_mask *= " + k_xl_material_uniform + ".z;"
+                 "\n  }";
+    }
+    fs.insert(body, start);
     return true;
 }
 
@@ -590,8 +664,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
     bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment || options.pbr_sky) && use_pbr_specular(glsl);
     std::string pbr_extra;
-    bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, pbr_extra);
+    bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, pbr_extra);
     if (!vertex && options.srgb_textures) decode_srgb_in_hardware(glsl, srgb_samplers); // after the above: it removes a pow they look for
+    bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
@@ -609,6 +684,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (pbr_specular) out << k_pbr_globals << k_pbr_specular_function;
     if (pbr_environment) out << k_pbr_environment_function;
     if (!pbr_extra.empty()) out << std::regex_replace(pbr_extra, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
+    if (sky_ambient) out << k_ambient_functions;
     if (final_pass) out << k_tonemap_functions;
     if (final_pass && options.hdr_output) out << "uniform float " << k_xl_headroom_uniform << ";\n";
     if (!vertex && !final_pass && options.hdr_output) out << "uniform float " << k_xl_limit_uniform << ";\n";

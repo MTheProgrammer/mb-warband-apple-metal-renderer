@@ -75,6 +75,15 @@ struct XlOptions {
     // instead of a two-colour gradient. Adds the sampler wbm_sky, which must be
     // given the atlas described at k_xl_sky_sampler.
     bool pbr_sky = false;
+    // Colour the ambient light by direction: tint what the engine adds as flat
+    // ambient and sky light with the colour of the captured sky on that side,
+    // and add sunlight bounced off the ground to surfaces that face downwards
+    // or sideways. Adds the wbm_amb uniform (see k_xl_ambient_uniform).
+    bool sky_ambient = false;
+    // On top of pbr_environment: take metalness, roughness and highlight
+    // strength per material class from the backend, which knows what each
+    // texture is. Adds the wbm_material uniform (see k_xl_material_uniform).
+    bool materials = false;
     // In the engine's final post-processing shader: replace its tone-mapping
     // operator with a filmic curve.
     bool filmic_tonemap = false;
@@ -99,6 +108,20 @@ extern const char *const k_xl_headroom_uniform;
 // largest colour value it may write. The backend sets it to 1 when drawing to
 // the screen and to a very large number otherwise.
 extern const char *const k_xl_limit_uniform;
+
+// With sky_ambient, shaders that add ambient light get wbm_amb, six vec4:
+//   [0..4] xyz  the sky's colour towards +X, -X, +Y, -Y and +Z (Z is up),
+//               linear, divided by the mean brightness of the five;
+//   [5]    xyz  light bounced off the ground, to add to a surface facing
+//               straight down; w: how far to apply the tint, 0 for not at all.
+extern const char *const k_xl_ambient_uniform;
+
+// With materials, shaders with an environment reflection get wbm_material:
+//   x  factor on the estimated metalness (0: never a metal);
+//   y  factor on the squared roughness derived from the material's shininess;
+//   z  factor on the highlight and reflection strength;
+//   w  above 0 when the material is known; otherwise the rest is ignored.
+extern const char *const k_xl_material_uniform;
 
 // With pbr_sky: a sampler for the sky atlas, six square faces side by side in
 // the order +X, -X, +Y, -Y, +Z, -Z (Z is up). Face f looks along its axis with

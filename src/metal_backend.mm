@@ -12,6 +12,8 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <atomic>
+#include <dirent.h>
+#include <mach-o/dyld.h>
 #include <cmath>
 #include <cstdarg>
 #include <map>
@@ -41,6 +43,7 @@ struct Buffer {
 
 struct Texture {
     id<MTLTexture> mtl;
+    uint8_t material = 0; // what the texture shows, when its file was recognised: see MaterialClass
     MTLPixelFormat format = MTLPixelFormatInvalid;
     int top_level = -1; // highest mip level that has content
     int scale = 1;      // storage is this many times the size the game asked for (see s_scale)
@@ -126,7 +129,9 @@ struct Program {
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
-    int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1; // fragment stage, see k_xl_dyn_sampler
+    int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
+    int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
+    int material_offset = -1;     // fragment stage, see k_xl_material_uniform // fragment stage, see k_xl_dyn_sampler
     // For the per-frame shadow map (see record_caster). The engine marks a
     // character's ground shadow, which that map replaces, with one blur constant.
     const XlUniform *u_wvp = nullptr, *u_world = nullptr, *u_bones = nullptr;
@@ -310,6 +315,175 @@ uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
 bool s_sun_valid;
 void apply_ambient_occlusion();
+
+// Ambient light from the captured sky (WBM_SKY_AMBIENT=1), see k_xl_ambient_uniform.
+bool s_sky_ambient;
+float s_sky_ambient_strength = 0.6f; // WBM_SKY_AMBIENT_STRENGTH: how far the sky's colour tints the ambient light
+float s_bounce_strength = 0.5f;      // WBM_BOUNCE: sunlight bounced off the ground, as a share of the ideal amount
+float s_amb[24];                     // the shaders' wbm_amb
+std::mutex s_amb_mu;
+float s_amb_faces[6][3]; // mean colour of each sky face as last read back, gamma-encoded; guarded by s_amb_mu
+bool s_amb_faces_valid;  // guarded by s_amb_mu
+uint64_t s_amb_stats_frames;
+
+// Material classes (WBM_MATERIALS=1), see k_xl_material_uniform. Textures are
+// recognised by their content, matched against the files in the game's
+// texture folders, and classed by words in the file's name.
+enum MaterialClass { MAT_UNKNOWN, MAT_METAL, MAT_CLOTH, MAT_LEATHER, MAT_SKIN, MAT_WOOD, MAT_STONE, MAT_HORSE, MAT_COUNT };
+const char *const k_material_names[MAT_COUNT] = {"unknown", "metal", "cloth", "leather", "skin and hair", "wood", "stone and ground", "horse"};
+// metalness factor, roughness factor, highlight strength, known
+const float k_material_params[MAT_COUNT][4] = {
+    {1.0f, 1.0f, 1.0f, 0.0f}, // unknown: the estimate from the specular mask stands
+    {1.5f, 0.6f, 1.2f, 1.0f}, // metal: readier to count as metal, smoother
+    {0.0f, 3.0f, 0.35f, 1.0f}, // cloth: never metal, matt
+    {0.0f, 1.4f, 0.8f, 1.0f}, // leather: a broad, soft sheen
+    {0.0f, 1.6f, 0.7f, 1.0f}, // skin and hair
+    {0.0f, 2.2f, 0.5f, 1.0f}, // wood
+    {0.0f, 2.5f, 0.4f, 1.0f}, // stone and ground
+    {0.0f, 1.2f, 0.9f, 1.0f}, // a horse's coat
+};
+bool s_materials;
+std::unordered_map<uint64_t, uint8_t> s_material_by_content; // filled once at start, read-only afterwards
+struct {
+    std::atomic<int> uploads{0}, matched{0}, recognised{0}, strangers{0};
+    int files = 0, classed[MAT_COUNT] = {};
+} s_material_stats;
+
+uint64_t content_key(uint32_t width, uint32_t height, const void *data, size_t size)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const uint8_t *p, size_t n) {
+        for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    };
+    mix((const uint8_t *)&width, 4);
+    mix((const uint8_t *)&height, 4);
+    mix((const uint8_t *)data, std::min<size_t>(size, 1024));
+    return h;
+}
+
+int classify_texture_name(std::string name)
+{
+    for (char &c : name) c = (char)tolower((unsigned char)c);
+    // Words that mark each class. A name with words of more than one class
+    // (a surcoat over mail) is a mixture, and is left to the specular mask.
+    static const struct {
+        int cls;
+        const char *words[32];
+    } table[] = {
+        {MAT_METAL, {"plate", "mail", "helmet", "helm", "lamellar", "scale", "gauntlet", "greave", "sword", "blade", "axe", "mace", "lance", "spear", "metal", "iron", "steel", "brass", "chain", "coif", "bascinet", "cuirass", "weapon"}},
+        {MAT_CLOTH, {"dress", "tunic", "shirt", "cloth", "coat", "surcoat", "vest", "costume", "outfit", "robe", "padded", "ragged", "banner", "heraldic", "gambeson", "hood", "cape", "cloak", "linen", "turban", "veil", "wimple", "blouse", "peasant", "lady", "tabard"}},
+        {MAT_LEATHER, {"leather", "boot", "saddle", "hide", "fur", "nomad", "belt", "glove", "shoe", "pelt"}},
+        {MAT_SKIN, {"face", "body", "hand", "skin", "hair", "beard"}},
+        {MAT_WOOD, {"plank", "wood", "bark", "tree", "trunk", "bow", "barrel", "cart", "fence", "palisade", "timber"}},
+        {MAT_STONE, {"stone", "wall", "rock", "stucco", "ground", "terrain", "roof", "building", "village", "brick", "earth", "road", "sand", "snow", "grass", "castle", "town", "floor", "mud", "steppe", "desert", "plaster"}},
+        {MAT_HORSE, {"horse", "courser", "hunter", "steed"}},
+    };
+    if (name.find("warhorse") != std::string::npos) return MAT_UNKNOWN; // a horse in armour
+    int found = MAT_UNKNOWN, classes = 0;
+    for (auto &row : table) {
+        for (const char *w : row.words) {
+            if (w && name.find(w) != std::string::npos) {
+                found = row.cls;
+                classes++;
+                break;
+            }
+        }
+    }
+    return classes == 1 ? found : MAT_UNKNOWN;
+}
+
+// Reads the headers of the DDS files in one folder and keys their first few
+// mip levels by content (the game may leave out the largest, depending on its
+// texture detail setting).
+void scan_texture_folder(const std::string &dir)
+{
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    while (struct dirent *e = readdir(d)) {
+        std::string name = e->d_name;
+        if (name.size() < 5 || strcasecmp(name.c_str() + name.size() - 4, ".dds")) continue;
+        int cls = classify_texture_name(name.substr(0, name.size() - 4));
+        s_material_stats.files++;
+        FILE *f = fopen((dir + "/" + name).c_str(), "rb");
+        if (!f) continue;
+        uint8_t header[128];
+        uint32_t height, width, mips, fourcc;
+        if (fread(header, 1, sizeof header, f) == sizeof header && !memcmp(header, "DDS ", 4)) {
+            memcpy(&height, header + 12, 4);
+            memcpy(&width, header + 16, 4);
+            memcpy(&mips, header + 28, 4);
+            memcpy(&fourcc, header + 84, 4);
+            size_t block = !memcmp(&fourcc, "DXT1", 4) ? 8 : (!memcmp(&fourcc, "DXT3", 4) || !memcmp(&fourcc, "DXT5", 4)) ? 16 : 0;
+            long at = sizeof header;
+            for (uint32_t level = 0; block && level < std::min<uint32_t>(std::max<uint32_t>(mips, 1), 4) && width && height; level++) {
+                size_t size = (size_t)((width + 3) / 4) * ((height + 3) / 4) * block;
+                uint8_t head[1024];
+                size_t want = std::min(size, sizeof head);
+                if (fseek(f, at, SEEK_SET) || fread(head, 1, want, f) != want) break;
+                s_material_by_content[content_key(width, height, head, want)] = (uint8_t)cls; // unknown ones too, to tell them from strangers
+                // The game turns most textures upside down before handing them to
+                // OpenGL, whose rows run bottom to top: the rows of blocks in
+                // reverse order, and the four rows inside each block reversed too.
+                // What it then uploads starts with the file's last rows of blocks.
+                size_t row_bytes = (size_t)((width + 3) / 4) * block, rows = (size_t)((height + 3) / 4);
+                size_t rows_wanted = std::min(rows, (want + row_bytes - 1) / row_bytes);
+                std::vector<uint8_t> flipped;
+                bool ok = true;
+                for (size_t r = 0; r < rows_wanted && ok; r++) {
+                    std::vector<uint8_t> row(row_bytes);
+                    ok = !fseek(f, at + (long)((rows - 1 - r) * row_bytes), SEEK_SET) && fread(row.data(), 1, row_bytes, f) == row_bytes;
+                    for (size_t b = 0; ok && b + block <= row_bytes && flipped.size() + b < want + block; b += block) {
+                        uint8_t *q = row.data() + b;
+                        if (block == 16 && !memcmp(&fourcc, "DXT3", 4)) { // four rows of explicit alpha, two bytes each
+                            std::swap(q[0], q[6]), std::swap(q[1], q[7]), std::swap(q[2], q[4]), std::swap(q[3], q[5]);
+                        } else if (block == 16) { // DXT5: sixteen 3-bit alpha indices after the two alpha values
+                            uint64_t bits = 0;
+                            for (int i = 0; i < 6; i++) bits |= (uint64_t)q[2 + i] << (8 * i);
+                            uint64_t turned = ((bits & 0xFFF) << 36) | ((bits >> 12 & 0xFFF) << 24) | ((bits >> 24 & 0xFFF) << 12) | (bits >> 36 & 0xFFF);
+                            for (int i = 0; i < 6; i++) q[2 + i] = (uint8_t)(turned >> (8 * i));
+                        }
+                        uint8_t *colour = q + (block == 16 ? 8 : 0); // two colours, then four rows of indices, a byte each
+                        std::swap(colour[4], colour[7]), std::swap(colour[5], colour[6]);
+                    }
+                    if (ok) flipped.insert(flipped.end(), row.begin(), row.end());
+                }
+                if (ok && flipped.size() >= want) s_material_by_content[content_key(width, height, flipped.data(), want)] = (uint8_t)cls;
+                at += (long)size;
+                width = std::max<uint32_t>(width / 2, 1);
+                height = std::max<uint32_t>(height / 2, 1);
+            }
+            if (cls != MAT_UNKNOWN) s_material_stats.classed[cls]++;
+        }
+        fclose(f);
+    }
+    closedir(d);
+}
+
+void scan_game_textures()
+{
+    char path[4096];
+    uint32_t size = sizeof path;
+    if (_NSGetExecutablePath(path, &size)) return;
+    std::string root = path; // <game>/Mount and Blade.app/Contents/MacOS/Mount and Blade
+    for (int up = 0; up < 4; up++) {
+        size_t slash = root.rfind('/');
+        if (slash == std::string::npos) return;
+        root.resize(slash);
+    }
+    scan_texture_folder(root + "/Textures");
+    scan_texture_folder(root + "/TexturesHD");
+    std::string module;
+    if (const char *home = getenv("HOME")) {
+        if (FILE *f = fopen((std::string(home) + "/Library/Application Support/MBWarband/last_module_warband").c_str(), "r")) {
+            char name[512];
+            size_t n = fread(name, 1, sizeof name - 1, f);
+            fclose(f);
+            module.assign(name, n);
+            while (!module.empty() && (module.back() == '\n' || module.back() == '\r' || module.back() == ' ')) module.pop_back();
+        }
+    }
+    if (!module.empty()) scan_texture_folder(root + "/Modules/" + module + "/Textures");
+}
 // Motion blur from the camera's own movement (WBM_MOTION_BLUR=1): see apply_motion_blur.
 bool s_motion_blur;
 float s_motion_blur_strength = 1.0f; // WBM_MOTION_BLUR_STRENGTH: exposure time in units of 1/48 s
@@ -737,6 +911,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -799,6 +974,8 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
             else if (u.name == k_xl_dyn_near_uniform) p.dyn_near_offset = u.offset;
             else if (u.name == k_xl_dyn_bias_uniform) p.dyn_bias_offset = u.offset;
+            else if (u.name == k_xl_ambient_uniform) p.amb_offset[s] = u.offset;
+            else if (u.name == k_xl_material_uniform) p.material_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -853,7 +1030,7 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
         memcpy(s_sun_matrix, data, sizeof s_sun_matrix); // the same for every program in a scene
         s_sun_matrix_valid = true;
     }
-    if ((s_contact_shadows || s_light_shafts) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
+    if ((s_contact_shadows || s_light_shafts || s_sky_ambient) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
         // The UI and other passes set these too; only the values in use while the
         // scene buffer is bound describe the scene's sun.
         Target t;
@@ -2349,6 +2526,24 @@ bool prepare_draw()
         memcpy(p->uniform_data[1].data() + p->dyn_window_offset, s_dyn_window, 16);
         p->uniform_dirty[1] = true;
     }
+    for (int stage = 0; stage < 2; stage++) {
+        if (p->amb_offset[stage] >= 0 && memcmp(p->uniform_data[stage].data() + p->amb_offset[stage], s_amb, sizeof s_amb)) {
+            memcpy(p->uniform_data[stage].data() + p->amb_offset[stage], s_amb, sizeof s_amb);
+            p->uniform_dirty[stage] = true;
+        }
+    }
+    if (p->material_offset >= 0) {
+        int cls = MAT_UNKNOWN;
+        if (p->alpha_texture_location >= 0) { // the diffuse texture says what the surface is
+            UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
+            Texture *t = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+            if (t) cls = t->material;
+        }
+        if (memcmp(p->uniform_data[1].data() + p->material_offset, k_material_params[cls], 16)) {
+            memcpy(p->uniform_data[1].data() + p->material_offset, k_material_params[cls], 16);
+            p->uniform_dirty[1] = true;
+        }
+    }
     if (p->dyn_near_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_near_offset, s_dyn_near, 16)) {
         memcpy(p->uniform_data[1].data() + p->dyn_near_offset, s_dyn_near, 16);
         p->uniform_dirty[1] = true;
@@ -2554,8 +2749,59 @@ void capture_sky(MTLPrimitiveType primitive, NSUInteger count, MTLIndexType inde
     }
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
     [blit generateMipmapsForTexture:s_sky_atlas];
+    if (s_sky_ambient) { // the smallest level with a texel per face: each is that face's mean colour
+        NSUInteger level = 0;
+        while ((N >> level) > 1) level++;
+        id<MTLBuffer> means = [s_device newBufferWithLength:6 * 8 options:MTLResourceStorageModeShared];
+        [blit copyFromTexture:s_sky_atlas sourceSlice:0 sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(6, 1, 1)
+                     toBuffer:means destinationOffset:0 destinationBytesPerRow:6 * 8 destinationBytesPerImage:6 * 8];
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+            const uint16_t *half = (const uint16_t *)means.contents;
+            auto to_float = [](uint16_t h) {
+                int e = (h >> 10) & 31, m = h & 1023;
+                float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? 65504.0f : ldexpf((float)(m + 1024), e - 25);
+                return (h & 0x8000) ? -v : v;
+            };
+            std::lock_guard<std::mutex> lock(s_amb_mu);
+            for (int face = 0; face < 6; face++)
+                for (int c = 0; c < 3; c++) s_amb_faces[face][c] = to_float(half[face * 4 + c]);
+            s_amb_faces_valid = true;
+        }];
+    }
     [blit endEncoding];
     [cmd commit];
+}
+
+// Works out the shaders' wbm_amb for this frame. Called at present.
+void update_sky_ambient()
+{
+    float amb[24] = {};
+    float faces[6][3];
+    bool valid;
+    {
+        std::lock_guard<std::mutex> lock(s_amb_mu);
+        memcpy(faces, s_amb_faces, sizeof faces);
+        valid = s_amb_faces_valid;
+    }
+    // Only while a sky is being drawn: indoors, and in menus, there is none.
+    if (valid && s_sky_frame + 2 >= s_frame_serial) {
+        float linear[5][3], mean[3] = {};
+        for (int face = 0; face < 5; face++) // the sixth looks down, at the dome's mirrored underside
+            for (int c = 0; c < 3; c++) mean[c] += (linear[face][c] = powf(std::max(faces[face][c], 0.0f), 2.2f)) / 5;
+        float brightness = 0.2126f * mean[0] + 0.7152f * mean[1] + 0.0722f * mean[2];
+        if (brightness > 1e-5f) {
+            for (int face = 0; face < 5; face++)
+                for (int c = 0; c < 3; c++) amb[face * 4 + c] = std::min(2.5f, std::max(0.4f, linear[face][c] / brightness));
+            amb[23] = s_sky_ambient_strength;
+            // vSunDir is the way the light travels; what reaches the ground is its
+            // downward part. A fifth of that comes back up, a little warm.
+            float down = s_sun_valid ? std::max(0.0f, -s_sun_dir[2]) : 0.0f;
+            const float ground[3] = {0.22f, 0.19f, 0.14f};
+            for (int c = 0; c < 3; c++) amb[20 + c] = std::max(0.0f, s_sun_color[c]) * down * ground[c] * s_bounce_strength;
+            s_amb_stats_frames++;
+        }
+    }
+    memcpy(s_amb, amb, sizeof s_amb);
 }
 
 bool primitive_type(GLenum mode, MTLPrimitiveType *type)
@@ -2654,6 +2900,13 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_DYN_RANGE")) s_dyn_range = std::max(5.0f, (float)atof(v));
     if (const char *v = getenv("WBM_DYN_BIAS")) s_dyn_bias_m = (float)atof(v);
     if (const char *v = getenv("WBM_DYN_NEAR")) s_dyn_near_range = std::max(0.0f, (float)atof(v));
+    const char *amb_env = getenv("WBM_SKY_AMBIENT");
+    s_sky_ambient = s_shader_options.sky_ambient = amb_env && atoi(amb_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_SKY_AMBIENT_STRENGTH")) s_sky_ambient_strength = std::min(1.0f, std::max(0.0f, (float)atof(v)));
+    if (const char *v = getenv("WBM_BOUNCE")) s_bounce_strength = std::max(0.0f, (float)atof(v));
+    const char *mat_env = getenv("WBM_MATERIALS");
+    s_materials = s_shader_options.materials = mat_env && atoi(mat_env) != 0 && s_shader_options.pbr_environment; // off unless set; needs WBM_PBR=2 or 3
+    if (s_materials) scan_game_textures();
     const char *blur_env = getenv("WBM_MOTION_BLUR");
     s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
     if (const char *v = getenv("WBM_MOTION_BLUR_STRENGTH")) s_motion_blur_strength = std::max(0.0f, (float)atof(v));
@@ -2711,11 +2964,11 @@ void mtl_attach_window(void *nswindow, int width, int height)
     else dispatch_sync(dispatch_get_main_queue(), attach);
     wb_note("metal: game renders at %dx%d, drawable is %dx%d (scale %d); soft shadows %s; %dx multisampling; "
             "reversed depth %s; sRGB textures %s; state cache %s; microfacet specular %s; ambient occlusion %s; "
-            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; filmic tone map %s; extended-range output %s",
+            "contact shadows %s; light shafts %s; per-frame shadow map %s; motion blur %s; sky ambient %s; material classes %s; filmic tone map %s; extended-range output %s",
             width, height, width * s_scale, height * s_scale, s_scale, s_shader_options.pcss_shadows ? "PCSS" : s_shader_options.soft_shadows ? "on" : "off", s_msaa,
             s_reverse_depth ? "on" : "off", s_shader_options.srgb_textures ? "on" : "off", s_state_cache ? "on" : "off",
             s_shader_options.pbr_sky ? "on, with metalness and sky reflection" : s_shader_options.pbr_environment ? "on, with metalness and environment" : s_shader_options.pbr_specular ? "on" : "off",
-            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off",
+            s_ao ? "on" : "off", s_contact_shadows ? "on" : "off", s_light_shafts ? "on" : "off", s_dyn_shadows ? "on" : "off", s_motion_blur ? "on" : "off", s_sky_ambient ? "on" : "off", s_materials ? "on" : "off",
             s_shader_options.filmic_tonemap ? "on" : "off",
             s_hdr ? "on" : "off");
 }
@@ -2736,6 +2989,17 @@ void mtl_dump_stats(FILE *f)
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
+    if (s_sky_ambient) {
+        fprintf(f, "\n== sky ambient ==\napplied in %llu frames; tint now towards +X %.2f %.2f %.2f, -X %.2f %.2f %.2f, up %.2f %.2f %.2f; bounce %.3f %.3f %.3f\n",
+                (unsigned long long)s_amb_stats_frames, s_amb[0], s_amb[1], s_amb[2], s_amb[4], s_amb[5], s_amb[6], s_amb[16], s_amb[17], s_amb[18],
+                s_amb[20], s_amb[21], s_amb[22]);
+    }
+    if (s_materials) {
+        fprintf(f, "\n== material classes ==\n%d texture files seen, classed by name:", s_material_stats.files);
+        for (int c = 1; c < MAT_COUNT; c++) fprintf(f, " %s %d,", k_material_names[c], s_material_stats.classed[c]);
+        fprintf(f, "\n%d compressed textures loaded by the game: %d matched a file, %d of those have a class\n", s_material_stats.uploads.load(),
+                s_material_stats.matched.load(), s_material_stats.recognised.load());
+    }
     if (s_dyn_stats.frames)
         fprintf(f, "\n== per-frame shadow map ==\ndrawn in %llu frames, %.0f casters per frame on average, %.0f more left out as scenery, %.0f added from the main pass\n"
                    "%llu draws left out as overlays, %zu overlay meshes known at exit\n",
@@ -2820,6 +3084,7 @@ void mtl_present(bool capture, uint32_t frame)
             s_casters.clear();
             s_caster_bones.clear();
         }
+        if (s_sky_ambient) update_sky_ambient();
         if (s_dyn_shadows) {
             s_late_ready.swap(s_late_casters);
             s_late_casters.clear();
@@ -3025,6 +3290,19 @@ void mtl_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalforma
     }
     @autoreleasepool {
         if (!ensure_storage(*t, f, level, width, height) || !data) return;
+        if (s_materials && level == 0) {
+            auto it = s_material_by_content.find(content_key((uint32_t)width, (uint32_t)height, data, (size_t)imageSize));
+            t->material = it == s_material_by_content.end() ? (uint8_t)MAT_UNKNOWN : it->second;
+            s_material_stats.uploads++;
+            if (it != s_material_by_content.end()) s_material_stats.matched++;
+            else if (s_material_stats.strangers++ < 60 && imageSize >= 32) {
+                const uint8_t *b = (const uint8_t *)data, *e = b + imageSize - 16;
+                char first[40], last[40];
+                for (int i = 0; i < 16; i++) snprintf(first + i * 2, 3, "%02x", b[i]), snprintf(last + i * 2, 3, "%02x", e[i]);
+                wb_note("material classes: no file matches a %dx%d %s texture of %d bytes, first %s last %s", width, height, E(internalformat), imageSize, first, last);
+            }
+            if (t->material) s_material_stats.recognised++;
+        }
         size_t blocks_w = ((size_t)width + 3) / 4, blocks_h = ((size_t)height + 3) / 4;
         if ((size_t)imageSize < blocks_w * blocks_h * f.block_bytes) {
             complain("compressed texture level is shorter than its size requires");
@@ -3312,7 +3590,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);
         if (s_dyn_shadows && s_pass_scene && !s_depth_test) record_overlay((NSUInteger)count, offset);
         // The engine draws the sky first, with the depth test off. That draw is the one to capture.
-        if (s_shader_options.pbr_sky && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
+        if ((s_shader_options.pbr_sky || s_sky_ambient) && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
             capture_sky(primitive, (NSUInteger)count, index_type, b->mtl, offset);
     }
 }
