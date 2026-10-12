@@ -2098,11 +2098,32 @@ void render_dynamic_shadows(Program &p)
     s_dyn_near[2] = s_dyn_near[3] = 0;
     if (!s_sun_matrix_valid) return;
 
-    double wvp[16], world[16], inv[16], view_proj[16], inv_view_proj[16], sun[16];
+    double wvp[16], world[16], inv[16], view_proj[16], sun[16];
     if (!vertex_matrix(p, "matWorldViewProj", wvp) || !vertex_matrix(p, "matWorld", world) || !mat_inverse(world, inv)) return;
     mat_mul(wvp, inv, view_proj);
-    if (!mat_inverse(view_proj, inv_view_proj)) return;
     for (int i = 0; i < 16; i++) sun[i] = s_sun_matrix[i];
+
+    // Inverting the view-projection itself to get from a draw's clip space back
+    // to the world loses the position along the view axis to rounding: a
+    // centimetre or two at a hundred metres, different every frame the camera
+    // moves, which made distant shadows shimmer. The parts of a projected
+    // position that do not go through the depth mapping are enough: x and y
+    // divided by the projection's scales, and w, are a rigid transform of the
+    // world position (`frame`), and that inverts without loss.
+    double p00 = sqrt(view_proj[0] * view_proj[0] + view_proj[4] * view_proj[4] + view_proj[8] * view_proj[8]);
+    double p11 = sqrt(view_proj[1] * view_proj[1] + view_proj[5] * view_proj[5] + view_proj[9] * view_proj[9]);
+    if (p00 < 1e-9 || p11 < 1e-9) return;
+    auto rigid = [&](const double *clip, double *out) { // rows (x / p00, y / p11, w, 0 0 0 1) of a clip-space matrix
+        for (int c = 0; c < 4; c++) {
+            out[c * 4 + 0] = clip[c * 4 + 0] / p00;
+            out[c * 4 + 1] = clip[c * 4 + 1] / p11;
+            out[c * 4 + 2] = clip[c * 4 + 3];
+            out[c * 4 + 3] = c == 3 ? 1.0 : 0.0;
+        }
+    };
+    double frame[16], inv_frame[16];
+    rigid(view_proj, frame);
+    if (!mat_inverse(frame, inv_frame)) return;
 
     if (!s_caster_library) {
         NSError *error = nil;
@@ -2135,16 +2156,9 @@ void render_dynamic_shadows(Program &p)
         s_dyn_sampler = [s_device newSamplerStateWithDescriptor:sd];
     }
 
-    // Where the camera is and which way it faces, from the two ends of the view axis.
-    auto unproject = [&](double z, double out[3]) {
-        const double *m = inv_view_proj;
-        double w = m[11] * z + m[15];
-        for (int r = 0; r < 3; r++) out[r] = (m[8 + r] * z + m[12 + r]) / w;
-    };
-    double eye[3], ahead[3];
-    unproject(-1.0, eye);
-    unproject(0.5, ahead);
-    double fx = ahead[0] - eye[0], fy = ahead[1] - eye[1], flat = sqrt(fx * fx + fy * fy); // Z is up
+    // Where the camera is, and which way it faces: the direction in which w grows.
+    double eye[3] = {inv_frame[12], inv_frame[13], inv_frame[14]};
+    double fx = view_proj[3], fy = view_proj[7], flat = sqrt(fx * fx + fy * fy); // Z is up
     double reach = s_dyn_range * 0.6;
     double focus[3] = {eye[0] + (flat > 1e-6 ? fx / flat * reach : 0), eye[1] + (flat > 1e-6 ? fy / flat * reach : 0), eye[2]};
 
@@ -2175,8 +2189,8 @@ void render_dynamic_shadows(Program &p)
     float window[8] = {(float)cu, (float)cv, (float)(1 / half_u), (float)(1 / half_v), 0, 0, 0, 0};
     if (fine) window[4] = (float)nu, window[5] = (float)nv, window[6] = (float)(1 / near_u), window[7] = (float)(1 / near_v);
 
-    double to_shadow[16]; // from the camera's clip space to shadow space
-    mat_mul(sun, inv_view_proj, to_shadow);
+    double to_shadow[16]; // from `frame` to shadow space
+    mat_mul(sun, inv_frame, to_shadow);
 
     // All the casters' uniforms go into one buffer.
     const size_t static_size = 256, skinned_size = 2304; // 112 and 2160 bytes, rounded up to the offset alignment
@@ -2220,9 +2234,10 @@ void render_dynamic_shadows(Program &p)
             at += size;
             continue;
         }
-        double m[16], object[16];
+        double m[16], object[16], placed[16];
         for (int i = 0; i < 16; i++) object[i] = c.wvp[i];
-        mat_mul(c.world ? sun : to_shadow, object, m);
+        if (!c.world) rigid(object, placed);
+        mat_mul(c.world ? sun : to_shadow, c.world ? object : placed, m);
         float m32[16];
         for (int i = 0; i < 16; i++) m32[i] = (float)m[i];
         memcpy(base + at, m32, 64);
