@@ -12,7 +12,9 @@
 //   texture_tool hair <picture> <name> <out-folder> [tack-picture]
 //       writes <name>_hair.png for the game's texture <name> from a picture of
 //       that texture with everything but the long hair (mane, tail, forelock)
-//       blacked out, or simply white where that hair is and black elsewhere:
+//       blacked out, or simply white where that hair is and black elsewhere
+//       (such a mask is taken exactly; in a picture, parts of the marked area
+//       that have the coat's colour are left out):
 //       red and green give the way the hair is combed, worked out from the run
 //       of the strands in the game's texture and its normal map; blue says what grows there (255 long hair, about 128 coat, 0 none).
 //       In place of the picture, "boxes:x0,y0,x1,y1/..." names rectangles of
@@ -382,8 +384,13 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     // A picture made for one horse is used for others of the same layout, whose
     // manes do not end in quite the same places; and a hand may slip. So within
     // the marked area, what has the colour of the coat next to it rather than
-    // of the hair is left out.
-    {
+    // of the hair is left out. Not so for a plain mask, white on black with
+    // nothing in between: that was made or corrected on purpose and is taken as it is.
+    int extremes = 0, all = 0;
+    for (int v = 0; v < 256; v++) all += histogram[v], extremes += v < 13 || v > 242 ? histogram[v] : 0;
+    bool plain_mask = boxes.empty() && extremes > all * 0.97;
+    if (plain_mask) printf("  the picture is a plain mask and is taken as it is\n");
+    else {
         std::vector<float> around = mask;
         blur(around, w, h, std::max(3, w / 40));
         std::vector<uint8_t> hair_c[3], coat_c[3];
