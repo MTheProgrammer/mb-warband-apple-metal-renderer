@@ -659,8 +659,50 @@ bool add_shell_push(std::string &vs)
     const std::string normal = "normalize(mat3(matWorldArray[$2]) * inNormal * inBlendWeight.x + mat3(matWorldArray[$4]) * inNormal * inBlendWeight.y + "
                                "mat3(matWorldArray[$5]) * inNormal * inBlendWeight.z + mat3(matWorldArray[$6]) * inNormal * inBlendWeight.w)";
     const std::string down = placed ? "normalize(vec3(0.0, 0.0, -1.0) * mat3(matWorld))" : "vec3(0.0)";
+    // Strands (wbm_shell.x below 0): the backend draws ribbons whose vertices all
+    // sit at a root on the skin and say in their colour which point of which
+    // strand they are (see build_strands in the backend). The strand is laid
+    // out here: it leaves the skin the way the hair map has it combed, bends
+    // over to hang, and is widened across the line of sight.
+    //   colour x: segment * 2 + side; y: a chance number, plus 128 for the tail;
+    //   z, w: the hair map's red and green at the root.
+    // wbm_shell.x: -(the mane's length), y: the tail's, metres.
+    std::string strand;
+    if (placed && vs.find("attribute vec4 inColor0;") != std::string::npos && vs.find("attribute vec3 inTangent;") != std::string::npos) {
+        vs = std::regex_replace(vs, std::regex(R"(\binColor0\b(?!;))"), "wbm_colour");
+        size_t body = vs.find("void main ()");
+        if (body != std::string::npos) body = vs.find('{', body);
+        if (body == std::string::npos) return false;
+        vs.insert(body + 1, "\n  wbm_colour = wbm_shell.x < 0.0 ? vec4(1.0) : inColor0;\n  wbm_strand_v = vec4(0.0);");
+        vs.insert(0, "varying vec4 wbm_strand_v;\n");
+        const std::string handed = vs.find("attribute vec3 inBinormal;") != std::string::npos ? "(dot(cross(inNormal, inTangent), inBinormal) < 0.0 ? -1.0 : 1.0)" : "1.0";
+        const std::string eye = vs.find("uniform vec4 vCameraPos;") != std::string::npos ? "((vCameraPos.xyz - matWorld[3].xyz) * mat3(matWorld) - $1.xyz)" : "wbm_n";
+        strand = "\n  if (wbm_shell.x < 0.0) {\n"
+                 "    float wbm_v = floor(inColor0.x * 255.0 + 0.5), wbm_r = floor(inColor0.y * 255.0 + 0.5);\n"
+                 "    float wbm_side = mod(wbm_v, 2.0) * 2.0 - 1.0, wbm_t = floor(wbm_v / 2.0) / 8.0;\n"
+                 "    float wbm_tail = step(128.0, wbm_r), wbm_chance = (wbm_r - 128.0 * wbm_tail) / 127.0;\n"
+                 "    vec2 wbm_d = inColor0.zw * 2.0 - 1.0;\n"
+                 "    mat3 wbm_m = mat3(matWorldArray[$2]) * inBlendWeight.x + mat3(matWorldArray[$4]) * inBlendWeight.y + mat3(matWorldArray[$5]) * inBlendWeight.z + mat3(matWorldArray[$6]) * inBlendWeight.w;\n"
+                 "    vec3 wbm_n = normalize(wbm_m * inNormal), wbm_along = wbm_m * inTangent;\n"
+                 "    vec3 wbm_down = " + down + ";\n"
+                 "    vec3 wbm_c = wbm_along * wbm_d.x - cross(wbm_n, wbm_along) * " + handed + " * wbm_d.y;\n"
+                 "    wbm_c = dot(wbm_c, wbm_c) > 0.0004 ? normalize(wbm_c) : wbm_down;\n"
+                 "    vec3 wbm_out = wbm_tail > 0.5 ? normalize(wbm_down + wbm_n * 0.3 + wbm_c * 0.2) : normalize(wbm_c + wbm_n * 0.2);\n"
+                 "    float wbm_len = (wbm_tail > 0.5 ? wbm_shell.y : -wbm_shell.x) * (0.55 + 0.45 * wbm_chance);\n"
+                 "    float wbm_k = wbm_tail > 0.5 ? 0.95 : 0.6;\n"
+                 "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
+                 "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
+                 "    vec3 wbm_eye = " + eye + ";\n"
+                 "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
+                 "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
+                 "    float wbm_w = min(0.005, wbm_len * 0.03) * (0.6 + 0.8 * fract(wbm_chance * 7.3)) * (1.0 - 0.6 * wbm_t);\n" // half the width of a lock, metres
+                 "    float wbm_used = max(wbm_w, 0.0012 * length(wbm_eye));\n" // not much under a pixel wide: the rest is made up in how much it covers
+                 "    $1.xyz += wbm_across * (wbm_side * wbm_used);\n"
+                 "    wbm_strand_v = vec4(wbm_side, wbm_t, wbm_chance, wbm_w / wbm_used);\n"
+                 "  }";
+    }
     vs = std::regex_replace(vs, skinned,
-                            "$&\n  if (wbm_shell.x > 0.0) {\n    vec3 wbm_n = " + normal + ";\n    if (wbm_shell.z < 0.0) $1.xyz += wbm_shell.x * (wbm_n * (1.0 - 0.55 * wbm_shell.y) + " + down +
+                            "$&" + strand + "\n  if (wbm_shell.x > 0.0) {\n    vec3 wbm_n = " + normal + ";\n    if (wbm_shell.z < 0.0) $1.xyz += wbm_shell.x * (wbm_n * (1.0 - 0.55 * wbm_shell.y) + " + down +
                                 " * (2.2 * wbm_shell.y));\n    else $1.xyz += wbm_shell.x * wbm_n;\n  }",
                             std::regex_constants::format_first_only);
     return true;
@@ -703,6 +745,17 @@ uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size t
 // as a share of the longest hair, 0 for the surface itself; z: hairs per unit
 // of texture coordinate; w: 1 on the surface when layers will follow.
 uniform vec4 wbm_shell;
+// A strand drawn as a ribbon (wbm_shell.x below 0, see add_shell_push) says
+// where on it this is: x -1 to 1 across, y 0 at the root to 1 at the tip, z a
+// chance number of its own, w how much of its drawn width is really hair. It
+// stands for a layer of long hair as far along as it has got.
+vec4 wbm_strand = vec4(0.0);
+// Strands are drawn twice: first what is solid, which leaves depth; then the
+// soft edges and thin tips, blended, which leave none and so hide nothing behind them.
+float wbm_strand_soft = 0.0; // 1 in the second
+vec4 wbm_shell_given() { return wbm_shell; }
+vec4 wbm_layer;
+#define wbm_shell wbm_layer
 
 // What grows at a place: x how much it is coat or hair at all, y how much of that is long hair.
 vec2 wbm_grows(vec2 uv)
@@ -745,6 +798,8 @@ vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_s
         float towards = pow(clamp(dot(v, -normalize(l + vec3(0.0, 0.0, 0.35))), 0.0, 1.0), 2.0);
         back = towards * smoothstep(0.25, -0.15, l.z) * wbm_fur.z * exp(-(depth * wbm_fur.y + 0.004) * vec3(70.0, 190.0, 300.0));
     }
+    if (wbm_shell.x < 0.0) back = vec3(0.0); // a strand hangs clear of the body: what the map knows of thickness there is not its own
+
     // Long hair, after Marschner: a strand sends light back three ways. Off
     // its surface, white, in a narrow band shifted towards the root. From
     // inside, having passed through the hair twice, in its colour, in a wider
@@ -817,7 +872,7 @@ float wbm_noise(vec2 p)
 // Where on the texture the hair passing over uv in this layer is rooted.
 vec2 wbm_shell_root(vec2 uv, vec3 down)
 {
-    if (wbm_shell.y <= 0.0) return uv;
+    if (wbm_shell.y <= 0.0 || wbm_shell.x < 0.0) return uv;
     // Lengths are in metres; how much of the texture a metre covers differs from one horse to the next.
     float per_metre = max(abs(wbm_fur.w), 0.02), share = wbm_shell.y;
     vec2 lean;
@@ -836,6 +891,17 @@ vec2 wbm_shell_root(vec2 uv, vec3 down)
 // cover part of it and are blended in; cut out whole or not at all they dither.
 float wbm_shell_cover(vec2 uv, vec3 down)
 {
+    if (wbm_shell.x < 0.0) { // a strand: its edges are soft, and it thins out to nothing at the tip
+        float pixel = max(fwidth(wbm_strand.x), 1e-4);
+        // A ribbon is a lock: some hairs side by side with gaps between, more gaps towards the tip.
+        float hairs = wbm_strand.x * 3.5 + wbm_strand.z * 31.0;
+        float gap = abs(fract(hairs) - 0.5) * 2.0; // 0 on a hair, 1 between two
+        float thin = mix(0.25, 0.9, wbm_strand.y) * (0.6 + 0.4 * fract(sin(floor(hairs) * 12.9898 + wbm_strand.z * 78.233) * 43758.5453));
+        float lock = mix(1.0, 1.0 - thin * smoothstep(0.35, 0.9, gap), clamp(0.6 / (pixel * 3.5), 0.0, 1.0)); // too fine to see, they even out
+        float cover = clamp((1.0 - abs(wbm_strand.x)) / pixel + 0.5, 0.0, 1.0) * wbm_strand.w * smoothstep(1.0, 0.8, wbm_strand.y) * lock;
+        if (wbm_strand_soft > 0.5) return cover < 0.7 ? cover : 0.0;
+        return cover < 0.7 ? 0.0 : 1.0;
+    }
     if (wbm_shell.y <= 0.0) return 1.0;
     bool long_ = wbm_shell.z < 0.0;
     float share = wbm_shell.y, density = abs(wbm_shell.z) / max(abs(wbm_fur.w), 0.02) * (long_ ? 0.17 : 1.0); // long hair is coarser than the coat
@@ -973,9 +1039,10 @@ bool add_fur(std::string &fs)
     }
     fs = std::regex_replace(fs, encode, "$1.xyz *= wbm_shell_shade(Tex0);\n  $&", std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, encode, "$1.xyz += wbm_hair_shine * vSunColor.xyz * (" + lit + " * wbm_shell_shade(Tex0));\n  $&", std::regex_constants::format_first_only);
+    fs.insert(0, "varying vec4 wbm_strand_v;\n");
     size_t body = fs.find("void main ()");
     if (body != std::string::npos) body = fs.find('{', body);
-    if (body != std::string::npos) fs.insert(body + 1, "\n  wbm_hair_cover = wbm_shell_cover(Tex0, " + down + ");\n  if (wbm_hair_cover < 0.02) discard;");
+    if (body != std::string::npos) fs.insert(body + 1, "\n  wbm_strand = wbm_strand_v;\n  wbm_layer = wbm_shell_given();\n  if (wbm_layer.x < 0.0) wbm_strand_soft = step(0.0, wbm_layer.z), wbm_layer = vec4(-1.0, max(wbm_strand.y, 0.02), -abs(wbm_layer.z), wbm_layer.w);\n  wbm_hair_cover = wbm_shell_cover(Tex0, " + down + ");\n  if (wbm_hair_cover < 0.02) discard;");
     // A layer is blended in by how much of the pixel its hair covers (the renderer turns blending on for layers).
     fs = std::regex_replace(fs, std::regex(R"(gl_FragColor = (\w+);)"), "$1.w = wbm_shell.y > 0.0 ? wbm_hair_cover : $1.w;\n  $&");
     // A hair has the colour of the place it grows from, not of what it hangs over.
@@ -1400,6 +1467,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
     if (shell_push) out << "uniform vec4 wbm_shell;\n";
+    if (shell_push && glsl.find("wbm_colour = ") != std::string::npos) out << "vec4 wbm_colour;\n";
     if (skin && vertex) out << k_skin_vertex_function;
     if (skin && !vertex) { // with the materials debug view, skin that scatters is painted red
         std::string f = k_skin_function;

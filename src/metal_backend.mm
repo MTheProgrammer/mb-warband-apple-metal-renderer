@@ -420,6 +420,11 @@ double s_wind_time;        // the same for every draw of a frame
 // Shells of fur (WBM_FUR_SHELLS): how many layers a coat near the camera is drawn in, 0 for none.
 int s_fur_shells;
 float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its texture a metre of its surface covers
+// WBM_HAIR_STRANDS: mane and tail as strands of their own, in place of layers
+// (see build_strands). WBM_TAIL_LENGTH: how long the tail's are, metres; the
+// mane's are WBM_HAIR_LENGTH. WBM_HAIR_STRANDS_DENSITY: strands to the square metre.
+bool s_hair_strands;
+float s_tail_length = 0.25f, s_strand_density = 30000.0f;
 float s_hair_length = 0.07f; // WBM_HAIR_LENGTH: how far mane and tail stand off the body, metres; 0 for no layers of their own
 float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 1400.0f; // WBM_FUR_LENGTH, metres; WBM_FUR_RANGE, metres; hairs per metre
 float s_shell_now[4];  // the shaders' wbm_shell for the draw being prepared
@@ -2657,6 +2662,124 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
     (late ? s_late_casters : s_casters).push_back(c);
 }
 
+// Strands. Where a coat's hair map marks long hair, roots are scattered over
+// the mesh's triangles, as many as their area asks for, and for each root a
+// ribbon of k_strand_segments segments is made whose vertices are all copies of
+// the mesh's vertex nearest the root, moved to the root. So the ribbon is
+// drawn with the horse's own program, bones and lighting; what tells its
+// vertices apart is their colour, from which the vertex shader lays the strand
+// out (see add_shell_push in shader_xlate.cpp). The model itself is untouched.
+const int k_strand_segments = 8; // the vertex shader divides by this
+
+struct StrandMesh {
+    GLuint buffer = 0; // in s_buffers, laid out like the mesh's own vertices
+    id<MTLBuffer> indices;
+    NSUInteger count = 0;
+};
+std::unordered_map<uint64_t, StrandMesh> s_strand_meshes;
+GLuint s_strand_names = 0x7f000000; // buffer names of the shim's own, out of the game's way
+
+// vertices, elements: the mesh as the game gave it. Attributes 0 (position),
+// 2 (colour), 4 (texture coordinate), 7 and 8 (bone weights and numbers) must share the buffer.
+const StrandMesh &build_strands(uint64_t key, const uint8_t *vertices, size_t vertex_bytes, const uint8_t *elements, size_t count, size_t width, id<MTLTexture> map)
+{
+    StrandMesh &mesh = s_strand_meshes[key];
+    if (mesh.buffer) return mesh;
+    mesh.buffer = s_strand_names++;
+    const Attrib &pa = s_attribs[0], &ca = s_attribs[2], &ta = s_attribs[4], &wa = s_attribs[7], &ba = s_attribs[8];
+    size_t stride = (size_t)pa.stride;
+    bool fits = stride > 0 && pa.type == GL_FLOAT && ta.type == GL_FLOAT && ca.type == GL_UNSIGNED_BYTE && ca.size == 4 && ta.buffer == pa.buffer && ca.buffer == pa.buffer &&
+                wa.buffer == pa.buffer && ba.buffer == pa.buffer && wa.enabled && ba.enabled && (size_t)ta.stride == stride && (size_t)ca.stride == stride &&
+                map.pixelFormat == MTLPixelFormatRGBA8Unorm;
+    if (!fits) return mesh;
+    size_t n = vertex_bytes / stride, mw = map.width, mh = map.height;
+    std::vector<uint8_t> px(mw * mh * 4);
+    [map getBytes:px.data() bytesPerRow:mw * 4 fromRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:0];
+    auto at = [&](float u, float v) {
+        size_t x = std::min(mw - 1, (size_t)((u - floorf(u)) * (float)mw)), y = std::min(mh - 1, (size_t)((v - floorf(v)) * (float)mh));
+        return &px[(y * mw + x) * 4];
+    };
+    auto component = [](const uint8_t *p, GLenum type, int k) {
+        float f;
+        if (type == GL_FLOAT) return memcpy(&f, p + k * 4, 4), f;
+        return (float)p[k];
+    };
+    uint32_t seed = (uint32_t)key | 1;
+    auto chance = [&] { // xorshift
+        seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5;
+        return (float)(seed & 0xffffff) / 16777216.0f;
+    };
+    std::vector<uint8_t> out;
+    std::vector<uint32_t> indices;
+    const size_t most = 12000; // strands to a mesh
+    size_t strands = 0;
+    float density = s_strand_density;
+    for (int pass = 0; pass < 2; pass++) { // first to see how much skin there is to cover, so that the allowance is spread evenly
+    double covered = 0;
+    for (size_t i = 0; i + 2 < count && strands < most; i += 3) {
+        uint32_t v[3];
+        for (int k = 0; k < 3; k++) v[k] = width == 2 ? *(const uint16_t *)(elements + (i + (size_t)k) * 2) : *(const uint32_t *)(elements + (i + (size_t)k) * 4);
+        if (v[0] >= n || v[1] >= n || v[2] >= n) continue;
+        float p[3][3], t[3][2];
+        for (int k = 0; k < 3; k++) memcpy(p[k], vertices + v[k] * stride + pa.offset, 12), memcpy(t[k], vertices + v[k] * stride + ta.offset, 8);
+        // Any long hair on it? Its corners and middle are asked.
+        bool any = at((t[0][0] + t[1][0] + t[2][0]) / 3, (t[0][1] + t[1][1] + t[2][1]) / 3)[2] > 204;
+        for (int k = 0; k < 3; k++) any = any || at(t[k][0], t[k][1])[2] > 204;
+        if (!any) continue;
+        float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]}, e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+        float cx = e1[1] * e2[2] - e1[2] * e2[1], cy = e1[2] * e2[0] - e1[0] * e2[2], cz = e1[0] * e2[1] - e1[1] * e2[0];
+        float wanted = 0.5f * sqrtf(cx * cx + cy * cy + cz * cz) * density;
+        covered += 0.5 * sqrt((double)cx * cx + (double)cy * cy + (double)cz * cz);
+        if (pass == 0) continue;
+        int roots = (int)wanted + (chance() < wanted - floorf(wanted) ? 1 : 0);
+        for (int r = 0; r < roots && strands < most; r++) {
+            float a = chance(), b = chance();
+            if (a + b > 1) a = 1 - a, b = 1 - b;
+            float w[3] = {1 - a - b, a, b};
+            float root[3], uv[2];
+            for (int k = 0; k < 3; k++) root[k] = w[0] * p[0][k] + w[1] * p[1][k] + w[2] * p[2][k];
+            for (int k = 0; k < 2; k++) uv[k] = w[0] * t[0][k] + w[1] * t[1][k] + w[2] * t[2][k];
+            const uint8_t *here = at(uv[0], uv[1]);
+            float luck = chance(), luck2 = chance(); // drawn whether or not the root is kept, so that a map's edit moves no other strand
+            (void)luck2;
+            if (here[2] <= 204) continue;
+            int nearest = w[1] > w[0] ? (w[2] > w[1] ? 2 : 1) : (w[2] > w[0] ? 2 : 0);
+            const uint8_t *from = vertices + v[nearest] * stride;
+            // The tail is what hangs on the last two bones of a horse's skeleton.
+            int bone = 0;
+            float heaviest = -1;
+            for (int k = 0; k < std::min<int>(wa.size, 4); k++) {
+                float weight = component(from + wa.offset, wa.type, k);
+                if (weight > heaviest) heaviest = weight, bone = (int)component(from + ba.offset, ba.type, k);
+            }
+            bool tail = bone >= 26;
+            uint32_t first = (uint32_t)(out.size() / stride);
+            for (int segment = 0; segment <= k_strand_segments; segment++) {
+                for (int side = 0; side < 2; side++) {
+                    size_t o = out.size();
+                    out.insert(out.end(), from, from + stride);
+                    memcpy(&out[o + pa.offset], root, 12), memcpy(&out[o + ta.offset], uv, 8);
+                    uint8_t *colour = &out[o + ca.offset];
+                    colour[0] = (uint8_t)(segment * 2 + side), colour[1] = (uint8_t)((int)(luck * 127.0f) + (tail ? 128 : 0)), colour[2] = here[0], colour[3] = here[1];
+                }
+                if (segment < k_strand_segments) {
+                    uint32_t q = first + (uint32_t)segment * 2;
+                    for (uint32_t k : {q, q + 1, q + 2, q + 1, q + 3, q + 2}) indices.push_back(k);
+                }
+            }
+            strands++;
+        }
+    }
+    if (pass == 0 && covered * density > (double)most * 0.9) density = (float)((double)most * 0.9 / covered);
+    }
+    if (indices.empty()) return mesh;
+    s_buffers[mesh.buffer].mtl = [s_device newBufferWithBytes:out.data() length:out.size() options:MTLResourceStorageModeShared];
+    mesh.indices = [s_device newBufferWithBytes:indices.data() length:indices.size() * 4 options:MTLResourceStorageModeShared];
+    mesh.count = indices.size();
+    if (getenv("WBM_DEBUG_STRANDS")) fprintf(stderr, "strands: %zu on a mesh of %zu triangles\n", strands, count / 3);
+    return mesh;
+}
+
 // Long hair casts shadows too. Its layers exist only as draws of the main
 // pass, so that is where they are taken from: a few of them per coat, to be
 // drawn into the next frame's map like the grass (see s_late_casters).
@@ -3541,6 +3664,9 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR")) s_fur_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_SHELLS")) s_fur_shells = std::min(24, std::max(0, atoi(v)));
     if (const char *v = getenv("WBM_HAIR_LENGTH")) s_hair_length = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_HAIR_STRANDS")) s_hair_strands = atoi(v) != 0;
+    if (const char *v = getenv("WBM_TAIL_LENGTH")) s_tail_length = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_HAIR_STRANDS_DENSITY")) s_strand_density = std::max(100.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_LENGTH")) s_fur_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_RANGE")) s_fur_range = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
@@ -4512,6 +4638,41 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             s_shell_draws++;
         }
         s_depth_mask = depth_mask; // mane and tail do leave depth: their layers hang far from the body and must hide one another
+        // Mane and tail as strands (see build_strands): one more draw of the same program, over ribbons.
+        if (long_hair && s_hair_strands && primitive == MTLPrimitiveTypeTriangle) {
+            Program *fp = find(s_programs, s_program);
+            UniformLocation &l = fp->locations[(size_t)fp->alpha_texture_location];
+            Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
+            Buffer *vb = s_attribs[0].enabled ? find(s_buffers, s_attribs[0].buffer) : nullptr;
+            const uint32_t needed = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8;
+            if (coat && coat->hair && vb && vb->mtl && (fp->input_mask & needed) == needed) {
+                const StrandMesh &strands = build_strands(mesh_id((NSUInteger)count, offset) ^ (uint64_t)(uintptr_t)(__bridge void *)coat->hair, (const uint8_t *)vb->mtl.contents,
+                                                          vb->mtl.length, (const uint8_t *)b->mtl.contents + offset, (size_t)count, type == GL_UNSIGNED_SHORT ? 2 : 4, coat->hair);
+                if (strands.count) {
+                    Attrib attribs[MAX_ATTRIBS];
+                    memcpy(attribs, s_attribs, sizeof attribs);
+                    bool cull = s_cull, was_blend = s_blend;
+                    GLenum src = s_blend_src, dst = s_blend_dst, eq = s_blend_eq;
+                    for (Attrib &a : s_attribs)
+                        if (a.enabled && a.buffer == attribs[0].buffer) a.buffer = strands.buffer;
+                    // What is solid first, leaving depth; then the soft edges, blended, leaving none (the sign of z tells the shader which).
+                    bool depth_mask = s_depth_mask;
+                    s_cull = false;
+                    for (int soft = 0; soft < 2; soft++) {
+                        if (soft) s_blend = true, s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD, s_depth_mask = false;
+                        const float now[4] = {-std::max(s_hair_length, 0.001f), s_tail_length, soft ? s_fur_density : -s_fur_density, clock};
+                        memcpy(s_shell_now, now, sizeof now);
+                        if (prepare_draw())
+                            [s_pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:strands.count indexType:MTLIndexTypeUInt32 indexBuffer:strands.indices indexBufferOffset:0];
+                        s_shell_draws++;
+                    }
+                    memcpy(s_attribs, attribs, sizeof attribs);
+                    s_depth_mask = depth_mask;
+                    s_cull = cull, s_blend = was_blend, s_blend_src = src, s_blend_dst = dst, s_blend_eq = eq;
+                    long_hair = false; // no layers as well
+                }
+            }
+        }
         // Mane and tail: layers of their own, reaching much farther out (see wbm_shell_bare).
         for (int layer = 1; long_hair && layer <= shells * 2; layer++) {
             float share = (float)layer / (float)(shells * 2);
