@@ -691,15 +691,24 @@ vec2 wbm_eye_uv(vec2 uv)
     return uv - wbm_gaze.xy * hold;
 }
 
-vec3 wbm_eye(vec2 uv, vec3 view, vec3 to_sun, float shadow, vec3 sun, vec3 sky)
+// painted: the face texture's colour here. The shine belongs to the ball, not
+// to the lids and the skin about it, which share the eye's place in the
+// texture and, on a face with heavy brows, most of what is seen of it. The
+// ball is told from skin by its paint: the white is grey, the pupil and the
+// lashes dark, and skin is neither.
+vec3 wbm_eye(vec2 uv, vec3 view, vec3 to_sun, float shadow, vec3 sun, vec3 sky, vec3 painted)
 {
     vec2 d = wbm_eye_place(uv);
-    float inside = 1.0 - smoothstep(0.55, 1.0, dot(d, d));
+    float inside = 1.0 - smoothstep(0.45, 0.9, dot(d, d));
     if (inside <= 0.0) return vec3(0.0);
+    float most = max(max(painted.r, painted.g), painted.b), least = min(min(painted.r, painted.g), painted.b);
+    float grey = 1.0 - smoothstep(0.2, 0.34, (most - least) / max(most, 0.05));
+    float dark = 1.0 - smoothstep(0.22, 0.36, most);
+    inside *= max(grey, dark);
     vec3 n = normalize(vec3(d * vec2(0.8, 0.45), 1.0)); // the ball bulges out of the flat it is painted on
     vec3 v = normalize(view), h = normalize(v + normalize(to_sun));
     float glint = pow(max(dot(n, h), 0.0), 220.0) * 2.5 * shadow;
-    float grazing = 0.03 + 0.97 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+    float grazing = min(0.03 + 0.97 * pow(1.0 - max(dot(n, v), 0.0), 5.0), 0.2); // seen edge-on, an eye is behind its lids
     return inside * (glint * sun + grazing * sky * 0.8);
     // (The highlight stays put while the iris moves under it, as it does on a real eye.)
 }
@@ -719,7 +728,7 @@ bool add_eye_glint(std::string &fs)
     std::string lit = std::regex_search(fs, m, shadow) ? std::string(m[1]) : "1.0";
     // The base colour (both layers: young and aged) is read through the moving eye.
     fs = std::regex_replace(fs, std::regex(R"(texture2D \((diffuse_texture(_2)?), Tex0\))"), "texture2D ($1, wbm_eye_uv(Tex0))");
-    fs = std::regex_replace(fs, encode, "$1.xyz += wbm_eye(Tex0, ViewDir, SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz + vSkyLightColor.xyz);\n  $&",
+    fs = std::regex_replace(fs, encode, "$1.xyz += wbm_eye(Tex0, ViewDir, SunLightDir, " + lit + ", vSunColor.xyz, vAmbientColor.xyz + vSkyLightColor.xyz, texture2D(diffuse_texture, wbm_eye_uv(Tex0)).xyz);\n  $&",
                             std::regex_constants::format_first_only);
     return true;
 }
