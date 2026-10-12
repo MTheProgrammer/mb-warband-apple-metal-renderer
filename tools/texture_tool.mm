@@ -467,7 +467,8 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     }
     // And a little of "hanging down the picture", which decides where a strip of hair is too thin to have an inside.
     float hang = inner_area > 0 ? (float)(0.08 * inner_strength / inner_area) : 1.0f;
-    for (size_t i = 0; i < count; i++) lxx[i] += hang * mask[i];
+    // (Much more of it where there is no inside to read at all, as in a forelock.)
+    for (size_t i = 0; i < count; i++) lxx[i] += hang * mask[i] * (1.0f + 30.0f * (1.0f - smoothstep(0.8f, 0.97f, inner[i])));
     for (size_t i = 0; i < count; i++) xx[i] *= grows[i], xy[i] *= grows[i], yy[i] *= grows[i];
     int radius = std::max(2, w / 110);
     // The coat's strokes are short and point every way, so there the reading
@@ -538,6 +539,11 @@ static int hair_map(const std::string &picture, std::string name, const std::str
         if (sum_y < -0.05 * (double)(queue.size() - first) || (fabs(sum_y) <= 0.05 * (double)(queue.size() - first) && sum_x < 0))
             for (size_t at = first; at < queue.size(); at++) dx[queue[at]] = -dx[queue[at]], dy[queue[at]] = -dy[queue[at]];
     }
+    // Whatever the patch as a whole does, no hair points up the picture: where a
+    // mane curls round to the forehead, keeping one sense all the way along it
+    // would end with the forelock standing on end.
+    for (size_t i = 0; i < count && !getenv("WBM_HAIR_DIR"); i++)
+        if (dy[i] < -0.2f) dx[i] = -dx[i], dy[i] = -dy[i];
     Image map;
     map.w = w, map.h = h;
     map.px.assign(count * 4, 255);
