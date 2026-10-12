@@ -740,6 +740,10 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
     static const std::regex alpha_mask(R"(spec_coef\) \* \w+\) \* (\w+)\.w\))");
     auto has = [&](const char *text) { return fs.find(text) != std::string::npos; };
 
+    // The engine's skin shader (recognised by its own wrap lighting, see
+    // add_skin_scattering) draws faces and nothing else. A face's specular map is
+    // bright where skin is oily, which the reading below would take for metal.
+    if (fs.find("max ((0.2 * (") != std::string::npos && fs.find(" + 0.9)), ") != std::string::npos) return false;
     if (std::distance(std::sregex_iterator(fs.begin(), fs.end(), decode), std::sregex_iterator()) != 1) return false;
     if (!std::regex_search(fs, encode) || !has("varying vec3 ViewDir;")) return false;
     // The opening brace of main. The engine's shader files have CRLF line ends,
@@ -849,8 +853,9 @@ bool add_pbr_environment(std::string &fs, bool sky, bool materials, bool debug, 
                  "    float grey = 1.0 - smoothstep(0.1, 0.28, (hi - lo) / max(hi, 0.08));\n"
                  "    float shiny = smoothstep(0.12, 0.3, wbm_debug_gloss);\n"
                  "    float most = known > 0.0 ? known - 1.0 : 0.8;\n"
-                 "    float factor = known > 0.0 || wbm_metal_map >= 0.0 ? 1.0 : " + k_xl_material_uniform + ".x;\n"
-                 "    wbm_metal = clamp(max(wbm_metal * factor, most * grey * shiny), 0.0, 1.0);\n"
+                 // A texture known to show skin, cloth, hair or the like has no metal on
+                 // it whatever its specular map says; leather and wood may have some.
+                 "    wbm_metal = clamp(max(wbm_metal, most * grey * shiny), 0.0, known > 0.0 ? most : 1.0);\n"
                  "    wbm_dim = 0.8;\n"
                  "}\n";
         start += std::string("\n  if (") + k_xl_material_uniform + ".w > 0.0) {"
