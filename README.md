@@ -89,6 +89,7 @@ While the game runs, `scripts/snap.sh` logs the next frame call by call and save
 | `WBM_DEBUG_CLEAR` | Metal mode: clears the screen to blue instead of the game's colour, to show that frames arrive |
 | `WBM_OUT` | Output directory. `run.sh` sets it to `traces/<timestamp>`; otherwise `~/Library/Logs/warband-metal` |
 | `WBM_TRACE_FRAMES` | Frames to log call by call and capture, for example `1-3,600` |
+| `WBM_SNAP_EVERY` | Captures a frame to `frames/` every this many seconds, for example `10`. In trace mode each captured frame is also logged call by call |
 | `WBM_GLERR` | `1` checks `glGetError` after every setup call |
 | `WBM_LOG_MAX_MB` | Size limit of `trace.log` outside call-by-call frames. Default 256 |
 | `WBM_MODULE` | Module to load, for `run.sh`, for example `Native`. Works like the launcher's choice: it stays selected for later launches |

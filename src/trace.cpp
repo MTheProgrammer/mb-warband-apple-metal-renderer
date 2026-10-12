@@ -87,6 +87,8 @@ uint64_t s_hist_over[FN_COUNT];
 
 std::vector<std::pair<uint32_t, uint32_t>> s_verbose_ranges; // WBM_TRACE_FRAMES
 volatile sig_atomic_t s_snap_requested;
+double s_snap_every; // WBM_SNAP_EVERY, seconds; 0 is off
+std::chrono::steady_clock::time_point s_last_auto_snap = std::chrono::steady_clock::now();
 
 std::mutex s_frame_mu;
 std::vector<float> s_frame_ms;
@@ -290,6 +292,10 @@ void wb_frame_end()
         s_snap_requested = 0;
         verbose = true;
     }
+    if (s_snap_every > 0 && std::chrono::duration<double>(now - s_last_auto_snap).count() >= s_snap_every) {
+        s_last_auto_snap = now; // WBM_SNAP_EVERY: a capture every so many seconds, nothing to time by hand
+        verbose = true;
+    }
     g_frame.store(next);
     g_verbose.store(verbose);
     if (verbose) wb_note("=== frame %u begin (verbose) ===", next);
@@ -427,6 +433,7 @@ static void wb_init()
     setvbuf(s_log, nullptr, _IOFBF, 1 << 20);
 
     parse_ranges(getenv("WBM_TRACE_FRAMES"));
+    if (const char *v = getenv("WBM_SNAP_EVERY")) s_snap_every = atof(v);
     if (const char *v = getenv("WBM_LOG_MAX_MB")) s_log_cap = strtoull(v, nullptr, 10) << 20;
     if (const char *v = getenv("WBM_GLERR")) g_glerr = atoi(v) != 0 && !g_metal; // no OpenGL context to ask in Metal mode
     g_verbose.store(in_verbose_ranges(0));
