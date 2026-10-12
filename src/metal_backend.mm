@@ -14,6 +14,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <atomic>
+#include <chrono>
 #include <dirent.h>
 #include <mach-o/dyld.h>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -528,6 +530,11 @@ void scan_game_textures()
 bool s_motion_blur;
 float s_motion_blur_strength = 1.0f; // WBM_MOTION_BLUR_STRENGTH: exposure time in units of 1/48 s
 void apply_motion_blur();
+// Anti-aliasing after the fact (WBM_FXAA=1): see apply_fxaa.
+bool s_fxaa;
+void apply_fxaa();
+// Frame-rate limits (WBM_MAX_FPS, and WBM_MENU_FPS for frames without a 3D scene); 0 for none.
+double s_max_fps, s_menu_fps;
 
 void reset_pass_state()
 {
@@ -692,11 +699,12 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     end_pass();
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa) && s_last.scene && s_last.color != t.color && s_last.draws > 100 &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         if (s_ao || s_contact_shadows || s_light_shafts) apply_ambient_occlusion();
         if (s_motion_blur) apply_motion_blur();
+        if (s_fxaa) apply_fxaa(); // last: edges as they will be shown
     }
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (t.color) {
@@ -2012,6 +2020,176 @@ void apply_motion_blur()
     s_blur_frames++;
 }
 
+// ---- anti-aliasing after the fact ---------------------------------------------------------
+//
+// FXAA (Lottes): where neighbouring pixels differ enough in brightness to be
+// an edge, the pixel is blended with its neighbour across the edge by as much
+// as the edge's run along its own direction says it is covered. It works on
+// the finished scene, so it costs the same whatever was drawn and smooths
+// cut-out edges (leaves, hair) as well as geometry. It runs before the game's
+// interface is drawn, which stays sharp. The scene buffer holds gamma-encoded
+// colour, which is what the brightness comparison wants.
+
+const char k_fxaa_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+};
+
+vertex VertexOut fxaa_vertex(uint id [[vertex_id]])
+{
+    VertexOut out;
+    out.position = float4(float2((id << 1) & 2, id & 2) * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+static float luma(float3 c) { return dot(clamp(c, 0.0, 1.0), float3(0.299, 0.587, 0.114)); }
+
+fragment float4 fxaa_fragment(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    float2 inv = 1.0 / float2(scene.get_width(), scene.get_height());
+    float2 uv = in.position.xy * inv;
+    float4 centre = scene.sample(smooth, uv);
+    float m = luma(centre.rgb);
+    float d = luma(scene.sample(smooth, uv + float2(0, -1) * inv).rgb), u = luma(scene.sample(smooth, uv + float2(0, 1) * inv).rgb);
+    float l = luma(scene.sample(smooth, uv + float2(-1, 0) * inv).rgb), r = luma(scene.sample(smooth, uv + float2(1, 0) * inv).rgb);
+    float lowest = min(m, min(min(d, u), min(l, r))), highest = max(m, max(max(d, u), max(l, r)));
+    float range = highest - lowest;
+    if (range < max(0.0312, highest * 0.125)) return centre;
+
+    float dl = luma(scene.sample(smooth, uv + float2(-1, -1) * inv).rgb), ur = luma(scene.sample(smooth, uv + float2(1, 1) * inv).rgb);
+    float ul = luma(scene.sample(smooth, uv + float2(-1, 1) * inv).rgb), dr = luma(scene.sample(smooth, uv + float2(1, -1) * inv).rgb);
+    float horizontal = abs(-2.0 * l + dl + ul) + abs(-2.0 * m + d + u) * 2.0 + abs(-2.0 * r + dr + ur);
+    float vertical = abs(-2.0 * u + ul + ur) + abs(-2.0 * m + l + r) * 2.0 + abs(-2.0 * d + dl + dr);
+    bool is_horizontal = horizontal >= vertical;
+
+    float luma1 = is_horizontal ? d : l, luma2 = is_horizontal ? u : r;
+    float gradient1 = luma1 - m, gradient2 = luma2 - m;
+    bool steepest1 = abs(gradient1) >= abs(gradient2);
+    float gradient = 0.25 * max(abs(gradient1), abs(gradient2));
+    float step_length = is_horizontal ? inv.y : inv.x;
+    float average;
+    if (steepest1) {
+        step_length = -step_length;
+        average = 0.5 * (luma1 + m);
+    } else {
+        average = 0.5 * (luma2 + m);
+    }
+    float2 at = uv;
+    if (is_horizontal) at.y += step_length * 0.5;
+    else at.x += step_length * 0.5;
+
+    // Along the edge both ways, until it ends.
+    float2 along = is_horizontal ? float2(inv.x, 0.0) : float2(0.0, inv.y);
+    float2 uv1 = at - along, uv2 = at + along;
+    float end1 = luma(scene.sample(smooth, uv1).rgb) - average, end2 = luma(scene.sample(smooth, uv2).rgb) - average;
+    bool reached1 = abs(end1) >= gradient, reached2 = abs(end2) >= gradient;
+    const float steps[10] = {1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 4.0, 8.0};
+    for (int i = 0; i < 10 && !(reached1 && reached2); i++) {
+        if (!reached1) {
+            uv1 -= along * steps[i];
+            end1 = luma(scene.sample(smooth, uv1).rgb) - average;
+            reached1 = abs(end1) >= gradient;
+        }
+        if (!reached2) {
+            uv2 += along * steps[i];
+            end2 = luma(scene.sample(smooth, uv2).rgb) - average;
+            reached2 = abs(end2) >= gradient;
+        }
+    }
+    float distance1 = is_horizontal ? uv.x - uv1.x : uv.y - uv1.y, distance2 = is_horizontal ? uv2.x - uv.x : uv2.y - uv.y;
+    bool nearer1 = distance1 < distance2;
+    float offset = -min(distance1, distance2) / (distance1 + distance2) + 0.5;
+    bool centre_darker = m < average;
+    bool right_way = ((nearer1 ? end1 : end2) < 0.0) != centre_darker;
+    offset = right_way ? offset : 0.0;
+
+    // Single bright or dark pixels.
+    float around = (2.0 * (d + u + l + r) + dl + ul + dr + ur) / 12.0;
+    float s1 = clamp(abs(around - m) / range, 0.0, 1.0), s2 = (-2.0 * s1 + 3.0) * s1 * s1;
+    offset = max(offset, s2 * s2 * 0.75);
+
+    float2 final_uv = uv;
+    if (is_horizontal) final_uv.y += offset * step_length;
+    else final_uv.x += offset * step_length;
+    return float4(scene.sample(smooth, final_uv).rgb, centre.a);
+}
+)";
+
+id<MTLLibrary> s_fxaa_library;
+std::map<int, id<MTLRenderPipelineState>> s_fxaa_pipelines; // by colour format
+id<MTLTexture> s_fxaa_texture;
+uint64_t s_fxaa_frames;
+
+// Called between render passes, once the engine has finished the scene.
+void apply_fxaa()
+{
+    if (!s_last.color) return;
+    if (!s_fxaa_library) {
+        NSError *error = nil;
+        s_fxaa_library = [s_device newLibraryWithSource:@(k_fxaa_source) options:nil error:&error];
+        if (!s_fxaa_library) {
+            complain("anti-aliasing shaders did not compile: %s", error.localizedDescription.UTF8String);
+            s_fxaa = false;
+            return;
+        }
+    }
+    id<MTLRenderPipelineState> __strong &pipeline = s_fxaa_pipelines[(int)s_last.color.pixelFormat];
+    if (!pipeline) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [s_fxaa_library newFunctionWithName:@"fxaa_vertex"];
+        d.fragmentFunction = [s_fxaa_library newFunctionWithName:@"fxaa_fragment"];
+        d.colorAttachments[0].pixelFormat = s_last.color.pixelFormat;
+        NSError *error = nil;
+        pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!pipeline) {
+            complain("anti-aliasing pipeline failed: %s", error.localizedDescription.UTF8String);
+            s_fxaa = false;
+            return;
+        }
+    }
+    NSUInteger w = s_last.color.width, h = s_last.color.height;
+    if (!s_fxaa_texture || s_fxaa_texture.width != w || s_fxaa_texture.height != h || s_fxaa_texture.pixelFormat != s_last.color.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s_last.color.pixelFormat width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_fxaa_texture = [s_device newTextureWithDescriptor:td];
+    }
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_fxaa_texture;
+    d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:pipeline];
+    [pass setFragmentTexture:s_last.color atIndex:0];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+    id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+    [blit copyFromTexture:s_fxaa_texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                toTexture:s_last.color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    s_fxaa_frames++;
+}
+
+// Holds the frame rate to a limit by waiting at the end of a frame.
+void limit_frame_rate()
+{
+    static std::chrono::steady_clock::time_point next;
+    double limit = s_scene_frame + 1 >= s_frame_serial ? s_max_fps : (s_menu_fps > 0 ? s_menu_fps : s_max_fps); // s_frame_serial was just advanced
+    auto now = std::chrono::steady_clock::now();
+    if (limit <= 0) {
+        next = now;
+        return;
+    }
+    auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / limit));
+    next += period;
+    if (next < now - period * 4) next = now; // fell behind: do not try to catch up
+    if (next > now) std::this_thread::sleep_until(next);
+}
+
 #include "texture_packs.inc"
 
 // Binds a buffer to a vertex (stage 0) or fragment (stage 1) slot, doing only
@@ -2998,6 +3176,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
     index_texture_packs();
     if (s_materials || !s_pack_files.empty() || s_pack_self_test || s_shader_options.skin_scattering) scan_game_textures();
+    const char *fxaa_env = getenv("WBM_FXAA");
+    s_fxaa = fxaa_env && atoi(fxaa_env) != 0; // off unless set
+    if (const char *v = getenv("WBM_MAX_FPS")) s_max_fps = std::max(0.0, atof(v));
+    if (const char *v = getenv("WBM_MENU_FPS")) s_menu_fps = std::max(0.0, atof(v));
     const char *blur_env = getenv("WBM_MOTION_BLUR");
     s_motion_blur = blur_env && atoi(blur_env) != 0; // off unless set
     if (const char *v = getenv("WBM_MOTION_BLUR_STRENGTH")) s_motion_blur_strength = std::max(0.0f, (float)atof(v));
@@ -3080,6 +3262,8 @@ void mtl_dump_stats(FILE *f)
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
+    if (s_fxaa_frames) fprintf(f, "\nanti-aliasing (FXAA) applied in %llu frames\n", (unsigned long long)s_fxaa_frames);
+    if (s_max_fps > 0 || s_menu_fps > 0) fprintf(f, "\nframe rate limited to %.0f, %.0f without a 3D scene (0: no limit)\n", s_max_fps, s_menu_fps);
     if (s_sky_ambient) {
         fprintf(f, "\n== sky ambient ==\napplied in %llu frames; tint now towards +X %.2f %.2f %.2f, -X %.2f %.2f %.2f, up %.2f %.2f %.2f; bounce %.3f %.3f %.3f\n",
                 (unsigned long long)s_amb_stats_frames, s_amb[0], s_amb[1], s_amb[2], s_amb[4], s_amb[5], s_amb[6], s_amb[16], s_amb[17], s_amb[18],
@@ -3197,6 +3381,7 @@ void mtl_present(bool capture, uint32_t frame)
         }
         capture_at_frame_end();
     }
+    limit_frame_rate();
 }
 
 // ---- frame capture and playback (see frame_capture.inc) -------------------------------------------
