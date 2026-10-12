@@ -3583,6 +3583,26 @@ bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *dista
 
 void mtl_preview_material(const char *name) { s_preview.material = name ? name : ""; }
 
+// The mesh a name stands for: itself if it is a mesh; the first mesh of a
+// resource file of that name otherwise; null if neither.
+const char *mtl_preview_resolve(const char *name)
+{
+    preview_read_library();
+    static std::string result;
+    std::string want = lower_case(name ? name : "");
+    if (want.size() > 4 && !want.compare(want.size() - 4, 4, ".brf")) want.resize(want.size() - 4);
+    auto &meshes = s_preview.library.meshes;
+    if (meshes.count(want)) return (result = want).c_str();
+    for (size_t f = 0; f < s_preview.library.files.size(); f++) {
+        const std::string &path = s_preview.library.files[f];
+        std::string base = lower_case(path.substr(path.rfind('/') + 1));
+        if (base != want + ".brf") continue;
+        for (auto &m : meshes)
+            if (m.second.file == (int)f && m.first.find(".lod") == std::string::npos) return (result = m.first).c_str();
+    }
+    return nullptr;
+}
+
 int mtl_preview_list(const char *pattern, FILE *out)
 {
     preview_read_library();

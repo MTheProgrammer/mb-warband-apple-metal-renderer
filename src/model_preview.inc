@@ -181,6 +181,26 @@ bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
     if (material != pv.library.materials.end()) part.material = material->second;
     else complain("preview: mesh %s names a material, %s, that no resource file has", mesh_name.c_str(), mesh.material.c_str());
 
+    // Heads are kept as one half, the engine making the other: every vertex on
+    // one side of the middle, and the texture's right half only. The age of a
+    // face is put into the alpha of its vertex colours by the game; here, young.
+    bool half = !mesh.skinned;
+    for (const BrfVertex &v : mesh.vertices) half = half && v.position[0] > -1e-4f && v.uv[0] > 0.49f;
+    if (half) {
+        size_t n = mesh.vertices.size(), triangles = mesh.indices.size() / 3;
+        for (size_t i = 0; i < n; i++) {
+            mesh.vertices[i].colour[3] = 0;
+            BrfVertex m = mesh.vertices[i];
+            m.position[0] = -m.position[0], m.normal[0] = -m.normal[0], m.tangent[0] = -m.tangent[0];
+            m.uv[0] = 1.0f - m.uv[0];
+            m.handedness = -m.handedness;
+            mesh.vertices.push_back(m);
+        }
+        for (size_t t = 0; t < triangles; t++) {
+            uint32_t a = mesh.indices[t * 3], b = mesh.indices[t * 3 + 1], c = mesh.indices[t * 3 + 2];
+            mesh.indices.push_back((uint32_t)n + a), mesh.indices.push_back((uint32_t)n + c), mesh.indices.push_back((uint32_t)n + b);
+        }
+    }
     std::vector<PreviewVertex> vertices(mesh.vertices.size());
     for (size_t i = 0; i < vertices.size(); i++) {
         const BrfVertex &v = mesh.vertices[i];

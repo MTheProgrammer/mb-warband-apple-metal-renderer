@@ -101,7 +101,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "%d meshes\n", found);
         return 0;
     }
-    if (!model.empty()) s_view.interface = false;
+    if (!model.empty()) {
+        // A mistyped name must not quietly show the frame as captured.
+        const char *mesh = mtl_preview_resolve(model.c_str());
+        if (!mesh) {
+            fprintf(stderr, "%s is neither a mesh nor a resource file. Names containing it:\n", model.c_str());
+            if (!mtl_preview_list(model.c_str(), stderr)) fprintf(stderr, "  none; try replay --list with a shorter word\n");
+            return 1;
+        }
+        if (model != mesh) fprintf(stderr, "%s is a resource file; showing its first mesh, %s (n and p step through the rest)\n", model.c_str(), mesh);
+        model = mesh;
+        s_view.interface = false;
+    }
     int width = 0, height = 0;
     if (!path || !mtl_replay_open(path, &width, &height)) {
         fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet] [--stats]\n"
