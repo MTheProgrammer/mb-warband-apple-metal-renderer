@@ -833,6 +833,8 @@ vec3 wbm_water_sky(vec3 d)
 //   foam at the shore and round whatever stands in the water, and the sun's glitter.
 bool add_water(std::string &fs, bool sky)
 {
+    // With the depth effects' inputs the water can look into a copy of the scene (wbm_scene, wbm_water): see below.
+    const bool looks = fs.find("varying vec4 projCoord;") != std::string::npos && fs.find("varying float Depth;") != std::string::npos && fs.find("uniform sampler2D depth_texture;") != std::string::npos;
     static const std::regex sun(R"((\w+) = \(\(0\.01 \* clamp \(\s*dot \((normal_\d+), LightDir_Alpha\.xyz\)\s*, 0\.0, 1\.0\)\) \* LightDif\);)");
     static const std::regex deep(R"((\w+)\.w = \(\1\.w \+ clamp \(\(\s*\((tmpvar_\d+)\.x - Depth\)\s*\* 32\.0\), 0\.0, 1\.0\)\);)");
     static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
@@ -857,17 +859,55 @@ bool add_water(std::string &fs, bool sky)
                                    "    " + out + ".xyz = mix(wbm_body, wbm_above, wbm_fresnel);\n"
                                  : "    " + out + ".xyz += wbm_body * (1.0 - wbm_fresnel);\n") +
                             "    float wbm_thick = wbm_deep >= 0.0 ? 1.0 - exp(-wbm_deep * 900.0) : 0.85;\n" // over a metre of water little of the bed is left
-                            "    float wbm_alpha = max(wbm_fresnel, wbm_thick) * LightDir_Alpha.w;\n"
+                            "    float wbm_alpha = max(wbm_fresnel, wbm_thick) * LightDir_Alpha.w, wbm_soft = 1.0;\n" +
+                            (looks ?
+                            // The scene as it was before the water: seen through the surface, shifted by the ripples
+                            // (the bed, refracted), and searched along the mirrored line of sight for what the surface
+                            // reflects: banks, trees, people. Where the search finds nothing on screen, the sky stays.
+                            "    if (wbm_water[2].x > 0.5 && wbm_deep >= 0.0) {\n"
+                            "      vec2 wbm_suv = vec2(projCoord.x, projCoord.w - projCoord.y) / projCoord.w;\n"
+                            "      float wbm_far = wbm_water[1].w;\n"
+                            "      vec2 wbm_ruv = clamp(wbm_suv + wbm_n.xy * (0.025 * clamp(wbm_deep * 1500.0, 0.0, 1.0)), vec2(0.001), vec2(0.999));\n"
+                            "      if (texture2D(depth_texture, wbm_ruv).x < Depth) wbm_ruv = wbm_suv;\n" // not what stands in front of the water
+                            "      vec3 wbm_under = pow(max(textureLod(wbm_scene, wbm_ruv, 0.0).xyz, vec3(0.0)), vec3(2.2));\n"
+                            "      float wbm_w0 = ((2.0 * Depth * wbm_far - 1.0) - wbm_water[0].w) / wbm_water[0].z;\n"
+                            "      vec3 wbm_p = vec3((wbm_suv * 2.0 - 1.0) * wbm_w0 / wbm_water[0].xy, wbm_w0);\n"
+                            "      vec3 wbm_up = normalize(wbm_water[1].xyz);\n"
+                            "      vec3 wbm_dir = reflect(normalize(wbm_p), wbm_up);\n"
+                            "      float wbm_stride = max(0.15, wbm_w0 * 0.03);\n"
+                            "      float wbm_jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
+                            "      vec3 wbm_s = wbm_p + wbm_dir * (wbm_stride * wbm_jitter);\n"
+                            "      float wbm_hit = 0.0;\n"
+                            "      vec2 wbm_huv = wbm_suv;\n"
+                            "      for (int wbm_i = 0; wbm_i < 64 && float(wbm_i) < wbm_water[2].y; wbm_i++) {\n"
+                            "        wbm_s += wbm_dir * wbm_stride;\n"
+                            "        if (wbm_s.z <= 0.1) break;\n"
+                            "        vec2 wbm_u = wbm_s.xy * wbm_water[0].xy / wbm_s.z * 0.5 + 0.5;\n"
+                            "        if (wbm_u.x < 0.0 || wbm_u.x > 1.0 || wbm_u.y < 0.0 || wbm_u.y > 1.0) break;\n"
+                            "        float wbm_ws = ((2.0 * texture2D(depth_texture, wbm_u).x * wbm_far - 1.0) - wbm_water[0].w) / wbm_water[0].z;\n"
+                            "        if (wbm_s.z > wbm_ws && wbm_s.z - wbm_ws < wbm_stride * 2.5 + 0.3) {\n"
+                            "          vec2 wbm_edge = min(wbm_u, 1.0 - wbm_u);\n"
+                            "          wbm_hit = clamp(min(wbm_edge.x, wbm_edge.y) * 12.0, 0.0, 1.0), wbm_huv = wbm_u;\n"
+                            "          break;\n"
+                            "        }\n"
+                            "        wbm_stride *= 1.18;\n"
+                            "      }\n"
+                            "      vec3 wbm_mirror = " + std::string(sky ? "wbm_above" : out + ".xyz") + ";\n"
+                            "      if (wbm_hit > 0.0) wbm_mirror = mix(wbm_mirror, pow(max(textureLod(wbm_scene, clamp(wbm_huv + wbm_n.xy * 0.012, vec2(0.001), vec2(0.999)), 0.0).xyz, vec3(0.0)), vec3(2.2)), wbm_hit);\n"
+                            "      " + out + ".xyz = mix(mix(wbm_under, wbm_body, wbm_thick), wbm_mirror, wbm_fresnel);\n"
+                            "      wbm_alpha = 1.0, wbm_soft = 0.5;\n" // what was blended in thinly before is now mixed here: foam and glitter are held back to match
+                            "    }\n" : std::string()) +
                             "    float wbm_ragged = 0.6 * texture2D(normal_texture, Tex0 * 9.0).y + 0.4 * texture2D(normal_texture, Tex0 * 23.0 + 0.37).w;\n"
                             // Foam: a narrow line right at the edge, and beyond it patches that thin out over some 20 cm of depth.
                             "    float wbm_foam = wbm_deep > 1e-7 ? max(0.7 * smoothstep(0.00005, 0.00001, wbm_deep), smoothstep(0.00018, 0.00004, wbm_deep) * smoothstep(0.42, 0.62, wbm_ragged)) : 0.0;\n"
-                            "    " + out + ".xyz = mix(" + out + ".xyz, LightDif.xyz * 0.55 + vec3(0.12), wbm_foam);\n"
+                            "    " + out + ".xyz = mix(" + out + ".xyz, LightDif.xyz * 0.55 + vec3(0.12), wbm_foam * wbm_soft);\n"
                             "    wbm_alpha = max(wbm_alpha, wbm_foam * 0.7);\n"
                             "    float wbm_glint = pow(clamp(dot(wbm_n, normalize(wbm_l + wbm_v)), 0.0, 1.0), 700.0) * step(0.0, wbm_l.z);\n"
-                            "    " + out + ".xyz += LightDif.xyz * (1.1 * wbm_glint);\n"
+                            "    " + out + ".xyz += LightDif.xyz * (1.1 * wbm_glint * wbm_soft);\n"
                             "    " + out + ".w = max(wbm_alpha, clamp(wbm_glint * 0.6, 0.0, 1.0) * LightDir_Alpha.w);\n  }\n  $&",
                             std::regex_constants::format_first_only);
     fs.insert(body + 1, "\n  float wbm_deep = -1.0;");
+    if (looks) fs.insert(0, "uniform sampler2D wbm_scene;\nuniform vec4 wbm_water[3];\n");
     return true;
 }
 

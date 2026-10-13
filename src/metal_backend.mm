@@ -125,6 +125,7 @@ struct UniformLocation {
     bool is_hair_map = false;                         // the wbm_hair_map sampler, which gets the bound texture's hair map
     bool is_fur_map = false;                          // the wbm_fur_map sampler, which gets the same map
     bool is_pbr_map = false;                          // the wbm_pbr_map sampler, which gets the bound texture's metalness map
+    bool is_scene_copy = false;                       // the wbm_scene sampler, which gets the scene as it was before water was drawn
     bool is_dyn_map = false;                          // the wbm_dyn_map sampler, which gets the per-frame shadow map
     bool is_sun_matrix = false;                       // matSunViewProj, the engine's shadow-space matrix
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
@@ -160,6 +161,7 @@ struct Program {
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     int grade_offset = -1;    // fragment stage, wbm_grade
     int parallax_offset = -1; // fragment stage, wbm_parallax
+    int water_offset = -1;    // fragment stage, wbm_water[3]: see copy_scene_for_water
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
     int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
@@ -311,6 +313,13 @@ LastPass s_last;
 // thread and handed to the final shader.
 bool s_hdr;
 float s_hdr_peak = 4.0f; // WBM_HDR_PEAK: the most headroom to use
+// Water reflects the scene and bends the view of its bed (WBM_WATER_REFLECTIONS, on with WBM_WATER): before the
+// first water of a frame is drawn, the scene so far is copied for the water's shader to look into.
+// WBM_WATER_STEPS: how far and how finely the reflection is searched for; WBM_WATER_EVERY: the copy is made afresh every so many frames.
+bool s_water_reflections = true;
+int s_water_steps = 24, s_water_every = 1;
+id<MTLTexture> s_water_scene;
+uint64_t s_water_frame, s_water_copies;
 float s_parallax;
 const float s_parallax_sign[2] = {-1.0f, -1.0f}; // which way the texture runs against the surface's own axes, found by trial // WBM_PARALLAX: depth of stone and brick, metres (0.05 is plenty); 0 for none
 float s_grade[4];        // WBM_CONTRAST, WBM_SATURATION, WBM_WARMTH: each about -1 to 1, 0 for no change
@@ -1068,7 +1077,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
+    p.yflip_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -1120,6 +1129,7 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.back().is_sun_color = name == "vSunColor";
                 p.locations.back().is_sky = name == k_xl_sky_sampler;
                 p.locations.back().is_dyn_map = name == k_xl_dyn_sampler;
+                p.locations.back().is_scene_copy = name == "wbm_scene";
                 p.locations.back().is_pbr_map = name == k_xl_pbr_sampler;
                 p.locations.back().is_fur_map = name == "wbm_fur_map";
                 p.locations.back().is_hair_map = name == "wbm_hair_map";
@@ -1133,6 +1143,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
             else if (u.name == "wbm_grade" && s == 1) p.grade_offset = u.offset;
             else if (u.name == "wbm_parallax" && s == 1) p.parallax_offset = u.offset;
+            else if (u.name == "wbm_water" && s == 1) p.water_offset = u.offset;
             else if (u.name == k_xl_limit_uniform) p.limit_offset = u.offset;
             else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
             else if (u.name == k_xl_dyn_near_uniform) p.dyn_near_offset = u.offset;
@@ -4083,6 +4094,23 @@ bool prepare_draw()
             p->uniform_dirty[1] = true;
         }
     }
+    if (p->water_offset >= 0) {
+        // [0]: the projection (p00, p11, a, b: clip z = a * w + b); [1]: the world's up in view space, and the far plane's
+        // distance; [2] x: 1 when the scene's copy is this frame's and the camera known, y: steps of the search for what is reflected.
+        float water[12] = {};
+        bool known = s_water_reflections && s_water_scene && s_water_frame + (uint64_t)s_water_every > s_frame_serial && s_camera.projection_frame == s_frame_serial &&
+                     s_camera.view_frame == s_frame_serial && fabs(s_camera.a) > 1e-9;
+        if (known) {
+            water[0] = (float)s_camera.p00, water[1] = (float)s_camera.p11, water[2] = (float)s_camera.a, water[3] = (float)s_camera.b;
+            for (int r = 0; r < 3; r++) water[4 + r] = (float)s_camera.view[r][2];
+            water[7] = fabs(1.0 - s_camera.a) > 1e-9 ? (float)fabs(s_camera.b / (1.0 - s_camera.a)) : 1250.0f;
+            water[8] = 1.0f, water[9] = (float)s_water_steps;
+        }
+        if (memcmp(p->uniform_data[1].data() + p->water_offset, water, sizeof water)) {
+            memcpy(p->uniform_data[1].data() + p->water_offset, water, sizeof water);
+            p->uniform_dirty[1] = true;
+        }
+    }
     if (p->parallax_offset >= 0) { // stone, brick and the ground have depth; a painted shield has not
         const float parallax[4] = {diffuse && diffuse->material == MAT_STONE ? s_parallax : 0.0f, s_parallax_sign[0], s_parallax_sign[1], 0};
         if (memcmp(p->uniform_data[1].data() + p->parallax_offset, parallax, 16)) {
@@ -4145,6 +4173,9 @@ bool prepare_draw()
             id<MTLSamplerState> sampler = t && t->mtl ? sampler_for(*t) : s_samplers.begin()->second;
             if (l.is_sky) { // not one of the game's textures
                 texture = s_sky_atlas ? s_sky_atlas : s_white;
+                if (s_sky_sampler) sampler = s_sky_sampler;
+            } else if (l.is_scene_copy) {
+                texture = s_water_scene ? s_water_scene : s_white;
                 if (s_sky_sampler) sampler = s_sky_sampler;
             } else if (l.is_dyn_map) {
                 texture = s_dyn_map ? s_dyn_map : s_white;
@@ -4504,6 +4535,9 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     s_shader_options.hair_strands = s_people_hair;
+    if (const char *v = getenv("WBM_WATER_REFLECTIONS")) s_water_reflections = atoi(v) != 0;
+    if (const char *v = getenv("WBM_WATER_STEPS")) s_water_steps = std::min(64, std::max(4, atoi(v)));
+    if (const char *v = getenv("WBM_WATER_EVERY")) s_water_every = std::max(1, atoi(v));
     if (const char *v = getenv("WBM_PARALLAX")) s_parallax = std::min(0.3f, std::max(0.0f, (float)atof(v)));
     s_shader_options.parallax = s_parallax > 0;
     if (const char *v = getenv("WBM_WATER")) s_shader_options.water = atoi(v) != 0;
@@ -4615,6 +4649,7 @@ void mtl_dump_stats(FILE *f)
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
     if (s_velocity_objects) fprintf(f, "moving objects blurred by their own movement: %llu in all\n", (unsigned long long)s_velocity_objects);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
+    if (s_water_copies) fprintf(f, "\nscene copied for water to reflect in %llu frames\n", (unsigned long long)s_water_copies);
     if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
     if (s_sharpen_frames) fprintf(f, "\nsharpened in %llu frames\n", (unsigned long long)s_sharpen_frames);
@@ -5475,6 +5510,25 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         float clock = 1.0f + (float)fmod(s_wind_time, 600.0); // above 0.5, which is all the coat's layers ask of it
         const float surface[4] = {0, 0, s_fur_density, shells ? clock : 0.0f};
         memcpy(s_shell_now, surface, sizeof surface);
+        if (s_water_reflections && s_pass_scene && s_pass_color) {
+            Program *wp = find(s_programs, s_program);
+            if (wp && wp->water_offset >= 0 && s_water_frame + (uint64_t)s_water_every <= s_frame_serial) {
+                id<MTLTexture> scene = s_pass_color; // what later passes read: with multisampling, filled when the pass ends
+                end_pass();
+                if (!s_water_scene || s_water_scene.width != scene.width || s_water_scene.height != scene.height || s_water_scene.pixelFormat != scene.pixelFormat) {
+                    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:scene.pixelFormat width:scene.width height:scene.height mipmapped:NO];
+                    td.usage = MTLTextureUsageShaderRead;
+                    td.storageMode = MTLStorageModePrivate;
+                    s_water_scene = [s_device newTextureWithDescriptor:td];
+                }
+                id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+                [blit copyFromTexture:scene sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(scene.width, scene.height, 1)
+                            toTexture:s_water_scene destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                [blit endEncoding];
+                s_water_frame = s_frame_serial;
+                s_water_copies++;
+            }
+        }
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];

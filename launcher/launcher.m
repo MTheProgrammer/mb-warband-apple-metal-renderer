@@ -58,6 +58,7 @@ static const Option k_options[] = {
     {"Materials and colour", "WBM_PARALLAX", "Depth in stone", "Stones stand out from their joints on walls and buildings nearby, by this many metres. 0 for none.", kSlider, "0.05", "0", "0", NULL, 0, 0.12, 0.01},
     {"Materials and colour", "WBM_WATER", "Water", "Glitter from the sun, paler shallows and foam at the shore.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
 
+    {"Materials and colour", "WBM_WATER_REFLECTIONS", "Reflections in water", "Water mirrors banks, trees and people, and bends the view of its bed. Costs most where water fills the screen.", kToggle, "1", "0", "0", NULL, 0, 0, 0},
     {"Trees and grass", "WBM_WIND", "Wind", "How much trees, bushes and grass sway. 0 for none.", kSlider, "1", "1", "0", NULL, 0, 2, 0.1},
     {"Trees and grass", "WBM_FOLIAGE", "Light through leaves", "Sunlight coming through leaves seen from their far side.", kSlider, "0.6", "0.6", "0", NULL, 0, 1, 0.1},
 
