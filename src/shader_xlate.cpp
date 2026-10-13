@@ -427,9 +427,12 @@ vec3 wbm_environment_sky(vec3 view, vec3 reflection, vec3 ground)
     vec3 d = normalize(reflection);
     float rough = sqrt(wbm_a2);
     vec3 above = normalize(vec3(d.xy, max(d.z, 0.04)));
-    vec3 sky = pow(max(wbm_sky_sample(above, clamp(rough * 7.0, 0.0, 5.0)), vec3(0.0)), vec3(2.2));
+    // Indoors the atlas holds the room all round, floor included, and says so in its fourth channel (a quarter; a sky's is 1):
+    // the guess at the ground, made from the fog's colour, which indoors is the wrong blue, is not wanted there.
+    bool room = abs(textureLod(wbm_sky, vec2(0.5 / 6.0, 0.5), 7.0).w - 0.25) < 0.1;
+    vec3 sky = pow(max(wbm_sky_sample(room ? d : above, clamp(rough * 7.0, 0.0, 5.0)), vec3(0.0)), vec3(2.2));
     float blur = 0.04 + 0.3 * rough;
-    vec3 env = mix(ground, sky, smoothstep(-blur, blur, d.z));
+    vec3 env = room ? sky : mix(ground, sky, smoothstep(-blur, blur, d.z));
     vec3 f0 = mix(vec3(0.04), wbm_albedo, wbm_metal);
     vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - nv, 5.0);
     return env * fresnel * mix(wbm_mask, 1.0, wbm_metal * wbm_metal); // a metal reflects whatever its highlight map says

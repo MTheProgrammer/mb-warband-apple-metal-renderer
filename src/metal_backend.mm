@@ -4479,7 +4479,7 @@ void update_room_probe()
     d.colorAttachments[0].texture = s_room_atlas;
     d.colorAttachments[0].loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
     d.colorAttachments[0].storeAction = MTLStoreActionStore;
-    d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0.25); // the fourth channel marks it as a room's: see wbm_environment_sky
     id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
     [pass setRenderPipelineState:s_room_pipeline];
     [pass setFragmentTexture:s_last.color atIndex:0];
