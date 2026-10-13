@@ -39,16 +39,19 @@ build/%.o: src/%.cpp $(HDRS) Makefile | build $(DEPS)
 build/%.o: src/%.mm $(HDRS) Makefile | build $(DEPS)
 	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -c $< -o $@
 
-# The double-clickable launcher: a script, with the library inside the bundle.
+# The double-clickable launcher: a window for the options and a Play button, with the library inside the bundle.
 APP := build/Warband Metal.app
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-app: $(LIB) launcher/warband-metal.sh launcher/Info.plist
+build/launcher: launcher/launcher.m
+	@mkdir -p build
+	clang -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -O2 -Wall -Wextra -fobjc-arc launcher/launcher.m -framework AppKit -o $@
+
+app: $(LIB) build/launcher launcher/Info.plist
 	rm -rf "$(APP)"
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	sed 's/@VERSION@/$(VERSION)/' launcher/Info.plist > "$(APP)/Contents/Info.plist"
-	cp launcher/warband-metal.sh "$(APP)/Contents/MacOS/warband-metal"
-	chmod +x "$(APP)/Contents/MacOS/warband-metal"
+	cp build/launcher "$(APP)/Contents/MacOS/warband-metal"
 	cp $(LIB) "$(APP)/Contents/Resources/"
 	strip -S "$(APP)/Contents/Resources/libwbmetal.dylib"  # drops debug info, which names build paths
 
@@ -84,7 +87,7 @@ build:
 	mkdir -p build
 
 clean:
-	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/*.zip
+	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/launcher build/*.zip
 	rm -rf "$(APP)"
 
 distclean:

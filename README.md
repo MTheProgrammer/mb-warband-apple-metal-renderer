@@ -28,11 +28,13 @@ You do not need to compile anything. A ready-made app is on the Releases page.
 
    **Without Terminal.** Double-click the app and close the warning. Open System Settings → Privacy & Security, scroll down to Security, and click "Open Anyway" next to the message about Warband Metal. Confirm with your password or Touch ID, then open the app again. This route has not been verified; if the game still does not start afterwards, use the Terminal command.
 
-3. Double-click `Warband Metal.app`. It starts the game on Metal. If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once and remembers it.
+3. Double-click `Warband Metal.app`. A window opens with the renderer's options, grouped and explained, three ready-made settings ("Everything on", "Faster", "As the game looks"), the module to play, and a Play button, which starts the game on Metal. The choices are remembered; a checkbox makes the app start the game at once from then on (hold Option while opening it to get the window back). If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once and remembers it.
 
 You can keep the app anywhere, for example in Applications.
 
-The module and the graphics options are still set in the game's own launcher, the window Steam's Play button opens: the game reads them when it starts, whichever way it is started.
+Each option in the window is one of the `WBM_*` variables listed below, and a variable set in the environment the app is started from wins over the window. The choices are kept in `~/Library/Application Support/warband-metal/settings.plist`.
+
+The game's own graphics options are still set in the game's own launcher, the window Steam's Play button opens: the game reads them when it starts, whichever way it is started.
 
 If something looks wrong, the log of the latest run is in `~/Library/Logs/warband-metal/trace.log`.
 
