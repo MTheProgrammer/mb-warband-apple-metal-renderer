@@ -309,6 +309,8 @@ bool preview_set_action(const std::string &action)
     Preview &pv = s_preview;
     preview_read_library();
     pv.animation = nullptr, pv.skeleton = nullptr, pv.action = action;
+    // How fast a horse doing this would be going, for its mane and tail to stream by.
+    s_pretend_speed = action == "walk" ? 1.7f : action == "trot" ? 4.0f : action == "canter" ? 7.0f : action == "gallop" ? 11.0f : action == "jump" ? 6.0f : 0.0f;
     if (action.empty() || action == "none") return true;
     std::string animation = "anim_horse";
     bool found = false;

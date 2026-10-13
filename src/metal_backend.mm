@@ -165,6 +165,7 @@ struct Program {
     int hair_colour_offset = -1; // fragment stage, the same
     int horse_eye_offset = -1; // fragment stage, the same
     int shell_offset[2] = {-1, -1}; // per stage: wbm_shell, see k_fur_function
+    int drift_offset = -1;          // vertex stage: wbm_drift, see drift_of
     int fur_offset = -1;      // fragment stage, see k_fur_function in shader_xlate.cpp
     int gaze_offset = -1;     // fragment stage, see k_eye_function in shader_xlate.cpp
     int leaf_sun_offset = -1; // vertex stage, see k_leaf_function in shader_xlate.cpp // fragment stage, see k_xl_dyn_sampler
@@ -424,6 +425,7 @@ float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its te
 // (see build_strands). WBM_TAIL_LENGTH and WBM_MANE_LENGTH: how long the
 // longest are, metres. WBM_HAIR_STRANDS_DENSITY: strands to the square metre.
 bool s_hair_strands;
+float s_pretend_speed; // metres a second a previewed model is taken to be going forwards, though it stays where it is (see drift_of)
 // WBM_PEOPLE_HAIR: people's hair and beards as strands over the hair mesh, for
 // characters within WBM_PEOPLE_HAIR_RANGE metres, at most WBM_PEOPLE_HAIR_MOST
 // meshes a frame; WBM_PEOPLE_HAIR_LENGTH: the longest strand, metres;
@@ -1043,7 +1045,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1120,6 +1122,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == "wbm_horse_eye") p.horse_eye_offset = u.offset;
             else if (u.name == "wbm_hair_colour") p.hair_colour_offset = u.offset;
             else if (u.name == "wbm_shell") p.shell_offset[s] = u.offset;
+            else if (u.name == "wbm_drift" && s == 0) p.drift_offset = u.offset;
             else location(u.name).uniform[s] = &u;
         }
         for (const XlSampler &smp : stages[s]->samplers) location(smp.name).texture_index[s] = smp.texture_index;
@@ -2441,6 +2444,8 @@ struct CasterDraw {
     // `push` metres, hanging as the drawn hair does at `share` of its length,
     // casting only where `alpha`, here the hair map, says long hair.
     bool hair = false;
+    int strand = 0; // 1: a horse's mane and tail as strands (push: the mane's length, share: the tail's); 2: a person's (push: the longest strand)
+    float drift[3] = {0, 0, 0};
     float push = 0, share = 0, down[3] = {0, 0, 0};
     std::shared_ptr<std::vector<float>> own_bones; // 32 matrices, kept with the record: it outlives the frame's own
 };
@@ -2499,12 +2504,14 @@ struct Caster {
     float4 window[2]; // the wide window and the fine one. xy: centre, zw: 2 / (width, height), all in map coordinates
     float4 params;    // x: alpha below which a cut-out texel casts nothing; for hair, y: metres out, z: share of the hair's length
     float4 hang;      // for hair, xyz: which way is down, in the space the bones leave the vertex in
+    float4 drift;     // for strands, xyz: how far their tips trail behind, as a share of their length, in the same space
 };
 struct SkinnedCaster {
     float4x4 m;
     float4 window[2];
     float4 params;
     float4 hang;
+    float4 drift;
     float4x4 bones[32];
 };
 struct HairIn {
@@ -2513,6 +2520,22 @@ struct HairIn {
     float2 uv [[attribute(4)]];
     float4 weights [[attribute(7)]];
     float4 indices [[attribute(8)]];
+};
+// Strands (see build_strands): every vertex sits at its strand's root, and its colour says which point of the strand it is.
+struct StrandIn {
+    float3 position [[attribute(0)]];
+    float3 normal [[attribute(1)]];
+    float4 colour [[attribute(2)]];
+    float2 uv [[attribute(4)]];
+    float4 weights [[attribute(7)]];
+    float4 indices [[attribute(8)]];
+};
+struct PersonStrandIn {
+    float3 position [[attribute(0)]];
+    float3 normal [[attribute(1)]];
+    float4 colour [[attribute(2)]];
+    float2 uv [[attribute(4)]];
+    float3 run [[attribute(6)]];
 };
 struct StaticIn {
     float3 position [[attribute(0)]];
@@ -2572,6 +2595,63 @@ vertex Out caster_hair(HairIn in [[stage_in]], constant SkinnedCaster &c [[buffe
     return finish(c.m * skinned, in.uv, c.window[side], c.params);
 }
 
+// A strand is a ribbon turned to face the sun, wide enough for the map to hold.
+static float3 strand_point(float3 out_, float3 down, float len, float k, float t, float side, float half_width, float3 drift, float4x4 m)
+{
+    float3 dir = out_ * (1.0 - k * t) + down * (k * t);
+    float3 p = len * (out_ * (t - 0.5 * k * t * t) + down * (0.5 * k * t * t)) + drift * (len * t * t);
+    p *= min(1.0, len * t / max(length(p), 1e-6)); // however it is blown about, a strand is no longer than it is
+    float3 sunward = float3(m[0][2], m[1][2], m[2][2]);
+    float3 across = cross(dir, sunward);
+    across = dot(across, across) > 1e-12 ? normalize(across) : float3(1.0, 0.0, 0.0);
+    return p + across * (side * half_width);
+}
+// Hair that streams behind does not hang as well: the faster, the less it droops.
+static float streaming(float k, float3 drift) { return k * (1.0 - 0.9 * min(length(drift), 1.0)); }
+
+// The mane and tail of a horse, laid out as add_shell_push in shader_xlate.cpp lays them out. params.y: the mane's length, z: the tail's.
+vertex Out caster_strand(StrandIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]], ushort side_ [[amplification_id]])
+{
+    float4 p = float4(in.position, 1.0);
+    float4 skinned = c.bones[int(in.indices.x)] * p * in.weights.x + c.bones[int(in.indices.y)] * p * in.weights.y +
+                     c.bones[int(in.indices.z)] * p * in.weights.z + c.bones[int(in.indices.w)] * p * in.weights.w;
+    float4x4 b = c.bones[int(in.indices.x)] * in.weights.x + c.bones[int(in.indices.y)] * in.weights.y + c.bones[int(in.indices.z)] * in.weights.z + c.bones[int(in.indices.w)] * in.weights.w;
+    float3x3 turn = float3x3(b[0].xyz, b[1].xyz, b[2].xyz);
+    float v = floor(in.colour.x * 255.0 + 0.5), r = floor(in.colour.y * 255.0 + 0.5);
+    float far = floor(v / 32.0) / 7.0;
+    v -= floor(v / 32.0) * 32.0;
+    float side = fmod(v, 2.0) * 2.0 - 1.0, t = floor(v / 2.0) / 8.0;
+    float tail = step(128.0, r);
+    r -= 128.0 * tail;
+    float fall = step(64.0, r) * 2.0 - 1.0, chance = (r - 64.0 * step(64.0, r)) / 63.0;
+    float3 n = normalize(turn * in.normal), down = c.hang.xyz;
+    float3 out_ = tail > 0.5 ? normalize(normalize(turn * float3(0.0, -0.12, -1.0)) + n * 0.12)
+                             : normalize(normalize(turn * (far > 0.5 ? float3(fall * 0.25, 1.0, 0.0) : float3(fall, (fract(chance * 5.7) - 0.5) * 0.9, 0.0))) * (0.3 + 0.35 * fract(chance * 3.1)) + n * 0.2 + down * 0.35);
+    float len = (tail > 0.5 ? c.params.z * (1.0 - 0.6 * far) : c.params.y * (1.0 - 0.45 * far)) * (tail > 0.5 ? 0.7 + 0.3 * chance : 0.45 + 0.55 * chance);
+    skinned.xyz += strand_point(out_, down, len, streaming(tail > 0.5 ? 0.85 : 1.0, c.drift.xyz), t, side, 0.006, c.drift.xyz, c.m);
+    return finish(c.m * skinned, in.uv + float2(chance, far), c.window[side_], c.params);
+}
+
+// A person's, as add_hair_strands lays them out. params.y: the longest strand's length.
+vertex Out caster_strand_person(PersonStrandIn in [[stage_in]], constant Caster &c [[buffer(0)]], ushort side_ [[amplification_id]])
+{
+    float v = floor(in.colour.x * 255.0 + 0.5), chance = in.colour.y;
+    float side = fmod(v, 2.0) * 2.0 - 1.0, t = floor(v / 2.0) / 8.0;
+    float3 n = normalize(in.normal), down = c.hang.xyz;
+    float3 run = dot(in.run, in.run) > 0.0004 ? normalize(in.run) : down;
+    float3 out_ = normalize(run + n * (fract(chance * 3.1) > 0.95 ? 0.45 : 0.02 + 0.14 * fract(chance * 3.1)));
+    float len = c.params.y * in.colour.z * (0.4 + 0.6 * chance);
+    float4 p = float4(in.position + strand_point(out_, down, len, streaming(0.4, c.drift.xyz), t, side, 0.003, c.drift.xyz, c.m), 1.0);
+    return finish(c.m * p, in.uv + float2(chance, 0.0), c.window[side_], c.params);
+}
+
+// Hair lets about half the light past it: every other strand casts.
+fragment float4 caster_strand_only(Out in [[stage_in]])
+{
+    if (fract(sin(dot(floor(in.uv * 4096.0), float2(12.9898, 78.233))) * 43758.5453) > 0.5) discard_fragment();
+    return float4(in.depth);
+}
+
 fragment float4 caster_hair_only(Out in [[stage_in]], texture2d<float> hair [[texture(0)]], sampler s [[sampler(0)]])
 {
     if (hair.sample(s, in.uv).b < 0.8) discard_fragment(); // long hair is 1 in a hair map's blue
@@ -2598,7 +2678,7 @@ fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[te
 id<MTLLibrary> s_caster_library;
 id<MTLDepthStencilState> s_caster_depth_state;
 NSUInteger s_caster_halves = 1; // 2 when the fine window is drawn too
-std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[5]; // [skinned * 2 + cutout], and 4 for hair
+std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[7]; // [skinned * 2 + cutout], 4 for hair in layers, 5 and 6 for strands
 
 // Called for each draw of the engine's depth pre-pass, after it has been issued.
 void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indices, NSUInteger index_offset, bool late)
@@ -2882,18 +2962,114 @@ void record_hair_casters(Program &p, Texture &coat, NSUInteger count, MTLIndexTy
     }
 }
 
-id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout, bool hair = false)
+// Strands cast shadows as strands: the ribbons just drawn are drawn again
+// into the next frame's map (see s_late_casters), laid out by the map's own
+// shaders. Called while the strands' buffer is still bound and prepared.
+// kind: 1 a horse's, 2 a person's. drift: as the strands were given it, in the world's space.
+void record_strand_caster(Program &p, const StrandMesh &strands, int kind, float first, float second, const float drift[3])
 {
-    auto &cache = s_caster_pipelines[hair ? 4 : skinned * 2 + cutout];
+    if (!p.u_world || s_late_casters.size() >= 4000 || (kind == 1 && !p.u_bones)) return;
+    CasterDraw c{};
+    memcpy(c.key.format, s_last_key.format, sizeof c.key.format);
+    memcpy(c.key.slot, s_last_key.slot, sizeof c.key.slot);
+    memcpy(c.key.offset, s_last_key.offset, sizeof c.key.offset);
+    memcpy(c.key.stride, s_last_key.stride, sizeof c.key.stride);
+    const int horse[6] = {0, 1, 2, 4, 7, 8}, person[5] = {0, 1, 2, 4, 6};
+    for (int k = 0; k < (kind == 1 ? 6 : 5); k++)
+        if (!c.key.format[(kind == 1 ? horse : person)[k]]) return;
+    c.slots = s_draw_binding.slots;
+    for (int i = 0; i < c.slots; i++) {
+        Buffer *b = find(s_buffers, s_draw_binding.buffer[i]);
+        if (!b || !b->mtl) return;
+        c.vertex[i] = b->mtl;
+        c.vertex_offset[i] = s_draw_binding.base[i];
+    }
+    c.indices = strands.indices, c.index_offset = 0, c.index_count = strands.count, c.index_type = MTLIndexTypeUInt32;
+    memcpy(c.wvp, p.uniform_data[0].data() + p.u_world->offset, sizeof c.wvp);
+    c.world = true;
+    c.bones = -1;
+    if (kind == 1) {
+        c.own_bones = std::make_shared<std::vector<float>>(32 * 16, 0.0f);
+        memcpy(c.own_bones->data(), p.uniform_data[0].data() + p.u_bones->offset, std::min<size_t>(32 * 64, p.uniform_data[0].size() - (size_t)p.u_bones->offset));
+    }
+    c.strand = kind, c.push = first, c.share = second;
+    // Down and the drift, in the space the world matrix starts from: the world's, turned back by the matrix's rotation.
+    const float *w = c.wvp;
+    float len = sqrtf(w[2] * w[2] + w[6] * w[6] + w[10] * w[10]);
+    if (len > 1e-6f) c.down[0] = -w[2] / len, c.down[1] = -w[6] / len, c.down[2] = -w[10] / len;
+    for (int k = 0; k < 3; k++) c.drift[k] = drift[0] * w[k * 4] + drift[1] * w[k * 4 + 1] + drift[2] * w[k * 4 + 2];
+    s_late_casters.push_back(c);
+}
+
+// Hair has weight: when its owner moves off, the strands' tips are left
+// behind a moment, and settle again when it stops. Each thing that has
+// strands is followed from frame to frame by where its world matrix puts it
+// (several may share a mesh: the nearest of last frame's is taken for the
+// same one), and how far its strands trail is eased after how fast it goes.
+// The result: which way and how far the tips trail, in the world's space, as a
+// share of a strand's length.
+struct Mover {
+    float place[3], drift[3];
+    double time;
+    uint64_t frame;
+};
+std::unordered_map<uint64_t, std::vector<Mover>> s_movers;
+
+void drift_of(uint64_t mesh, const float *world, float out[3])
+{
+    static const char *fixed = getenv("WBM_TEST_DRIFT"); // "x y z", to see it in a still
+    if (fixed && sscanf(fixed, "%f %f %f", &out[0], &out[1], &out[2]) == 3) return;
+    std::vector<Mover> &movers = s_movers[mesh];
+    const float place[3] = {world[12], world[13], world[14]};
+    Mover *same = nullptr;
+    float nearest = 2.0f * 2.0f; // metres, squared: farther off than that it is another
+    for (Mover &m : movers) {
+        if (m.frame == s_frame_serial) continue; // taken by another this frame
+        float d = 0;
+        for (int k = 0; k < 3; k++) d += (place[k] - m.place[k]) * (place[k] - m.place[k]);
+        if (d < nearest) nearest = d, same = &m;
+    }
+    if (!same) {
+        for (size_t i = 0; i < movers.size();) // those not seen for a while make room
+            if (movers[i].frame + 120 < s_frame_serial) movers[i] = movers.back(), movers.pop_back();
+            else i++;
+        movers.push_back(Mover{{place[0], place[1], place[2]}, {0, 0, 0}, s_wind_time, s_frame_serial});
+        out[0] = out[1] = out[2] = 0;
+        return;
+    }
+    double dt = s_wind_time - same->time;
+    if (dt > 1e-4 && dt < 0.5) {
+        float target[3], length = 0;
+        float ahead = sqrtf(world[4] * world[4] + world[5] * world[5] + world[6] * world[6]); // the model's +y is the way it faces
+        for (int k = 0; k < 3; k++) {
+            float speed = (place[k] - same->place[k]) / (float)dt + (ahead > 1e-6f ? world[4 + k] / ahead * s_pretend_speed : 0.0f);
+            target[k] = -speed * 0.09f, length += target[k] * target[k]; // at a gallop, 10 m/s, the tips trail by nine tenths of the length
+        }
+        length = sqrtf(length);
+        float ease = 1.0f - expf(-(float)dt * 5.0f);
+        for (int k = 0; k < 3; k++) same->drift[k] += ((length > 0.95f ? target[k] * 0.95f / length : target[k]) - same->drift[k]) * ease;
+    } else if (dt >= 0.5) {
+        same->drift[0] = same->drift[1] = same->drift[2] = 0;
+    }
+    if (dt > 1e-4 || dt < 0) memcpy(same->place, place, sizeof place), same->time = s_wind_time;
+    same->frame = s_frame_serial;
+    memcpy(out, same->drift, 12);
+}
+float s_drift_now[4]; // the shaders' wbm_drift for the draw being prepared
+
+id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout, bool hair = false, int strand = 0)
+{
+    auto &cache = s_caster_pipelines[strand ? 4 + strand : hair ? 4 : skinned * 2 + cutout];
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = [s_caster_library newFunctionWithName:hair ? @"caster_hair" : skinned ? @"caster_skinned" : @"caster_static"];
-    d.fragmentFunction = [s_caster_library newFunctionWithName:hair ? @"caster_hair_only" : cutout ? @"caster_cutout" : @"caster_opaque"];
+    d.vertexFunction = [s_caster_library newFunctionWithName:strand == 1 ? @"caster_strand" : strand == 2 ? @"caster_strand_person" : hair ? @"caster_hair" : skinned ? @"caster_skinned" : @"caster_static"];
+    d.fragmentFunction = [s_caster_library newFunctionWithName:strand ? @"caster_strand_only" : hair ? @"caster_hair_only" : cutout ? @"caster_cutout" : @"caster_opaque"];
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-    const int wanted[5] = {0, 4, 7, 8, 1};
+    const int plain[5] = {0, 4, 7, 8, 1}, horse[6] = {0, 4, 7, 8, 1, 2}, person[5] = {0, 4, 1, 2, 6};
+    const int *wanted = strand == 1 ? horse : strand == 2 ? person : plain;
     bool uses_constant = false;
-    for (int n = 0; n < (hair ? 5 : skinned ? 4 : 2); n++) {
+    for (int n = 0; n < (strand == 1 ? 6 : strand == 2 ? 5 : hair ? 5 : skinned ? 4 : 2); n++) {
         int i = wanted[n];
         if (key.format[i] && key.slot[i] != CONSTANT_SLOT) {
             vd.attributes[i].format = (MTLVertexFormat)key.format[i];
@@ -3039,7 +3215,7 @@ void render_dynamic_shadows(Program &p)
     mat_mul(sun, inv_frame, to_shadow);
 
     // All the casters' uniforms go into one buffer.
-    const size_t static_size = 256, skinned_size = 2304; // 128 and 2176 bytes, rounded up to the offset alignment
+    const size_t static_size = 256, skinned_size = 2304; // 144 and 2192 bytes, rounded up to the offset alignment
     size_t total = 0;
     for (const CasterDraw &c : casters) total += c.bones >= 0 || c.own_bones ? skinned_size : static_size;
     if (!total) return;
@@ -3075,7 +3251,7 @@ void render_dynamic_shadows(Program &p)
     for (const CasterDraw &c : casters) {
         bool skinned = c.bones >= 0 || c.own_bones;
         size_t size = skinned ? skinned_size : static_size;
-        id<MTLRenderPipelineState> pipeline = caster_pipeline(c.key, skinned, c.alpha != nil, c.hair);
+        id<MTLRenderPipelineState> pipeline = caster_pipeline(c.key, skinned, c.alpha != nil, c.hair, c.strand);
         if (!pipeline) {
             at += size;
             continue;
@@ -3091,7 +3267,9 @@ void render_dynamic_shadows(Program &p)
         const float params[4] = {c.cutoff, c.push, c.share, 0}, hang[4] = {c.down[0], c.down[1], c.down[2], 0};
         memcpy(base + at + 96, params, 16);
         memcpy(base + at + 112, hang, 16);
-        if (skinned) memcpy(base + at + 128, c.own_bones ? c.own_bones->data() : &bones[(size_t)c.bones * 32 * 16], 32 * 64);
+        const float drift[4] = {c.drift[0], c.drift[1], c.drift[2], 0};
+        memcpy(base + at + 128, drift, 16);
+        if (skinned) memcpy(base + at + 144, c.own_bones ? c.own_bones->data() : &bones[(size_t)c.bones * 32 * 16], 32 * 64);
         if (last_pipeline != (__bridge void *)pipeline) {
             [pass setRenderPipelineState:pipeline];
             last_pipeline = (__bridge void *)pipeline;
@@ -3230,6 +3408,10 @@ bool prepare_draw()
         if (p->shell_offset[stage] < 0 || !memcmp(p->uniform_data[stage].data() + p->shell_offset[stage], s_shell_now, 16)) continue;
         memcpy(p->uniform_data[stage].data() + p->shell_offset[stage], s_shell_now, 16);
         p->uniform_dirty[stage] = true;
+    }
+    if (p->drift_offset >= 0 && memcmp(p->uniform_data[0].data() + p->drift_offset, s_drift_now, 16)) {
+        memcpy(p->uniform_data[0].data() + p->drift_offset, s_drift_now, 16);
+        p->uniform_dirty[0] = true;
     }
     if (p->fur_offset >= 0) {
         const float fur[4] = {diffuse && (diffuse->pbr || diffuse->hair) ? s_fur_strength : 0.0f, s_dyn_near[2] > 0 && s_dyn_bias > 0 ? s_dyn_bias_m / s_dyn_bias : 0.0f,
@@ -4686,7 +4868,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         if (!prepare_draw()) return;
         MTLIndexType index_type = type == GL_UNSIGNED_SHORT ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         [s_pass drawIndexedPrimitives:primitive indexCount:(NSUInteger)count indexType:index_type indexBuffer:b->mtl indexBufferOffset:offset];
-        if (long_hair && s_dyn_shadows && primitive == MTLPrimitiveTypeTriangle) {
+        if (long_hair && s_dyn_shadows && !s_hair_strands && primitive == MTLPrimitiveTypeTriangle) { // strands cast for themselves
             Program *fp = find(s_programs, s_program);
             UniformLocation &l = fp->locations[(size_t)fp->alpha_texture_location];
             if (Texture *coat = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr)
@@ -4730,6 +4912,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                     for (Attrib &a : s_attribs)
                         if (a.enabled && a.buffer == attribs[0].buffer) a.buffer = strands.buffer;
                     s_cull = false;
+                    if (hp->u_world) drift_of(mesh_id((NSUInteger)count, offset), (const float *)(hp->uniform_data[0].data() + hp->u_world->offset), s_drift_now);
                     for (int soft = 0; soft < 2; soft++) { // what is solid first, leaving depth; then the soft edges, blended, leaving none
                         s_blend = soft != 0, s_depth_mask = soft == 0;
                         if (soft) s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD;
@@ -4739,6 +4922,8 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                             [s_pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:strands.count indexType:MTLIndexTypeUInt32 indexBuffer:strands.indices indexBufferOffset:0];
                         s_shell_draws++;
                     }
+                    if (s_dyn_shadows) record_strand_caster(*hp, strands, 2, s_people_hair_length, 0, s_drift_now);
+                    memset(s_drift_now, 0, sizeof s_drift_now);
                     memcpy(s_attribs, attribs, sizeof attribs);
                     s_cull = cull, s_blend = was_blend, s_depth_mask = depth_mask, s_blend_src = src, s_blend_dst = dst, s_blend_eq = eq;
                     s_people_hair_drawn++;
@@ -4765,6 +4950,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                     // What is solid first, leaving depth; then the soft edges, blended, leaving none (the sign of z tells the shader which).
                     bool depth_mask = s_depth_mask;
                     s_cull = false;
+                    if (fp->u_world) drift_of(mesh_id((NSUInteger)count, offset), (const float *)(fp->uniform_data[0].data() + fp->u_world->offset), s_drift_now);
                     for (int soft = 0; soft < 2; soft++) {
                         if (soft) s_blend = true, s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD, s_depth_mask = false;
                         const float now[4] = {-std::max(s_mane_length, 0.001f), s_tail_length, soft ? s_fur_density : -s_fur_density, clock};
@@ -4773,6 +4959,8 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                             [s_pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:strands.count indexType:MTLIndexTypeUInt32 indexBuffer:strands.indices indexBufferOffset:0];
                         s_shell_draws++;
                     }
+                    if (s_dyn_shadows) record_strand_caster(*fp, strands, 1, s_mane_length, s_tail_length, s_drift_now);
+                    memset(s_drift_now, 0, sizeof s_drift_now);
                     memcpy(s_attribs, attribs, sizeof attribs);
                     s_depth_mask = depth_mask;
                     s_cull = cull, s_blend = was_blend, s_blend_src = src, s_blend_dst = dst, s_blend_eq = eq;

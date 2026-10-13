@@ -700,13 +700,20 @@ bool add_shell_push(std::string &vs)
                  "    wbm_c = dot(wbm_c, wbm_c) > 0.0004 ? normalize(wbm_c) : wbm_down;\n"
                  "    vec3 wbm_out = wbm_tail > 0.5 ? normalize(normalize(wbm_m * vec3(0.0, -0.12, -1.0)) + wbm_n * 0.12) : normalize(normalize(wbm_m * (wbm_far > 0.5 ? vec3(wbm_fall * 0.25, 1.0, 0.0) : vec3(wbm_fall, (fract(wbm_chance * 5.7) - 0.5) * 0.9, 0.0))) * (0.3 + 0.35 * fract(wbm_chance * 3.1)) + wbm_n * 0.2 + wbm_down * 0.35);\n"
                  "    float wbm_len = (wbm_tail > 0.5 ? wbm_shell.y * (1.0 - 0.6 * wbm_far) : -wbm_shell.x * (1.0 - 0.45 * wbm_far)) * (wbm_tail > 0.5 ? 0.7 + 0.3 * wbm_chance : 0.45 + 0.55 * wbm_chance);\n"
-                 "    float wbm_k = wbm_tail > 0.5 ? 0.85 : 1.0;\n"
+                 "    float wbm_k = (wbm_tail > 0.5 ? 0.85 : 1.0) * (1.0 - 0.9 * min(length(wbm_drift.xyz), 1.0));\n" // streaming behind, it does not hang as well
                  "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
-                 "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
+                 "    vec3 wbm_off = wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
                  // They swing a little, each out of step with the next, the tips most; the tail more than the mane.
                  "    float wbm_time = wbm_shell.w - 1.0, wbm_place = dot(inPosition, vec3(5.0, 3.0, 2.0));\n"
                  "    vec3 wbm_blow = vec3(sin(wbm_time * 1.9 + wbm_place + wbm_chance * 2.0) + 0.4 * sin(wbm_time * 4.7 + wbm_chance * 40.0), cos(wbm_time * 1.4 + wbm_place * 1.3 + wbm_chance * 2.0) + 0.4 * cos(wbm_time * 3.9 + wbm_chance * 31.0), 0.0);\n"
-                 "    $1.xyz += (wbm_blow * mat3(matWorld)) * ((wbm_tail > 0.5 ? 0.05 : 0.08) * wbm_len * wbm_t * wbm_t);\n"
+                 "    wbm_off += (wbm_blow * mat3(matWorld)) * ((wbm_tail > 0.5 ? 0.05 : 0.08) * wbm_len * wbm_t * wbm_t);\n"
+                 // Left behind a little when the horse moves off (see drift_of in the backend).
+                 "    vec3 wbm_trail = (wbm_drift.xyz * mat3(matWorld)) * wbm_len;\n"
+                 "    wbm_off += wbm_trail * (wbm_t * wbm_t);\n"
+                 // However it is blown about, a strand is no longer than it is.
+                 "    wbm_off *= min(1.0, wbm_len * wbm_t / max(length(wbm_off), 1e-6));\n"
+                 "    $1.xyz += wbm_off;\n"
+                 "    wbm_dir = normalize(wbm_dir * wbm_len + wbm_trail * (2.0 * wbm_t));\n"
                  "    vec3 wbm_eye = " + eye + ";\n"
                  "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
                  "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
@@ -808,15 +815,17 @@ bool add_hair_strands(std::string &glsl, bool vertex)
                               "    vec3 wbm_n = normalize(inNormal), wbm_down = normalize(vec3(0.0, 0.0, -1.0) * mat3(matWorld));\n"
                               "    vec3 wbm_c = dot(inBinormal, inBinormal) > 0.0004 ? normalize(inBinormal) : wbm_down;\n"
                               "    vec3 wbm_out = normalize(wbm_c + wbm_n * (fract(wbm_chance * 3.1) > 0.95 ? 0.45 : 0.02 + 0.14 * fract(wbm_chance * 3.1)));\n"
-                              "    float wbm_len = -wbm_shell.x * inColor0.z * (0.4 + 0.6 * wbm_chance), wbm_k = 0.4;\n"
+                              "    float wbm_len = -wbm_shell.x * inColor0.z * (0.4 + 0.6 * wbm_chance), wbm_k = 0.4 * (1.0 - 0.9 * min(length(wbm_drift.xyz), 1.0));\n"
                               "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
-                              "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
+                              "    vec3 wbm_off = wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
                               // The wind: gusts that pass over the head, each strand a little out of step, the tip moving most.
                               "    float wbm_time = wbm_shell.w - 1.0, wbm_place = dot(inPosition, vec3(7.0, 5.0, 3.0));\n"
                               "    vec3 wbm_blow = vec3(sin(wbm_time * 2.3 + wbm_place + wbm_chance * 2.0) + 0.5 * sin(wbm_time * 5.1 + wbm_chance * 40.0), cos(wbm_time * 1.7 + wbm_place * 1.3 + wbm_chance * 2.0) + 0.5 * cos(wbm_time * 4.3 + wbm_chance * 31.0), 0.0);\n"
                               "    vec3 wbm_sway = (wbm_blow * mat3(matWorld)) * (0.16 * wbm_shell.y * wbm_len * wbm_t * wbm_t);\n"
-                              "    $1.xyz += wbm_sway;\n"
-                              "    wbm_dir = normalize(wbm_dir * wbm_len + wbm_sway * 2.0);\n"
+                              "    wbm_off += wbm_sway + (wbm_drift.xyz * mat3(matWorld)) * (wbm_len * wbm_t * wbm_t);\n"
+                              "    wbm_off *= min(1.0, wbm_len * wbm_t / max(length(wbm_off), 1e-6));\n"
+                              "    $1.xyz += wbm_off;\n"
+                              "    wbm_dir = normalize(wbm_dir * wbm_len + wbm_sway * 2.0 + (wbm_drift.xyz * mat3(matWorld)) * (2.0 * wbm_len * wbm_t));\n"
                               "    vec3 wbm_eye = (vCameraPos.xyz - matWorld[3].xyz) * mat3(matWorld) - $1.xyz;\n"
                               "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
                               "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
@@ -1614,11 +1623,11 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (!vertex && (fur || hair_strands)) out << k_strand_function;
     if (fur) out << k_fur_function;
     if (hair_strands && !vertex) out << k_people_hair_function;
-    if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\n" : "");
+    if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\nuniform vec4 wbm_drift;\n" : "");
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
     if (shell_push) out << "uniform vec4 wbm_shell;\n";
-    if (shell_push && glsl.find("wbm_colour = ") != std::string::npos) out << "vec4 wbm_colour;\n";
+    if (shell_push && glsl.find("wbm_colour = ") != std::string::npos) out << "vec4 wbm_colour;\nuniform vec4 wbm_drift;\n";
     if (skin && vertex) out << k_skin_vertex_function;
     if (skin && !vertex) { // with the materials debug view, skin that scatters is painted red
         std::string f = k_skin_function;
