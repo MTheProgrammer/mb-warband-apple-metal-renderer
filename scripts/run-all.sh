@@ -22,9 +22,11 @@ export WBM_MATERIALS=${WBM_MATERIALS:-1}        # metalness and roughness by mat
 export WBM_WIND=${WBM_WIND:-1}                  # trees, bushes and grass sway (a strength; 0 for none)
 export WBM_FOLIAGE=${WBM_FOLIAGE:-0.6}          # sunlight through leaves seen from their far side
 export WBM_FUR=${WBM_FUR:-1}                    # a soft, velvety coat on horses (needs coat maps: build/texture_tool pbr)
-export WBM_FUR_SHELLS=${WBM_FUR_SHELLS:-12}     # layers of fur on horses within a few metres, and long hair where a hair map says (0: none)
-export WBM_HAIR_STRANDS=${WBM_HAIR_STRANDS:-1} # mane and tail as strands in place of layers (0: layers)
-export WBM_PEOPLE_HAIR=${WBM_PEOPLE_HAIR:-1}   # loose strands over the hair and beards of people within a few metres
+# Hair is the costliest of all, so it is off here; set these to have it:
+#   WBM_FUR_SHELLS=12 WBM_HAIR_STRANDS=1 WBM_PEOPLE_HAIR=1 scripts/run-all.sh
+export WBM_FUR_SHELLS=${WBM_FUR_SHELLS:-0}      # layers of fur on horses within a few metres (12 is a good number; 0: none)
+export WBM_HAIR_STRANDS=${WBM_HAIR_STRANDS:-0} # mane and tail as strands (needs WBM_FUR_SHELLS above 0; 0: none)
+export WBM_PEOPLE_HAIR=${WBM_PEOPLE_HAIR:-0}   # loose strands over the hair and beards of people within a few metres (1: on)
 export WBM_PARALLAX=${WBM_PARALLAX:-0.05}     # stones stand out from their joints on walls and buildings nearby (0: none)
 export WBM_WATER=${WBM_WATER:-1}                # sun glitter, paler shallows and shore foam on water
 export WBM_EYES=${WBM_EYES:-1}                  # a highlight and a reflection in the eyes of faces
