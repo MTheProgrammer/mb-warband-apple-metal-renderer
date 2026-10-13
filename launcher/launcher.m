@@ -21,6 +21,7 @@ typedef NS_ENUM(int, Kind) { kToggle, kSlider, kChoice };
 // An option. `everything`, `fast` and `plain` are its values in the three
 // presets; an empty value leaves the variable unset. For a choice, `choices`
 // is "value=label|value=label"; for a toggle, on is `everything` (or "1").
+// A fourth preset is made from the first (see preset_value).
 typedef struct {
     const char *group, *env, *title, *help;
     Kind kind;
@@ -67,7 +68,8 @@ static const Option k_options[] = {
     {"Speed", "WBM_MENU_FPS", "Limit in menus", "The same for menus and loading screens.", kChoice, "", "60", "", "=The game's own|60=60|30=30", 0, 0, 0},
 };
 static const int k_option_count = sizeof k_options / sizeof k_options[0];
-static NSString *const k_presets[] = {@"Everything on", @"Faster", @"As the game looks"};
+static NSString *const k_presets[] = {@"Everything on", @"Faster", @"Everything but hair", @"As the game looks"};
+static const int k_preset_count = 4;
 
 static NSString *S(const char *s) { return s ? @(s) : @""; }
 
@@ -78,7 +80,15 @@ static NSString *module_file(void) { return [NSHomeDirectory() stringByAppending
 static NSString *binary_in(NSString *game) { return [game stringByAppendingPathComponent:@"Mount and Blade.app/Contents/MacOS/Mount and Blade"]; }
 static BOOL is_game(NSString *game) { return game.length && [[NSFileManager defaultManager] isExecutableFileAtPath:binary_in(game)]; }
 
-static NSString *preset_value(const Option *o, int preset) { return S(preset == 0 ? o->everything : preset == 1 ? o->fast : o->plain); }
+// "Everything but hair" is "Everything on" without the fur layers and the strands, which cost the most of all.
+static NSString *preset_value(const Option *o, int preset)
+{
+    if (preset == 2) {
+        if (!strcmp(o->env, "WBM_FUR_SHELLS") || !strcmp(o->env, "WBM_HAIR_STRANDS") || !strcmp(o->env, "WBM_PEOPLE_HAIR")) return @"0";
+        return S(o->everything);
+    }
+    return S(preset == 0 ? o->everything : preset == 1 ? o->fast : o->plain);
+}
 
 // WBM_GAME, then the Steam default, then the folder chosen on an earlier run.
 static NSString *find_game(void)
@@ -132,7 +142,7 @@ static NSString *find_game(void)
 
 - (int)matchingPreset
 {
-    for (int p = 0; p < 3; p++) {
+    for (int p = 0; p < k_preset_count; p++) {
         BOOL same = YES;
         for (int i = 0; i < k_option_count && same; i++) {
             NSString *have = self.values[S(k_options[i].env)], *want = preset_value(&k_options[i], p);
@@ -163,7 +173,7 @@ static NSString *find_game(void)
         control.enabled = getenv(o->env) == NULL; // set from outside: not the window's to change
     }
     int preset = [self matchingPreset];
-    [self.presets selectItemAtIndex:preset < 0 ? 3 : preset];
+    [self.presets selectItemAtIndex:preset < 0 ? k_preset_count : preset];
     self.gameLabel.stringValue = self.game ? [self.game stringByAbbreviatingWithTildeInPath] : @"Not found: choose the \"MountBlade Warband\" folder";
     self.skip.state = [self.values[@"_skip"] isEqualToString:@"1"] ? NSControlStateValueOn : NSControlStateValueOff;
 }
@@ -182,7 +192,7 @@ static NSString *find_game(void)
 - (void)presetChosen:(NSPopUpButton *)sender
 {
     NSInteger p = sender.indexOfSelectedItem;
-    if (p >= 0 && p < 3)
+    if (p >= 0 && p < k_preset_count)
         for (int i = 0; i < k_option_count; i++) self.values[S(k_options[i].env)] = preset_value(&k_options[i], (int)p);
     [self refresh];
 }
@@ -351,7 +361,7 @@ static NSString *find_game(void)
 
     // Above the list: the presets. Below it: the game, the module, and the button.
     self.presets = [NSPopUpButton new];
-    for (int p = 0; p < 3; p++) [self.presets addItemWithTitle:k_presets[p]];
+    for (int p = 0; p < k_preset_count; p++) [self.presets addItemWithTitle:k_presets[p]];
     [self.presets addItemWithTitle:@"My own choice"];
     self.presets.target = self, self.presets.action = @selector(presetChosen:);
     NSStackView *top = [NSStackView stackViewWithViews:@[[self label:@"Settings:" small:NO], self.presets]];
