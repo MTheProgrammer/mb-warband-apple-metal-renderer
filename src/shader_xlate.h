@@ -122,6 +122,10 @@ struct XlOptions {
     // In the same shader: let the brightest parts of the image exceed display
     // white, for an extended-range (HDR) drawable. Adds the wbm_headroom uniform.
     bool hdr_output = false;
+    // Colour grading in the final shader, after the tone map: contrast,
+    // saturation and warmth, from the wbm_grade uniform (x, y, z; each 0 for
+    // no change; w is spare).
+    bool grade = false;
 };
 
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space

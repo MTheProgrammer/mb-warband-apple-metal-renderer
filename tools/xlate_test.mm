@@ -51,7 +51,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-e")) options.pbr_environment = true;
         if (!strcmp(argv[i], "-k")) options.pbr_sky = true;
         if (!strcmp(argv[i], "-t")) options.filmic_tonemap = true;
-        if (!strcmp(argv[i], "-r")) options.hdr_output = true;
+        if (!strcmp(argv[i], "-r")) options.hdr_output = options.grade = true;
         if (!strcmp(argv[i], "-g")) options.srgb_textures = true;
         if (!strcmp(argv[i], "-d") && i + 1 < argc) dump = atoi(argv[++i]);
     }

@@ -158,6 +158,7 @@ struct Program {
     int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
+    int grade_offset = -1;    // fragment stage, wbm_grade
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
     int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
@@ -309,6 +310,7 @@ LastPass s_last;
 // thread and handed to the final shader.
 bool s_hdr;
 float s_hdr_peak = 4.0f; // WBM_HDR_PEAK: the most headroom to use
+float s_grade[4];        // WBM_CONTRAST, WBM_SATURATION, WBM_WARMTH: each about -1 to 1, 0 for no change
 std::atomic<float> s_headroom{1.0f};
 NSWindow *s_window;
 float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macOS 26 and later)
@@ -1062,7 +1064,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
+    p.yflip_offset = p.samples_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -1125,6 +1127,7 @@ void link_program(GLuint program_id, Program &p)
             if (u.name == k_xl_yflip_uniform) p.yflip_offset = u.offset;
             else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
+            else if (u.name == "wbm_grade" && s == 1) p.grade_offset = u.offset;
             else if (u.name == k_xl_limit_uniform) p.limit_offset = u.offset;
             else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
             else if (u.name == k_xl_dyn_near_uniform) p.dyn_near_offset = u.offset;
@@ -3687,6 +3690,10 @@ bool prepare_draw()
         memcpy(p->uniform_data[1].data() + p->limit_offset, &limit, 4);
         p->uniform_dirty[1] = true;
     }
+    if (p->grade_offset >= 0 && memcmp(p->uniform_data[1].data() + p->grade_offset, s_grade, 16)) {
+        memcpy(p->uniform_data[1].data() + p->grade_offset, s_grade, 16);
+        p->uniform_dirty[1] = true;
+    }
     float headroom = s_headroom.load(std::memory_order_relaxed);
     if (p->headroom_offset >= 0 && memcmp(p->uniform_data[1].data() + p->headroom_offset, &headroom, 4)) {
         memcpy(p->uniform_data[1].data() + p->headroom_offset, &headroom, 4);
@@ -4026,6 +4033,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_hdr = s_shader_options.hdr_output = hdr_env && atoi(hdr_env) != 0;                  // off unless set
     s_shader_options.filmic_tonemap = tonemap_env && atoi(tonemap_env) != 0;              // off unless set
     if (const char *v = getenv("WBM_HDR_PEAK")) s_hdr_peak = std::max(1.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_CONTRAST")) s_grade[0] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
+    if (const char *v = getenv("WBM_SATURATION")) s_grade[1] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
+    if (const char *v = getenv("WBM_WARMTH")) s_grade[2] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
+    s_shader_options.grade = s_grade[0] != 0 || s_grade[1] != 0 || s_grade[2] != 0;
     if (const char *v = getenv("WBM_LOD_BIAS")) s_lod_bias = (float)atof(v);
     const char *ao_env = getenv("WBM_AO");
     s_ao = ao_env && atoi(ao_env) != 0; // off unless set

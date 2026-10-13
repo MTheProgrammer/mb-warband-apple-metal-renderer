@@ -62,6 +62,10 @@ static const Option k_options[] = {
     {"Picture", "WBM_MOTION_BLUR", "Motion blur", "Blur from the camera's own movement.", kToggle, "0", "0", "0", NULL, 0, 0, 0},
     {"Picture", "WBM_SHARPEN", "Sharpening", "0 for none. About 0.3 is plenty together with upscaling.", kSlider, "0", "0.3", "0", NULL, 0, 1, 0.05},
 
+    {"Picture", "WBM_CONTRAST", "Contrast", "Deeper darks and brighter lights, or flatter. 0 leaves the picture as it is.", kSlider, "0", "0", "0", NULL, -1, 1, 0.05},
+    {"Picture", "WBM_SATURATION", "Saturation", "Stronger or weaker colours. 0 leaves them as they are.", kSlider, "0", "0", "0", NULL, -1, 1, 0.05},
+    {"Picture", "WBM_WARMTH", "Warmth", "Towards warm (right) or cool (left). 0 leaves it as it is.", kSlider, "0", "0", "0", NULL, -1, 1, 0.05},
+
     {"Speed", "WBM_UPSCALE", "Draw smaller and enlarge", "The scene is drawn smaller and enlarged by MetalFX; the interface stays sharp.", kChoice, "", "0.67", "",
      "=Off|0.8=80% of the size|0.67=67% of the size|0.5=Half the size", 0, 0, 0},
     {"Speed", "WBM_MAX_FPS", "Frame rate limit", "Fewer frames means a cooler, quieter machine.", kChoice, "", "", "", "=The game's own|120=120|90=90|60=60|30=30", 0, 0, 0},

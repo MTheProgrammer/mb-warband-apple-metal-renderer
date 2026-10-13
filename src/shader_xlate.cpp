@@ -1551,6 +1551,22 @@ vec3 wbm_filmic(vec3 x)
     vec3 over = max(x - knee, vec3(0.0));
     return min(x, vec3(knee)) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
 }
+// Grading, on the picture as it will be shown (0 to 1): contrast is an
+// S-curve about middle grey, which leaves black and white where they are;
+// saturation moves each colour away from its own grey; warmth trades blue for
+// red. Each is 0 for no change, and about -1 to 1.
+uniform vec4 wbm_grade;
+vec3 wbm_graded(vec3 c)
+{
+    c = clamp(c, 0.0, 1.0);
+    vec3 curved = c * c * (3.0 - 2.0 * c);
+    vec3 flat_ = mix(c, vec3(0.5), 0.5);
+    c = wbm_grade.x >= 0.0 ? mix(c, curved, wbm_grade.x) : mix(c, flat_, -wbm_grade.x);
+    float grey = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = max(mix(vec3(grey), c, 1.0 + wbm_grade.y), vec3(0.0));
+    c *= vec3(1.0 + 0.12 * wbm_grade.z, 1.0, 1.0 - 0.12 * wbm_grade.z);
+    return c * (grey / max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4)); // warmth changes the colour, not the brightness
+}
 vec3 wbm_expand(vec3 c, float headroom)
 {
     vec3 g = clamp(c, 0.0, 1.0);
@@ -1570,6 +1586,7 @@ bool rewrite_final_pass(std::string &fs, const XlOptions &options)
     if (result != std::string(branch[1])) return false;
     std::string extra;
     if (options.filmic_tonemap) extra += result + " = wbm_filmic(" + exposed + ");\n  ";
+    if (options.grade) extra += result + " = wbm_graded(" + result + ");\n  ";
     if (options.hdr_output) extra += result + " = wbm_expand(" + result + ", " + k_xl_headroom_uniform + ");\n  ";
     fs.insert((size_t)enc.position(), extra);
     return true;
@@ -1639,7 +1656,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool shell_push = vertex && options.fur && add_shell_push(glsl);
     bool hair_strands = options.hair_strands && add_hair_strands(glsl, vertex);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
-    bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output) && rewrite_final_pass(glsl, options);
+    bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output || options.grade) && rewrite_final_pass(glsl, options);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
