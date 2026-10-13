@@ -800,7 +800,9 @@ vec4 wbm_people_hair(vec3 normal_, vec3 tangent_, vec3 view, vec3 to_sun, vec3 c
 //   where the water is shallow, the bed's light coming back up through it,
 //   pale and green, fading as it deepens;
 //   foam in a ragged band along the shore, broken up by the ripples.
-// The last two need the depth the engine's own fade is worked out from.
+// The last two need the depth the engine's own fade is worked out from, which
+// is a share of the far plane's distance: 1250 m in a battle, where 0.0008 is a metre.
+// The shallows fade over about half a metre of water, the foam lies where it is under 30 cm.
 bool add_water(std::string &fs)
 {
     static const std::regex sun(R"((\w+) = \(\(0\.01 \* clamp \(\s*dot \((normal_\d+), LightDir_Alpha\.xyz\)\s*, 0\.0, 1\.0\)\) \* LightDif\);)");
@@ -814,9 +816,9 @@ bool add_water(std::string &fs)
     if (std::regex_search(fs, m, deep) && std::string(m[1]) == out) {
         fs = std::regex_replace(fs, deep,
                                 "$&\n    float wbm_deep = max($2.x - Depth, 0.0);\n"
-                                "    " + out + ".xyz += vec3(0.035, 0.085, 0.07) * LightDif.xyz * exp(-wbm_deep * 900.0);\n"
+                                "    " + out + ".xyz += vec3(0.02, 0.05, 0.04) * LightDif.xyz * exp(-wbm_deep * 2500.0);\n"
                                 "    float wbm_ragged = texture2D(normal_texture, Tex0 * 2.7).y + 0.5 * texture2D(normal_texture, Tex0 * 7.3 + 0.37).w;\n"
-                                "    float wbm_foam = smoothstep(0.0016, 0.0003, wbm_deep) * smoothstep(0.55, 0.95, wbm_ragged) * step(1e-7, wbm_deep);\n"
+                                "    float wbm_foam = smoothstep(0.00028, 0.00006, wbm_deep) * smoothstep(0.45, 0.8, wbm_ragged) * step(1e-7, wbm_deep);\n"
                                 "    " + out + ".xyz = mix(" + out + ".xyz, LightDif.xyz * 0.55 + vec3(0.12), wbm_foam);\n"
                                 "    " + out + ".w = max(" + out + ".w, wbm_foam * 0.85);",
                                 std::regex_constants::format_first_only);

@@ -475,6 +475,10 @@ void preview_draw(bool prepass)
     s_depth_test = true, s_depth_mask = true, s_depth_func = GL_LEQUAL, s_cull = false, s_blend = false;
     for (PreviewPart &part : pv.parts) {
         if (prepass && part.material.shader.find("water") != std::string::npos) continue; // water is not in the engine's pre-pass: it asks it how deep the bed lies
+        // The engine blends water in and does not let it hide what is drawn later; so here, when asked (WBM_PREVIEW_BLEND=1).
+        bool blended = getenv("WBM_PREVIEW_BLEND") && part.material.shader.find("water") != std::string::npos;
+        s_blend = blended, s_depth_mask = !blended;
+        if (blended) s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD;
         GLuint id = part.program[prepass ? 1 : 0];
         Program *p = find(s_programs, id);
         if (!p) continue;
@@ -486,6 +490,16 @@ void preview_draw(bool prepass)
         preview_matrix(id, "matWaterWorldViewProj", world_view_projection);
         GLint location = mtl_glGetUniformLocation(id, "use_depth_effects");
         if (location >= 0) mtl_glUniform1i(location, pv.keep_scene ? 1 : 0);
+        // The pre-pass divides by the far plane's distance; the water multiplies by one over it.
+        auto far_clip = s_stage_uniforms.find("far_clip");
+        location = mtl_glGetUniformLocation(id, "far_clip_Inv");
+        if (location >= 0 && far_clip != s_stage_uniforms.end()) {
+            const std::vector<uint8_t> &raw = far_clip->second.has[0] ? far_clip->second.raw[0] : far_clip->second.raw[1];
+            float far_ = 0;
+            if (raw.size() >= 4) memcpy(&far_, raw.data(), 4);
+            if (far_ > 0) mtl_glUniform1f(location, 1.0f / far_);
+        }
+        preview_vector(id, "vDepthRT_HalfPixel_ViewportSizeInv", 0, 0, 0, 0);
         if (posed) {
             GLint bones = mtl_glGetUniformLocation(id, "matWorldArray");
             std::vector<float> values(32 * 16);
@@ -527,12 +541,13 @@ void preview_draw(bool prepass)
             }
             // Water asks how far off the bed under it is: that is in the picture of the engine's depth pre-pass.
             if (l.name == "depth_texture") {
-                for (auto &entry : s_textures)
-                    if (entry.second.screen_sized && entry.second.format == MTLPixelFormatR16Float && entry.second.mtl) {
-                        l.unit = 29;
-                        s_bound_texture[29] = entry.first;
-                        mine = true;
-                    }
+                for (auto &fb : s_framebuffers) { // the pre-pass's target: screen-sized, R16F, with a depth buffer of its own
+                    Texture *t = find(s_textures, fb.second.color_texture);
+                    if (!t || !t->screen_sized || t->format != MTLPixelFormatR16Float || !t->mtl || !(fb.second.depth_renderbuffer || fb.second.depth_texture)) continue;
+                    l.unit = 29;
+                    s_bound_texture[29] = fb.second.color_texture;
+                    mine = true;
+                }
             }
             if (mine || !stand_in) continue;
             auto there = stand_in->location_by_name.find(l.name);
