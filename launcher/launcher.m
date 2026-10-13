@@ -74,6 +74,9 @@ static const Option k_options[] = {
      "=Off|0.8=80% of the size|0.67=67% of the size|0.5=Half the size", 0, 0, 0},
     {"Speed", "WBM_MAX_FPS", "Frame rate limit", "Fewer frames means a cooler, quieter machine.", kChoice, "", "", "", "=The game's own|120=120|90=90|60=60|30=30", 0, 0, 0},
     {"Speed", "WBM_MENU_FPS", "Limit in menus", "The same for menus and loading screens.", kChoice, "", "60", "", "=The game's own|60=60|30=30", 0, 0, 0},
+
+    // Not one of the library's variables (the name begins with "_"): a line of the game's own rgl_config.txt, and no part of the presets.
+    {"Game", "_edit_mode", "Edit mode", "The game's own scene editor and free camera: Ctrl+E in a scene.", kToggle, "1", "", "", NULL, 0, 0, 0},
 };
 static const int k_option_count = sizeof k_options / sizeof k_options[0];
 static NSString *const k_presets[] = {@"Everything on", @"Everything but hair", @"Faster", @"As the game looks"};
@@ -89,6 +92,37 @@ static NSString *binary_in(NSString *game) { return [game stringByAppendingPathC
 static BOOL is_game(NSString *game) { return game.length && [[NSFileManager defaultManager] isExecutableFileAtPath:binary_in(game)]; }
 
 // "Everything but hair" is "Everything on" without the fur layers and the strands, which cost the most of all.
+static BOOL is_game_setting(const Option *o) { return o->env[0] == '_'; }
+static NSString *game_config(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/MBWarband/rgl_config.txt"]; }
+
+// A line "key = value" of the game's rgl_config.txt: read (nil when there is none), and rewritten in place.
+static NSString *config_value(NSString *key)
+{
+    NSString *text = [NSString stringWithContentsOfFile:game_config() encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> *parts = [line componentsSeparatedByString:@"="];
+        if (parts.count == 2 && [[parts[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] isEqualToString:key])
+            return [parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
+    return nil;
+}
+
+static void set_config_value(NSString *key, NSString *value)
+{
+    NSString *text = [NSString stringWithContentsOfFile:game_config() encoding:NSUTF8StringEncoding error:nil];
+    if (!text) return; // the game has not been run yet: it writes the file itself
+    NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        NSArray<NSString *> *parts = [lines[i] componentsSeparatedByString:@"="];
+        if (parts.count == 2 && [[parts[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] isEqualToString:key]) {
+            if ([[parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] isEqualToString:value]) return;
+            lines[i] = [NSString stringWithFormat:@"%@ = %@", key, value];
+            [[lines componentsJoinedByString:@"\n"] writeToFile:game_config() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+    }
+}
+
 static NSString *preset_value(const Option *o, int preset)
 {
     if (preset == 1) {
@@ -128,6 +162,7 @@ static NSString *find_game(void)
     NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:settings_path()];
     for (NSString *key in saved)
         if ([saved[key] isKindOfClass:NSString.class]) self.values[key] = saved[key];
+    self.values[@"_edit_mode"] = [config_value(@"enable_edit_mode") isEqualToString:@"1"] ? @"1" : @"0"; // as the game has it now
 }
 
 - (void)save
@@ -142,7 +177,7 @@ static NSString *find_game(void)
     NSMutableDictionary *env = [NSMutableDictionary dictionary];
     for (int i = 0; i < k_option_count; i++) {
         NSString *name = S(k_options[i].env), *value = self.values[name];
-        if (getenv(k_options[i].env) || !value.length) continue;
+        if (is_game_setting(&k_options[i]) || getenv(k_options[i].env) || !value.length) continue;
         env[name] = value;
     }
     return env;
@@ -153,6 +188,7 @@ static NSString *find_game(void)
     for (int p = 0; p < k_preset_count; p++) {
         BOOL same = YES;
         for (int i = 0; i < k_option_count && same; i++) {
+            if (is_game_setting(&k_options[i])) continue;
             NSString *have = self.values[S(k_options[i].env)], *want = preset_value(&k_options[i], p);
             same = k_options[i].kind == kSlider ? fabs(have.doubleValue - want.doubleValue) < 1e-6 : [have isEqualToString:want];
         }
@@ -201,7 +237,8 @@ static NSString *find_game(void)
 {
     NSInteger p = sender.indexOfSelectedItem;
     if (p >= 0 && p < k_preset_count)
-        for (int i = 0; i < k_option_count; i++) self.values[S(k_options[i].env)] = preset_value(&k_options[i], (int)p);
+        for (int i = 0; i < k_option_count; i++)
+            if (!is_game_setting(&k_options[i])) self.values[S(k_options[i].env)] = preset_value(&k_options[i], (int)p);
     [self refresh];
 }
 
@@ -263,6 +300,7 @@ static NSString *find_game(void)
         return;
     }
     [self save];
+    set_config_value(@"enable_edit_mode", [self.values[@"_edit_mode"] isEqualToString:@"1"] ? @"1" : @"0");
     NSString *module = self.modules.titleOfSelectedItem;
     if (module.length && !getenv("WBM_MODULE")) { // the game reads the module's name from this file
         [[NSFileManager defaultManager] createDirectoryAtPath:module_file().stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
@@ -436,6 +474,7 @@ static NSString *find_game(void)
         NSDictionary<NSString *, NSString *> *env = [self environment];
         for (NSString *name in [env.allKeys sortedArrayUsingSelector:@selector(compare:)]) printf("%s=%s\n", name.UTF8String, env[name].UTF8String);
         printf("game: %s\n", self.game ? self.game.UTF8String : "not found");
+        printf("edit mode: %s\n", [self.values[@"_edit_mode"] isEqualToString:@"1"] ? "on" : "off");
         exit(0);
     }
     NSUInteger snapshot = [args indexOfObject:@"--snapshot"];

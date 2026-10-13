@@ -28,7 +28,7 @@ You do not need to compile anything. A ready-made app is on the Releases page.
 
    **Without Terminal.** Double-click the app and close the warning. Open System Settings → Privacy & Security, scroll down to Security, and click "Open Anyway" next to the message about Warband Metal. Confirm with your password or Touch ID, then open the app again. This route has not been verified; if the game still does not start afterwards, use the Terminal command.
 
-3. Double-click `Warband Metal.app`. A window opens with the renderer's options, grouped and explained, four ready-made settings ("Everything on", "Everything but hair", "Faster", "As the game looks"), the module to play, and a Play button, which starts the game on Metal. The choices are remembered; a checkbox makes the app start the game at once from then on (hold Option while opening it to get the window back). If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once and remembers it.
+3. Double-click `Warband Metal.app`. A window opens with the renderer's options, grouped and explained, four ready-made settings ("Everything on", "Everything but hair", "Faster", "As the game looks"), the module to play, and a Play button, which starts the game on Metal. An "Edit mode" switch at the end of the list sets `enable_edit_mode` in the game's own `rgl_config.txt` when Play is pressed (the game's scene editor and free camera, Ctrl+E in a scene). The choices are remembered; a checkbox makes the app start the game at once from then on (hold Option while opening it to get the window back). If the game is not in the default Steam library, it asks for the "MountBlade Warband" folder once and remembers it.
 
 You can keep the app anywhere, for example in Applications.
 
