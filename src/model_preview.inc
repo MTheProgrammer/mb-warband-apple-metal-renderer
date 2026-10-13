@@ -151,6 +151,10 @@ GLuint preview_texture(const std::string &texture_name)
             std::string candidate = pv.root + folder + name + ".dds";
             if (path.empty() && access(candidate.c_str(), R_OK) == 0) path = candidate;
         }
+        for (const char *folder : {"/TexturesHD/", "/Textures/"}) { // an animated texture is a run of files: the first will do
+            std::string candidate = pv.root + folder + name + "_0.dds";
+            if (path.empty() && access(candidate.c_str(), R_OK) == 0) path = candidate;
+        }
         GLuint id = 0;
         if (!path.empty()) {
             id = pv.next_id++;
@@ -245,6 +249,8 @@ bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
     part.normal = preview_texture(part.material.normal);
     part.specular = preview_texture(part.material.specular);
     part.environment = preview_texture(part.material.environment);
+    // Water reflects a picture of the scene that the engine draws for it; here its own texture stands in.
+    if (!part.environment && part.material.shader.find("water") != std::string::npos) part.environment = part.diffuse;
 
     // The material's shader names a technique; the game's shader files are named
     // after techniques, with a suffix for the variant in use. Shadowed, and
@@ -458,6 +464,9 @@ void preview_draw(bool prepass)
         preview_matrix(id, "matWorldView", world_view);
         preview_matrix(id, "matWorldViewProj", world_view_projection);
         preview_matrix(id, "matViewProj", view_projection);
+        preview_matrix(id, "matWaterWorldViewProj", world_view_projection);
+        GLint location = mtl_glGetUniformLocation(id, "use_depth_effects");
+        if (location >= 0) mtl_glUniform1i(location, pv.keep_scene ? 1 : 0);
         if (posed) {
             GLint bones = mtl_glGetUniformLocation(id, "matWorldArray");
             std::vector<float> values(32 * 16);
@@ -469,7 +478,7 @@ void preview_draw(bool prepass)
         preview_vector(id, "vCameraPos", eye[0], eye[1], eye[2], 0);
         preview_vector(id, "vMaterialColor", 1, 1, 1, 1);
         preview_vector(id, "vSpecularColor", part.material.specular_colour[0], part.material.specular_colour[1], part.material.specular_colour[2], 1);
-        GLint location = mtl_glGetUniformLocation(id, "fMaterialPower");
+        location = mtl_glGetUniformLocation(id, "fMaterialPower");
         if (location >= 0) mtl_glUniform1f(location, part.material.shininess);
         location = mtl_glGetUniformLocation(id, "alpha_test_val");
         if (location >= 0) mtl_glUniform1f(location, part.alpha_test);
@@ -496,6 +505,15 @@ void preview_draw(bool prepass)
                 l.unit = 30;
                 s_bound_texture[30] = 0; // nothing bound reads as white: nothing nearer the sun
                 continue;
+            }
+            // Water asks how far off the bed under it is: that is in the picture of the engine's depth pre-pass.
+            if (l.name == "depth_texture") {
+                for (auto &entry : s_textures)
+                    if (entry.second.screen_sized && entry.second.format == MTLPixelFormatR16Float && entry.second.mtl) {
+                        l.unit = 29;
+                        s_bound_texture[29] = entry.first;
+                        mine = true;
+                    }
             }
             if (mine || !stand_in) continue;
             auto there = stand_in->location_by_name.find(l.name);
