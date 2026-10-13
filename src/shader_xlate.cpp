@@ -793,6 +793,43 @@ vec4 wbm_people_hair(vec3 normal_, vec3 tangent_, vec3 view, vec3 to_sun, vec3 c
 }
 )";
 
+// Water. The engine's water reflects a picture of the surroundings by how
+// steeply it is seen, and fades out where the bed is near. It takes next to
+// nothing from the sun (a hundredth of its light). Added here:
+//   the sun's glitter, a sharp highlight off each ripple of the normal map;
+//   where the water is shallow, the bed's light coming back up through it,
+//   pale and green, fading as it deepens;
+//   foam in a ragged band along the shore, broken up by the ripples.
+// The last two need the depth the engine's own fade is worked out from.
+bool add_water(std::string &fs)
+{
+    static const std::regex sun(R"((\w+) = \(\(0\.01 \* clamp \(\s*dot \((normal_\d+), LightDir_Alpha\.xyz\)\s*, 0\.0, 1\.0\)\) \* LightDif\);)");
+    static const std::regex deep(R"((\w+)\.w = \(\1\.w \+ clamp \(\(\s*\((tmpvar_\d+)\.x - Depth\)\s*\* 32\.0\), 0\.0, 1\.0\)\);)");
+    static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
+    std::smatch m;
+    if (fs.find("varying vec4 LightDir_Alpha;") == std::string::npos || fs.find("varying vec3 CameraDir;") == std::string::npos || fs.find("varying vec4 LightDif;") == std::string::npos ||
+        !std::regex_search(fs, m, sun) || !std::regex_search(fs, encode))
+        return false;
+    const std::string out = m[1], normal = m[2];
+    if (std::regex_search(fs, m, deep) && std::string(m[1]) == out) {
+        fs = std::regex_replace(fs, deep,
+                                "$&\n    float wbm_deep = max($2.x - Depth, 0.0);\n"
+                                "    " + out + ".xyz += vec3(0.035, 0.085, 0.07) * LightDif.xyz * exp(-wbm_deep * 900.0);\n"
+                                "    float wbm_ragged = texture2D(normal_texture, Tex0 * 2.7).y + 0.5 * texture2D(normal_texture, Tex0 * 7.3 + 0.37).w;\n"
+                                "    float wbm_foam = smoothstep(0.0016, 0.0003, wbm_deep) * smoothstep(0.55, 0.95, wbm_ragged) * step(1e-7, wbm_deep);\n"
+                                "    " + out + ".xyz = mix(" + out + ".xyz, LightDif.xyz * 0.55 + vec3(0.12), wbm_foam);\n"
+                                "    " + out + ".w = max(" + out + ".w, wbm_foam * 0.85);",
+                                std::regex_constants::format_first_only);
+    }
+    fs = std::regex_replace(fs, encode,
+                            "{\n    vec3 wbm_h = normalize(normalize(LightDir_Alpha.xyz) + normalize(CameraDir));\n"
+                            "    float wbm_glint = pow(clamp(dot(normalize(" + normal + "), wbm_h), 0.0, 1.0), 260.0);\n"
+                            "    " + out + ".xyz += LightDif.xyz * (2.5 * wbm_glint * step(0.0, LightDir_Alpha.z));\n"
+                            "    " + out + ".w = max(" + out + ".w, clamp(wbm_glint, 0.0, 1.0) * LightDir_Alpha.w);\n  }\n  $&",
+                            std::regex_constants::format_first_only);
+    return true;
+}
+
 // People's hair as strands. The engine's hair shader draws a rigid mesh whose
 // binormal is the way the hair runs. For characters near the camera the backend
 // draws ribbons over it (build_strands), all of whose vertices sit at a root on
@@ -1655,6 +1692,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool wind = vertex && options.wind && add_wind(glsl);
     bool shell_push = vertex && options.fur && add_shell_push(glsl);
     bool hair_strands = options.hair_strands && add_hair_strands(glsl, vertex);
+    if (!vertex && options.water) add_water(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output || options.grade) && rewrite_final_pass(glsl, options);
 

@@ -4083,6 +4083,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     s_shader_options.hair_strands = s_people_hair;
+    if (const char *v = getenv("WBM_WATER")) s_shader_options.water = atoi(v) != 0;
     if (const char *v = getenv("WBM_EYES_MOVE")) s_gaze_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FOLIAGE")) s_foliage_backlight = std::max(0.0f, (float)atof(v));

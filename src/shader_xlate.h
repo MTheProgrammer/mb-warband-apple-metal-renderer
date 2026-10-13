@@ -101,6 +101,10 @@ struct XlOptions {
     // ribbons the backend draws over the hair mesh of characters near the
     // camera (see add_hair_strands). Adds the wbm_shell uniform to both stages.
     bool hair_strands = false;
+    // Water: the engine's water shaders get the sun's glitter on the waves,
+    // a paler, greener colour where the water is shallow, and foam along the
+    // shore (the last two where the game's depth effects are on).
+    bool water = false;
     // Eyes that catch the light: faces have their eyes painted on, at the same
     // place in every face texture, since all heads share one layout. There the
     // engine's skin shader gets a small sharp highlight from the sun and a
