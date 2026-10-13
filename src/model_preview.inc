@@ -32,6 +32,7 @@ struct Preview {
     const BrfSkeleton *skeleton = nullptr;
     std::string action;
     double from = 0, to = 0, seconds = 1, held = -1; // held: a fixed place in the action, 0 to 1, or below 0 to let it run
+    GLuint prepass_texture = 0; // the target of the engine's depth pre-pass in the frame being played
     int most_bones = 0;   // one more than the highest bone any vertex of the model hangs on
     std::string material; // when set, used in place of the one the mesh names (heads name none: the game picks a face's by its own rules)
     std::vector<PreviewPart> parts;
@@ -423,6 +424,8 @@ void preview_draw(bool prepass)
     Preview &pv = s_preview;
     Replay &rp = s_replay;
     if (!pv.active || !rp.camera_known) return;
+    if (prepass)
+        if (Framebuffer *fb = find(s_framebuffers, s_fbo)) pv.prepass_texture = fb->color_texture;
 
     // The model's own space is laid over the world's with its middle put a
     // little way ahead of the camera the frame was captured with.
@@ -541,11 +544,9 @@ void preview_draw(bool prepass)
             }
             // Water asks how far off the bed under it is: that is in the picture of the engine's depth pre-pass.
             if (l.name == "depth_texture") {
-                for (auto &fb : s_framebuffers) { // the pre-pass's target: screen-sized, R16F, with a depth buffer of its own
-                    Texture *t = find(s_textures, fb.second.color_texture);
-                    if (!t || !t->screen_sized || t->format != MTLPixelFormatR16Float || !t->mtl || !(fb.second.depth_renderbuffer || fb.second.depth_texture)) continue;
+                if (pv.prepass_texture) { // what the pre-pass of this frame was drawn into (noted in preview_draw)
                     l.unit = 29;
-                    s_bound_texture[29] = fb.second.color_texture;
+                    s_bound_texture[29] = pv.prepass_texture;
                     mine = true;
                 }
             }
