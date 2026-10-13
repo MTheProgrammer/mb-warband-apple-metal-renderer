@@ -703,6 +703,10 @@ bool add_shell_push(std::string &vs)
                  "    float wbm_k = wbm_tail > 0.5 ? 0.85 : 1.0;\n"
                  "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
                  "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
+                 // They swing a little, each out of step with the next, the tips most; the tail more than the mane.
+                 "    float wbm_time = wbm_shell.w - 1.0, wbm_place = dot(inPosition, vec3(5.0, 3.0, 2.0));\n"
+                 "    vec3 wbm_blow = vec3(sin(wbm_time * 1.9 + wbm_place + wbm_chance * 2.0) + 0.4 * sin(wbm_time * 4.7 + wbm_chance * 40.0), cos(wbm_time * 1.4 + wbm_place * 1.3 + wbm_chance * 2.0) + 0.4 * cos(wbm_time * 3.9 + wbm_chance * 31.0), 0.0);\n"
+                 "    $1.xyz += (wbm_blow * mat3(matWorld)) * ((wbm_tail > 0.5 ? 0.05 : 0.08) * wbm_len * wbm_t * wbm_t);\n"
                  "    vec3 wbm_eye = " + eye + ";\n"
                  "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
                  "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
@@ -718,6 +722,32 @@ bool add_shell_push(std::string &vs)
                             std::regex_constants::format_first_only);
     return true;
 }
+
+// How people's hair takes the light, after Marschner as the horses' manes do
+// (see wbm_fur_lit): a narrow white band off the strands' surface, shifted
+// towards the root; a wider band in the hair's colour from inside them,
+// shifted towards the tip and broken up from strand to strand; light coming
+// straight through when the sun is behind; and a broad sheen from the sky.
+// All vectors in the world's space; t runs along the hair. x, y, z: per unit
+// of sunlight; w: the sky's sheen, per unit of sky light.
+const char k_people_hair_function[] = R"(
+vec4 wbm_people_hair(vec3 normal_, vec3 tangent_, vec3 view, vec3 to_sun, vec3 colour, vec2 uv)
+{
+    vec3 n = normalize(normal_), t = normalize(tangent_), v = normalize(view), l = normalize(to_sun);
+    vec3 h = normalize(v + l);
+    float jitter = fract(sin(dot(floor(uv * vec2(700.0, 40.0)), vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    vec3 t_surface = normalize(t - n * 0.10), t_inside = normalize(t + n * (0.16 + 0.12 * jitter));
+    float a = dot(t_surface, h), b = dot(t_inside, h);
+    float off_surface = pow(sqrt(max(1.0 - a * a, 0.0)), 200.0), from_inside = pow(sqrt(max(1.0 - b * b, 0.0)), 32.0);
+    float bright = max(colour.x, max(colour.y, colour.z));
+    vec3 hue = mix(vec3(1.0), colour / max(bright, 0.02), 0.8) * mix(0.25, 1.0, smoothstep(0.05, 0.4, bright)); // dark hair swallows what goes into it
+    float lit_side = clamp(dot(n, l) * 0.7 + 0.5, 0.0, 1.0);
+    float through = pow(clamp(dot(-v, l), 0.0, 1.0), 7.0) * (1.0 - abs(dot(t, l)));
+    float c = dot(t, normalize(v + vec3(0.0, 0.0, 1.0)));
+    float sheen = pow(sqrt(max(1.0 - c * c, 0.0)), 14.0) * (0.25 + 0.75 * pow(1.0 - clamp(dot(v, n), 0.0, 1.0), 3.0));
+    return vec4(lit_side * (0.14 * off_surface + 0.30 * from_inside * hue) + 0.30 * through * hue, 0.12 * sheen);
+}
+)";
 
 // People's hair as strands. The engine's hair shader draws a rigid mesh whose
 // binormal is the way the hair runs. For characters near the camera the backend
@@ -735,7 +765,23 @@ bool add_hair_strands(std::string &glsl, bool vertex)
     if (body == std::string::npos) return false;
     if (!vertex) {
         static const std::regex result(R"(gl_FragColor = (\w+);)");
+        static const std::regex encode(R"((\w+)\.xyz = pow \(\1\.xyz, output_gamma_inv\.xyz\);)");
         if (glsl.find("0.800118") == std::string::npos || !std::regex_search(glsl, result)) return false;
+        // The engine's own two streaks of highlight make way for the bands above, on the mesh and on the strands alike.
+        std::smatch m;
+        std::string sun = std::regex_search(glsl, m, std::regex(R"(\bsun_amount_\d+\b)")) ? m.str() : "1.0";
+        std::string colour = std::regex_search(glsl, m, std::regex(R"(\bfinal_col_\d+\b)")) ? m.str() + ".xyz" : "vec3(0.5)";
+        if (std::regex_search(glsl, encode) && glsl.find("uniform vec4 vSunDir;") != std::string::npos && glsl.find("uniform vec4 vSunColor;") != std::string::npos &&
+            glsl.find("uniform vec4 vAmbientColor;") != std::string::npos) {
+            glsl = std::regex_replace(glsl, std::regex(R"(vec3\(0\.800118, 0\.88902, 0\.88902\))"), "vec3(0.2, 0.22, 0.22)");
+            glsl = std::regex_replace(glsl, std::regex(R"(vec3\(0\.7326, 0\.65934, 0\.7326\))"), "vec3(0.18, 0.16, 0.18)");
+            glsl = std::regex_replace(glsl, encode,
+                                      "vec4 wbm_shine = wbm_people_hair(normal, tangent, viewVec, -vSunDir.xyz, " + colour + ", Tex0);\n"
+                                      "  $1.xyz += wbm_shine.xyz * vSunColor.xyz * " + sun + " + wbm_shine.w * vAmbientColor.xyz;\n"
+                                      // Hair shades hair: a strand is darker at its root, down among the others, than at its tip.
+                                      "  if (wbm_shell.x < 0.0) $1.xyz *= mix(0.7, 1.0, wbm_strand.y);\n  $&",
+                                      std::regex_constants::format_first_only);
+        }
         // A strand has the texture's colour where it is rooted, in a tone of its
         // own; where the texture is clear there is no hair to root one in.
         glsl = std::regex_replace(glsl, result,
@@ -765,6 +811,12 @@ bool add_hair_strands(std::string &glsl, bool vertex)
                               "    float wbm_len = -wbm_shell.x * inColor0.z * (0.4 + 0.6 * wbm_chance), wbm_k = 0.4;\n"
                               "    vec3 wbm_dir = wbm_out * (1.0 - wbm_k * wbm_t) + wbm_down * (wbm_k * wbm_t);\n"
                               "    $1.xyz += wbm_len * (wbm_out * (wbm_t - 0.5 * wbm_k * wbm_t * wbm_t) + wbm_down * (0.5 * wbm_k * wbm_t * wbm_t));\n"
+                              // The wind: gusts that pass over the head, each strand a little out of step, the tip moving most.
+                              "    float wbm_time = wbm_shell.w - 1.0, wbm_place = dot(inPosition, vec3(7.0, 5.0, 3.0));\n"
+                              "    vec3 wbm_blow = vec3(sin(wbm_time * 2.3 + wbm_place + wbm_chance * 2.0) + 0.5 * sin(wbm_time * 5.1 + wbm_chance * 40.0), cos(wbm_time * 1.7 + wbm_place * 1.3 + wbm_chance * 2.0) + 0.5 * cos(wbm_time * 4.3 + wbm_chance * 31.0), 0.0);\n"
+                              "    vec3 wbm_sway = (wbm_blow * mat3(matWorld)) * (0.16 * wbm_shell.y * wbm_len * wbm_t * wbm_t);\n"
+                              "    $1.xyz += wbm_sway;\n"
+                              "    wbm_dir = normalize(wbm_dir * wbm_len + wbm_sway * 2.0);\n"
                               "    vec3 wbm_eye = (vCameraPos.xyz - matWorld[3].xyz) * mat3(matWorld) - $1.xyz;\n"
                               "    vec3 wbm_across = cross(wbm_dir, wbm_eye);\n"
                               "    wbm_across = dot(wbm_across, wbm_across) > 1e-12 ? normalize(wbm_across) : wbm_n;\n"
@@ -1561,6 +1613,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (eyes) out << k_eye_function;
     if (!vertex && (fur || hair_strands)) out << k_strand_function;
     if (fur) out << k_fur_function;
+    if (hair_strands && !vertex) out << k_people_hair_function;
     if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\n" : "");
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;

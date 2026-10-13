@@ -4733,7 +4733,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
                     for (int soft = 0; soft < 2; soft++) { // what is solid first, leaving depth; then the soft edges, blended, leaving none
                         s_blend = soft != 0, s_depth_mask = soft == 0;
                         if (soft) s_blend_src = GL_SRC_ALPHA, s_blend_dst = GL_ONE_MINUS_SRC_ALPHA, s_blend_eq = GL_FUNC_ADD;
-                        const float now[4] = {-s_people_hair_length, 0, soft ? 1.0f : -1.0f, clock};
+                        const float now[4] = {-s_people_hair_length, s_wind_strength, soft ? 1.0f : -1.0f, clock}; // y: how hard the wind blows
                         memcpy(s_shell_now, now, sizeof now);
                         if (prepare_draw())
                             [s_pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:strands.count indexType:MTLIndexTypeUInt32 indexBuffer:strands.indices indexBufferOffset:0];
