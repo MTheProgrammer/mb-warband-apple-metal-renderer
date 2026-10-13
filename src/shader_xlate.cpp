@@ -198,8 +198,14 @@ float wbm_dyn_cascade(vec3 coord, vec3 cdx, vec3 cdy, vec4 window, float column,
     float lit = 0.0;
     for (int i = 0; i < 12; i++) {
         vec2 o = rotate * wbm_dyn_disc[i] * radius;
-        vec2 t = clamp(q.xy + o / size, vec2(0.5 / size), vec2(1.0 - 0.5 / size)); // stay in this window's half
-        lit += textureLod(wbm_dyn_map, vec2((t.x + column) * 0.5, t.y), 0.0).x < q.z - bias + dot(slope, o) ? 0.0 : 1.0;
+        vec2 t = clamp(q.xy + o / size, vec2(1.0 / size), vec2(1.0 - 1.0 / size)); // stay in this window's half
+        // The four texels round the place are each asked and the answers blended by
+        // how near each is: seen close, where a texel covers many pixels, the
+        // shadow's edge is then a slope and not steps with a dither on them.
+        vec2 at = vec2((t.x + column) * 0.5, t.y);
+        vec2 f = fract(at * vec2(2.0 * size, size) - 0.5);
+        vec4 lights = step(vec4(q.z - bias + dot(slope, o)), textureGather(wbm_dyn_map, at, 0));
+        lit += mix(mix(lights.w, lights.z, f.x), mix(lights.x, lights.y, f.x), f.y);
     }
     return lit / 12.0;
 }
@@ -504,6 +510,9 @@ bool add_sky_ambient(std::string &glsl, bool vertex)
 // lighting for nothing.
 const char k_skin_function[] = R"(
 uniform vec4 wbm_skin;
+// How far behind the surface nearest the sun this point is, in the shadow
+// map's depth units (wbm_skin.y makes metres of it); below 0 when unknown.
+float wbm_skin_gap = -1.0;
 
 // mapped and smooth_: the cosine of the sun's angle to the normal-mapped
 // surface and to the smooth one.
@@ -511,7 +520,11 @@ vec3 wbm_skin_core(float mapped, float smooth_, float shadow)
 {
     // Where the light only grazes, a sharp shadow map draws the head's own
     // polygons on it as steps. Light there is nearly gone anyway; the shadow is let go.
-    shadow = mix(1.0, shadow, smoothstep(0.0, 0.3, smooth_));
+    // That is for the head's shadow on itself, which lies millimetres behind
+    // the lit surface. A shadow cast from farther off, a hat's brim over the
+    // eyes, stays: let go, it left lit patches inside the shadow.
+    float own = wbm_skin_gap >= 0.0 && wbm_skin.y > 0.0 ? 1.0 - smoothstep(0.012, 0.035, wbm_skin_gap * wbm_skin.y) : 1.0;
+    shadow = mix(shadow, mix(1.0, shadow, smoothstep(0.0, 0.3, smooth_)), own);
     const vec3 wrap = vec3(0.38, 0.16, 0.07);       // how far round each colour reaches
     const vec3 relief = vec3(0.25, 0.7, 1.0);       // how much of the normal map each colour sees
     vec3 facing = mix(vec3(smooth_), vec3(mapped), relief);
@@ -1629,6 +1642,11 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (shell_push) out << "uniform vec4 wbm_shell;\n";
     if (shell_push && glsl.find("wbm_colour = ") != std::string::npos) out << "vec4 wbm_colour;\nuniform vec4 wbm_drift;\n";
     if (skin && vertex) out << k_skin_vertex_function;
+    if (skin && !vertex && glsl.find("wbm_dynamic_shadow(") != std::string::npos && glsl.find("ShadowTexCoord") != std::string::npos) {
+        size_t body = glsl.find("void main ()");
+        if (body != std::string::npos) body = glsl.find('{', body);
+        if (body != std::string::npos) glsl.insert(body + 1, "\n  wbm_skin_gap = wbm_dyn_thickness(ShadowTexCoord.xyz);");
+    }
     if (skin && !vertex) { // with the materials debug view, skin that scatters is painted red
         std::string f = k_skin_function;
         if (options.debug_materials) f = std::regex_replace(f, std::regex("return lit \\* pow\\(vec3\\(shadow\\), vec3\\(0\\.7, 1\\.0, 1\\.25\\)\\);"), "return vec3(4.0, 0.0, 0.0);");
