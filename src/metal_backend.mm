@@ -2183,6 +2183,16 @@ fragment float4 velocity_fragment(VelocityOut in [[stage_in]])
     return float4(in.now.xy / in.now.w - in.before.xy / max(in.before.w, 1.0e-4), in.now.w, 1.0);
 }
 
+// How much of a thing's own movement is blurred. Far off, all of it. Near the
+// camera, where the player's own character is, only what is fast: a blade
+// swung, not the body that swings it or its legs as it runs. `extra` is the
+// movement over a frame, in clip space; the speeds are in screen heights to the exposure.
+static float own_share(float2 extra, float amount, Params p)
+{
+    float speed = length(extra * float2(p.size.x / p.size.y, 1.0)) * 0.5 * p.exposure;
+    return mix(smoothstep(0.012, 0.035, speed), 1.0, amount);
+}
+
 fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]], DepthTexture depth [[texture(1)]],
                               texture2d<float> objects [[texture(2)]], constant Params &p [[buffer(0)]])
 {
@@ -2203,7 +2213,10 @@ fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene 
         float inverse = dot(p.inverse_w, n);
         float distance = inverse > 1.0e-9 ? 1.0 / inverse : 1.0e9;
         float2 extra = o.xy - camera;
-        if (o.z > 0.0 && abs(o.z - distance) < 0.06 * distance + 0.15 && length(extra * p.size) > 3.0) moved += extra, own = 1.0;
+        if (o.z > 0.0 && abs(o.z - distance) < 0.06 * distance + 0.15 && length(extra * p.size) > 3.0) {
+            float keep = own_share(extra, amount, p);
+            moved += extra * keep, own = step(0.02, keep);
+        }
         if (own <= 0.0) {
             // Beside a moving thing that is nearer: its streak reaches over this pixel, if it is moving this way fast enough.
             float most = 0.0;
@@ -2216,7 +2229,10 @@ fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene 
                 float along = abs(dot(theirs, normalize(off)));
                 if (t.z > 0.0 && t.z < distance - 0.1 && along > reach && along > most) most = along, extra = t.xy - camera;
             }
-            if (most > 0.0) moved += extra, own = 1.0;
+            if (most > 0.0) {
+                float keep = own_share(extra, amount, p);
+                moved += extra * keep, own = step(0.02, keep);
+            }
         }
     }
     if (amount <= 0.0 && own <= 0.0) return centre;
