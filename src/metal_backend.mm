@@ -2099,7 +2099,7 @@ struct Params {
     float exposure;     // in frames
     float near_start, near_end; // distances between which the blur fades in
     float max_length;   // in screen heights
-    float pad;
+    float has_objects;  // 1 when the third texture holds this frame's moving objects (see render_object_velocities)
 };
 
 #if WBM_MSAA
@@ -2135,21 +2135,96 @@ static float blurred(float4 n, Params p)
     return smoothstep(p.near_start, p.near_end, distance);
 }
 
+// Things that move by themselves (a sword swung, a horse's legs) are drawn once
+// more into a small texture, each pixel holding how far it moved across the
+// screen since the last frame (x, y, in clip space) and how far off it is (z;
+// below 0 where nothing moving was drawn). See render_object_velocities.
+struct VelocityStatic {
+    float4x4 now, before; // object to clip space, this frame and the last
+};
+struct VelocitySkinned {
+    float4x4 now, before;
+    float4x4 bones_now[32], bones_before[32];
+};
+struct VelocityStaticIn {
+    float3 position [[attribute(0)]];
+};
+struct VelocitySkinnedIn {
+    float3 position [[attribute(0)]];
+    float4 weights [[attribute(7)]];
+    float4 indices [[attribute(8)]];
+};
+struct VelocityOut {
+    float4 position [[position]];
+    float4 now, before;
+};
+static VelocityOut velocity_out(float4 now, float4 before)
+{
+    VelocityOut out;
+    out.position = float4(now.x, -now.y, (now.z + now.w) * 0.5, now.w); // rows as the scene's textures have them
+    out.now = now, out.before = before;
+    return out;
+}
+vertex VelocityOut velocity_static(VelocityStaticIn in [[stage_in]], constant VelocityStatic &u [[buffer(0)]])
+{
+    float4 p = float4(in.position, 1.0);
+    return velocity_out(u.now * p, u.before * p);
+}
+vertex VelocityOut velocity_skinned(VelocitySkinnedIn in [[stage_in]], constant VelocitySkinned &u [[buffer(0)]])
+{
+    float4 p = float4(in.position, 1.0);
+    int4 i = int4(in.indices);
+    float4 a = u.bones_now[i.x] * p * in.weights.x + u.bones_now[i.y] * p * in.weights.y + u.bones_now[i.z] * p * in.weights.z + u.bones_now[i.w] * p * in.weights.w;
+    float4 b = u.bones_before[i.x] * p * in.weights.x + u.bones_before[i.y] * p * in.weights.y + u.bones_before[i.z] * p * in.weights.z + u.bones_before[i.w] * p * in.weights.w;
+    return velocity_out(u.now * a, u.before * b);
+}
+fragment float4 velocity_fragment(VelocityOut in [[stage_in]])
+{
+    return float4(in.now.xy / in.now.w - in.before.xy / max(in.before.w, 1.0e-4), in.now.w, 1.0);
+}
+
 fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]], DepthTexture depth [[texture(1)]],
-                              constant Params &p [[buffer(0)]])
+                              texture2d<float> objects [[texture(2)]], constant Params &p [[buffer(0)]])
 {
     constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
     float2 uv = in.position.xy / p.size;
     float4 centre = scene.sample(smooth, uv);
     float4 n = clip_point(depth, in.position.xy, p);
     float amount = blurred(n, p);
     float4 before = p.reproject * n;
-    if (amount <= 0.0 || before.w <= 1.0e-6) return centre;
-    float2 velocity = (n.xy - before.xy / before.w) * 0.5 * p.exposure * amount; // in uv, per exposure
+    float2 camera = before.w > 1.0e-6 ? n.xy - before.xy / before.w : float2(0.0); // what the camera's own movement does to this pixel
+    float2 moved = camera * amount;
+    // A thing that moves by itself is blurred by its own movement however near it is:
+    // what it does over and above the camera's. It must be the thing seen at this pixel, not one hidden behind it.
+    float own = 0.0;
+    if (p.has_objects > 0.5) {
+        float4 o = objects.sample(nearest, uv);
+        float inverse = dot(p.inverse_w, n);
+        float distance = inverse > 1.0e-9 ? 1.0 / inverse : 1.0e9;
+        float2 extra = o.xy - camera;
+        if (o.z > 0.0 && abs(o.z - distance) < 0.06 * distance + 0.15 && length(extra * p.size) > 3.0) moved += extra, own = 1.0;
+        if (own <= 0.0) {
+            // Beside a moving thing that is nearer: its streak reaches over this pixel, if it is moving this way fast enough.
+            float most = 0.0;
+            float spin = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715)))); // differently at each pixel, or the reach shows as steps
+            for (int k = 0; k < 12; k++) {
+                float angle = (float(k) + spin) * 0.5235988, reach = ((k & 1) == 0 ? 7.0 : 18.0) * (0.75 + 0.5 * fract(spin * 7.0)); // pixels
+                float2 off = float2(cos(angle), sin(angle)) * reach;
+                float4 t = objects.sample(nearest, uv + off / p.size);
+                float2 theirs = (t.xy - camera) * 0.25 * p.exposure * p.size; // half the streak, in pixels
+                float along = abs(dot(theirs, normalize(off)));
+                if (t.z > 0.0 && t.z < distance - 0.1 && along > reach && along > most) most = along, extra = t.xy - camera;
+            }
+            if (most > 0.0) moved += extra, own = 1.0;
+        }
+    }
+    if (amount <= 0.0 && own <= 0.0) return centre;
+    float2 velocity = moved * 0.5 * p.exposure; // in uv, per exposure
     float aspect = p.size.x / p.size.y;
     float length_ = length(velocity * float2(aspect, 1.0));
     if (length_ * p.size.y < 0.75) return centre;
-    velocity *= min(1.0, p.max_length / length_);
+    velocity *= min(1.0, p.max_length * (1.0 + own) / length_);
 
     const int samples = 10;
     float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
@@ -2159,7 +2234,7 @@ fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene 
         float t = (float(i) + noise) / float(samples) - 0.5;
         float2 q = uv + velocity * t;
         if (any(q < float2(0.0)) || any(q > float2(1.0))) continue;
-        float w = blurred(clip_point(depth, q * p.size, p), p); // near things keep their colour to themselves
+        float w = max(blurred(clip_point(depth, q * p.size, p), p), own); // near things keep their colour to themselves
         sum += scene.sample(smooth, q).rgb * w;
         weight += w;
     }
@@ -2171,8 +2246,9 @@ struct BlurParams { // must match Params in k_blur_source
     float reproject[16];
     float inverse_w[4];
     float size[2];
-    float reversed, exposure, near_start, near_end, max_length, pad;
+    float reversed, exposure, near_start, near_end, max_length, has_objects;
 };
+id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, NSUInteger h);
 
 id<MTLLibrary> s_blur_library;
 std::map<int, id<MTLRenderPipelineState>> s_blur_pipelines; // by colour format
@@ -2182,6 +2258,7 @@ uint64_t s_blur_frames;
 
 // Called between render passes, once the engine has finished the scene, after
 // the other effects on it.
+bool objects_recorded();
 void apply_motion_blur()
 {
     double now = CACurrentMediaTime(), frame_time = now - s_blur_time;
@@ -2197,7 +2274,8 @@ void apply_motion_blur()
     // view) is no movement: the far point straight ahead would cross the screen.
     double change = 0;
     for (int i = 0; i < 16; i++) change = std::max(change, fabs(reproject[i] - (i % 5 == 0 ? reproject[15] : 0.0)));
-    if (change < 1e-7 * fabs(reproject[15])) return;
+    bool still = change < 1e-7 * fabs(reproject[15]);
+    if (still && !objects_recorded()) return;
     double qw = reproject[11] + reproject[15];
     if (qw <= 1e-9) return;
     double jump = hypot((reproject[8] + reproject[12]) / qw, (reproject[9] + reproject[13]) / qw);
@@ -2251,7 +2329,9 @@ void apply_motion_blur()
     params.near_start = 5.0f * scale;
     params.near_end = 10.0f * scale;
     params.max_length = 0.04f;
-    params.pad = 0;
+    id<MTLTexture> objects = render_object_velocities(reproject, w, h);
+    params.has_objects = objects ? 1.0f : 0.0f;
+    if (still && !objects) return;
 
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     d.colorAttachments[0].texture = s_blur_texture;
@@ -2261,6 +2341,7 @@ void apply_motion_blur()
     [pass setRenderPipelineState:pipeline];
     [pass setFragmentTexture:s_last.color atIndex:0];
     [pass setFragmentTexture:s_last.depth atIndex:1];
+    [pass setFragmentTexture:objects ? objects : s_white atIndex:2];
     [pass setFragmentBytes:&params length:sizeof params atIndex:0];
     [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [pass endEncoding];
@@ -2718,6 +2799,7 @@ struct CasterDraw {
     // A layer of long hair (see record_hair_casters): the mesh pushed out by
     // `push` metres, hanging as the drawn hair does at `share` of its length,
     // casting only where `alpha`, here the hair map, says long hair.
+    uint64_t mesh = 0; // see mesh_id
     bool hair = false;
     int strand = 0; // 1: a horse's mane and tail as strands (push: the mane's length, share: the tail's); 2: a person's (push: the longest strand)
     float drift[3] = {0, 0, 0};
@@ -2726,6 +2808,25 @@ struct CasterDraw {
 };
 std::vector<CasterDraw> s_casters;
 std::vector<float> s_caster_bones;
+// For motion blur: this frame's objects with their bones, and where last frame's were.
+struct VelocityDraw {
+    CasterDraw c;
+    int bones; // index into s_velocity_bones of 32 matrices, or -1
+    float origin[4]; // where it is, in clip space: the engine places things with bones by their bones, under one matrix for all
+};
+struct PastObject {
+    uint64_t mesh;
+    float wvp[16];
+    int bones; // index into s_past_bones, or -1
+    bool taken;
+    float origin[4];
+};
+std::vector<VelocityDraw> s_velocity_draws;
+std::vector<PastObject> s_past_objects;
+std::vector<float> s_velocity_bones, s_past_bones;
+uint64_t s_past_frame, s_velocity_objects;
+id<MTLTexture> s_velocity_texture, s_velocity_depth;
+id<MTLDepthStencilState> s_velocity_depth_state;
 
 // Grass never reaches the pre-pass: the engine draws it in the main pass only.
 // Cut-out geometry that turns up there without having been in the pre-pass is
@@ -2953,6 +3054,7 @@ fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[te
 id<MTLLibrary> s_caster_library;
 id<MTLDepthStencilState> s_caster_depth_state;
 NSUInteger s_caster_halves = 1; // 2 when the fine window is drawn too
+std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_velocity_pipelines[2]; // [skinned]
 std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_caster_pipelines[7]; // [skinned * 2 + cutout], 4 for hair in layers, 5 and 6 for strands
 
 // Called for each draw of the engine's depth pre-pass, after it has been issued.
@@ -3022,7 +3124,174 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
             c.alpha_sampler = sampler_for(*t);
         }
     }
-    (late ? s_late_casters : s_casters).push_back(c);
+    c.mesh = mesh;
+    if (!late && s_motion_blur && s_velocity_draws.size() < 1500) { // kept apart: the shadow map takes its own away when it is drawn
+        VelocityDraw v{c, -1, {c.wvp[12], c.wvp[13], c.wvp[14], c.wvp[15]}};
+        if (c.bones >= 0) {
+            v.bones = (int)(s_velocity_bones.size() / (32 * 16));
+            const float *from = &s_caster_bones[(size_t)c.bones * 32 * 16];
+            s_velocity_bones.insert(s_velocity_bones.end(), from, from + 32 * 16);
+            for (int r = 0; r < 4; r++) v.origin[r] = c.wvp[r] * from[12] + c.wvp[4 + r] * from[13] + c.wvp[8 + r] * from[14] + c.wvp[12 + r];
+        }
+        s_velocity_draws.push_back(v);
+    }
+    if (late || s_dyn_shadows) (late ? s_late_casters : s_casters).push_back(c);
+    else if (c.bones >= 0) s_caster_bones.resize((size_t)c.bones * 32 * 16); // not wanted for shadows: give the matrices back
+}
+
+// Motion blur of things that move by themselves. Each object of the depth
+// pre-pass is found again among last frame's (the same mesh, nearest to where
+// the camera's own movement would have put it), and those that have moved
+// are drawn into a half-size texture with both poses: see the shaders in
+// k_blur_source. `reproject` takes this frame's clip space to the last one's.
+bool objects_recorded() { return !s_velocity_draws.empty() && s_past_frame == s_frame_serial && !s_past_objects.empty(); }
+
+id<MTLRenderPipelineState> velocity_pipeline(const PipelineKey &key, bool skinned)
+{
+    auto &cache = s_velocity_pipelines[skinned];
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [s_blur_library newFunctionWithName:skinned ? @"velocity_skinned" : @"velocity_static"];
+    d.fragmentFunction = [s_blur_library newFunctionWithName:@"velocity_fragment"];
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+    const int wanted[3] = {0, 7, 8};
+    bool uses_constant = false;
+    for (int n = 0; n < (skinned ? 3 : 1); n++) {
+        int i = wanted[n];
+        if (key.format[i] && key.slot[i] != CONSTANT_SLOT) {
+            vd.attributes[i].format = (MTLVertexFormat)key.format[i];
+            vd.attributes[i].offset = key.offset[i];
+            vd.attributes[i].bufferIndex = VERTEX_SLOT_BASE + key.slot[i];
+        } else {
+            vd.attributes[i].format = MTLVertexFormatFloat4;
+            vd.attributes[i].offset = 0;
+            vd.attributes[i].bufferIndex = CONSTANT_SLOT;
+            uses_constant = true;
+        }
+    }
+    for (int s = 0; s < MAX_VERTEX_SLOTS; s++) {
+        if (!key.stride[s]) continue;
+        vd.layouts[VERTEX_SLOT_BASE + s].stride = key.stride[s];
+        vd.layouts[VERTEX_SLOT_BASE + s].stepFunction = MTLVertexStepFunctionPerVertex;
+    }
+    if (uses_constant) {
+        vd.layouts[CONSTANT_SLOT].stride = 16;
+        vd.layouts[CONSTANT_SLOT].stepFunction = MTLVertexStepFunctionConstant;
+        vd.layouts[CONSTANT_SLOT].stepRate = 0;
+    }
+    d.vertexDescriptor = vd;
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    NSError *error = nil;
+    id<MTLRenderPipelineState> state = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!state) complain("motion blur object pipeline failed: %s", error.localizedDescription.UTF8String);
+    cache[key] = state;
+    return state;
+}
+
+id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, NSUInteger h)
+{
+    if (!objects_recorded() || !s_blur_library) return nil;
+    for (PastObject &o : s_past_objects) o.taken = false;
+    struct Pair {
+        const VelocityDraw *now;
+        const PastObject *before;
+    };
+    std::vector<Pair> pairs;
+    size_t bytes = 0;
+    const size_t static_size = 256, skinned_size = 4352; // 128 and 4224 bytes, rounded up to the offset alignment
+    for (const VelocityDraw &v : s_velocity_draws) {
+        const float *m = v.c.wvp, *at = v.origin;
+        if (at[3] < 0.05f || at[3] > 80.0f) continue; // behind the camera, or too far off for it to show
+        double expected[4]; // where it was, had only the camera moved
+        for (int r = 0; r < 4; r++) expected[r] = reproject[12 + r] * at[3] + reproject[r] * at[0] + reproject[4 + r] * at[1] + reproject[8 + r] * at[2];
+        if (expected[3] < 1e-3) continue;
+        PastObject *best = nullptr;
+        double nearest = 0.6;
+        for (PastObject &o : s_past_objects) {
+            if (o.taken || o.mesh != v.c.mesh || o.origin[3] < 1e-3f || (o.bones >= 0) != (v.bones >= 0)) continue;
+            double d = hypot(o.origin[0] / o.origin[3] - expected[0] / expected[3], o.origin[1] / o.origin[3] - expected[1] / expected[3]) + fabs(log(o.origin[3] / expected[3])) * 3.0;
+            if (d < nearest) nearest = d, best = &o;
+        }
+        if (!best) continue;
+        best->taken = true;
+        if (v.bones < 0) { // a thing without bones that has only gone where the camera's movement took it has no blur of its own
+            double most = 0;
+            for (int c = 0; c < 4; c++)
+                for (int r = 0; r < 4; r++) {
+                    double e = 0;
+                    for (int k = 0; k < 4; k++) e += reproject[k * 4 + r] * m[c * 4 + k];
+                    most = std::max(most, fabs(e - best->wvp[c * 4 + r]));
+                }
+            if (most < 2e-3 * std::max(1.0f, m[15])) continue;
+        }
+        if (v.bones >= 0 && !memcmp(&s_velocity_bones[(size_t)v.bones * 512], &s_past_bones[(size_t)best->bones * 512], 512 * sizeof(float))) {
+            double most = 0;
+            for (int c = 0; c < 4; c++)
+                for (int r = 0; r < 4; r++) {
+                    double e = 0;
+                    for (int k = 0; k < 4; k++) e += reproject[k * 4 + r] * m[c * 4 + k];
+                    most = std::max(most, fabs(e - best->wvp[c * 4 + r]));
+                }
+            if (most < 2e-3 * std::max(1.0f, m[15])) continue; // nor one with bones that has held its pose
+        }
+        pairs.push_back({&v, best});
+        bytes += v.bones >= 0 ? skinned_size : static_size;
+    }
+    if (pairs.empty()) return nil;
+    NSUInteger vw = std::max<NSUInteger>(1, w / 2), vh = std::max<NSUInteger>(1, h / 2);
+    if (!s_velocity_texture || s_velocity_texture.width != vw || s_velocity_texture.height != vh) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:vw height:vh mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_velocity_texture = [s_device newTextureWithDescriptor:td];
+        s_velocity_depth = new_depth_texture(vw, vh, 1);
+    }
+    if (!s_velocity_depth_state) {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionLess;
+        dd.depthWriteEnabled = YES;
+        s_velocity_depth_state = [s_device newDepthStencilStateWithDescriptor:dd];
+    }
+    id<MTLBuffer> uniforms = [s_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    uint8_t *base = (uint8_t *)uniforms.contents;
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_velocity_texture;
+    d.colorAttachments[0].loadAction = MTLLoadActionClear;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, -1, 0); // nothing moving here
+    d.depthAttachment.texture = s_velocity_depth;
+    d.depthAttachment.loadAction = MTLLoadActionClear;
+    d.depthAttachment.storeAction = MTLStoreActionDontCare;
+    d.depthAttachment.clearDepth = 1.0;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setDepthStencilState:s_velocity_depth_state];
+    [pass setCullMode:MTLCullModeNone];
+    [pass setVertexBuffer:s_constant_attrib offset:0 atIndex:CONSTANT_SLOT];
+    size_t at = 0;
+    for (const Pair &pair : pairs) {
+        const CasterDraw &c = pair.now->c;
+        bool skinned = pair.now->bones >= 0;
+        size_t size = skinned ? skinned_size : static_size;
+        id<MTLRenderPipelineState> pipeline = velocity_pipeline(c.key, skinned);
+        if (pipeline) {
+            memcpy(base + at, c.wvp, 64);
+            memcpy(base + at + 64, pair.before->wvp, 64);
+            if (skinned) {
+                memcpy(base + at + 128, &s_velocity_bones[(size_t)pair.now->bones * 32 * 16], 32 * 64);
+                memcpy(base + at + 128 + 32 * 64, &s_past_bones[(size_t)pair.before->bones * 32 * 16], 32 * 64);
+            }
+            [pass setRenderPipelineState:pipeline];
+            [pass setVertexBuffer:uniforms offset:at atIndex:0];
+            for (int i = 0; i < c.slots; i++) [pass setVertexBuffer:c.vertex[i] offset:c.vertex_offset[i] atIndex:(NSUInteger)(VERTEX_SLOT_BASE + i)];
+            [pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:c.index_count indexType:c.index_type indexBuffer:c.indices indexBufferOffset:c.index_offset];
+        }
+        at += size;
+    }
+    [pass endEncoding];
+    s_velocity_objects += pairs.size();
+    return s_velocity_texture;
 }
 
 // Strands. Where a coat's hair map marks long hair, roots are scattered over
@@ -4326,6 +4595,7 @@ void mtl_dump_stats(FILE *f)
     fprintf(f, "%llu uniform blocks copied, %llu reused\n", (unsigned long long)s_call_stats.uniform_copies,
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
+    if (s_velocity_objects) fprintf(f, "moving objects blurred by their own movement: %llu in all\n", (unsigned long long)s_velocity_objects);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
     if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
@@ -4433,6 +4703,17 @@ void mtl_present(bool capture, uint32_t frame)
             s_casters.clear();
             s_caster_bones.clear();
         }
+        if (!s_dyn_shadows) s_caster_bones.clear(), s_prepass_meshes.clear();
+        s_past_objects.clear();
+        for (const VelocityDraw &v : s_velocity_draws) {
+            PastObject o{v.c.mesh, {}, v.bones, false, {v.origin[0], v.origin[1], v.origin[2], v.origin[3]}};
+            memcpy(o.wvp, v.c.wvp, sizeof o.wvp);
+            s_past_objects.push_back(o);
+        }
+        s_past_bones.swap(s_velocity_bones);
+        s_velocity_bones.clear();
+        s_velocity_draws.clear();
+        s_past_frame = s_frame_serial;
         if (s_sky_ambient) update_sky_ambient();
         if (s_dyn_shadows) {
             s_late_ready.swap(s_late_casters);
@@ -5289,7 +5570,7 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         }
         s_blend = blend, s_blend_src = blend_src, s_blend_dst = blend_dst, s_blend_eq = blend_eq;
         if (shells) memset(s_shell_now, 0, sizeof s_shell_now);
-        if (s_dyn_shadows && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
+        if ((s_dyn_shadows || s_motion_blur) && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
         if (s_dyn_shadows && s_pass_scene && primitive == MTLPrimitiveTypeTriangle && s_depth_test && s_depth_mask)
             record_caster((NSUInteger)count, index_type, b->mtl, offset, true);
         if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);

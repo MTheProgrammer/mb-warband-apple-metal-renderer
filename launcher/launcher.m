@@ -63,7 +63,7 @@ static const Option k_options[] = {
 
     {"Picture", "WBM_MSAA", "Multisampling", "Smooths edges as they are drawn. The costliest setting.", kChoice, "1", "1", "4", "1=Off|2=2x|4=4x", 0, 0, 0},
     {"Picture", "WBM_FXAA", "Edge smoothing", "Smooths edges after the scene is drawn. Cheap.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
-    {"Picture", "WBM_MOTION_BLUR", "Motion blur", "Blur from the camera's own movement.", kToggle, "0", "0", "0", NULL, 0, 0, 0},
+    {"Picture", "WBM_MOTION_BLUR", "Motion blur", "Blur from the camera's movement, and of things that move: swords, legs, horses.", kToggle, "0", "0", "0", NULL, 0, 0, 0},
     {"Picture", "WBM_SHARPEN", "Sharpening", "0 for none. About 0.3 is plenty together with upscaling.", kSlider, "0", "0.3", "0", NULL, 0, 1, 0.05},
 
     {"Picture", "WBM_CONTRAST", "Contrast", "Deeper darks and brighter lights, or flatter. 0 leaves the picture as it is.", kSlider, "0", "0", "0", NULL, -1, 1, 0.05},
