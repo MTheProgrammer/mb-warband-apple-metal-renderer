@@ -2835,6 +2835,7 @@ id<MTLDepthStencilState> s_velocity_depth_state;
 // not show.
 std::vector<CasterDraw> s_late_casters, s_late_ready; // from this frame, and from the last for use in this one
 std::unordered_set<uint64_t> s_prepass_meshes;        // everything this frame's pre-pass drew
+std::unordered_set<uint64_t> s_prepass_solid;         // and what of it had no texture to be cut out by
 
 // Scenery is in the engine's own shadow map already, drawn there once per scene.
 // Drawing it into this one as well would cost a draw and change the look of its
@@ -3124,6 +3125,7 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
             c.alpha_sampler = sampler_for(*t);
         }
     }
+    if (!late && !c.alpha) s_prepass_solid.insert(mesh);
     c.mesh = mesh;
     if (!late && s_motion_blur && s_velocity_draws.size() < 1500) { // kept apart: the shadow map takes its own away when it is drawn
         VelocityDraw v{c, -1, {c.wvp[12], c.wvp[13], c.wvp[14], c.wvp[15]}};
@@ -4704,6 +4706,7 @@ void mtl_present(bool capture, uint32_t frame)
             s_caster_bones.clear();
         }
         if (!s_dyn_shadows) s_caster_bones.clear(), s_prepass_meshes.clear();
+        s_prepass_solid.clear();
         s_past_objects.clear();
         for (const VelocityDraw &v : s_velocity_draws) {
             PastObject o{v.c.mesh, {}, v.bones, false, {v.origin[0], v.origin[1], v.origin[2], v.origin[3]}};
@@ -5575,6 +5578,13 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
             record_caster((NSUInteger)count, index_type, b->mtl, offset, true);
         if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);
         if (s_dyn_shadows && s_pass_scene && !s_depth_test) record_overlay((NSUInteger)count, offset);
+        // So is a marker that floats over a soldier's head: the pre-pass draws it as a solid thing, without a
+        // texture to cut it out by, and the main pass then blends it in, unlit. (Soldiers fading in at a
+        // distance are blended too, but lit.)
+        if (s_dyn_shadows && s_pass_scene && s_depth_test && s_blend && s_prepass_solid.count(mesh_id((NSUInteger)count, offset))) {
+            Program *mp = find(s_programs, s_program);
+            if (mp && !(mp->input_mask & 2u)) record_overlay((NSUInteger)count, offset); // and it is unlit: its shader takes no normals
+        }
         // The engine draws the sky first, with the depth test off. That draw is the one to capture.
         if ((s_shader_options.pbr_sky || s_sky_ambient) && s_pass_scene && !s_depth_test && s_sky_frame != s_frame_serial)
             capture_sky(primitive, (NSUInteger)count, index_type, b->mtl, offset);
