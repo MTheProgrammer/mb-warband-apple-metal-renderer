@@ -490,6 +490,30 @@ bool add_sky_ambient(std::string &glsl, bool vertex)
         return true;
     }
     static const std::regex term(R"(\(clamp \(\s*dot \(SkyLightDir, ([\w.]+)\)\s*, 0\.0, 1\.0\) \* vSkyLightColor\))");
+    // The engine's face shader lights with the flat ambient colour alone: no
+    // light from the sky at all, where the hat on the same head gets it. A
+    // face in shadow is then far darker than what is round it. Its vertex
+    // shader does hand over the sky's direction; the term is put in as the
+    // other shaders have it, and then treated like theirs.
+    static const std::regex flat(R"(= \(vAmbientColor \+ \()");
+    static const std::regex mapped(R"(dot \(SunLightDir, (normal_\d+)\))");
+    std::smatch m;
+    if (glsl.find("SkyLightDir") == std::string::npos && glsl.find("max ((0.2 * (") != std::string::npos && glsl.find("varying vec3 SunLightDir;") != std::string::npos &&
+        std::regex_search(glsl, flat) && std::regex_search(glsl, m, mapped)) {
+        const std::string n = m[1];
+        glsl = std::regex_replace(glsl, flat,
+                                  "= ((vAmbientColor + wbm_ambient_up(clamp(dot(SkyLightDir, " + n + "), 0.0, 1.0) * vSkyLightColor, vAmbientColor, dot(normalize(SkyLightDir), " + n + "))) + (",
+                                  std::regex_constants::format_first_only);
+        glsl.insert(0, std::string("varying vec3 SkyLightDir;\n") + (glsl.find("uniform vec4 vSkyLightColor;") == std::string::npos ? "uniform vec4 vSkyLightColor;\n" : ""));
+        return true;
+    }
+    // The face shader with a specular map has the term with the dot product worked out a line before, and wrapped as its sunlight is.
+    static const std::regex apart(R"(\(clamp \(\s*max \(\(0\.2 \* \((tmpvar_\d+) \+ 0\.9\)\), \1\)\s*, 0\.0, 1\.0\) \* vSkyLightColor\))");
+    if (glsl.find("uniform vec4 vAmbientColor;") != std::string::npos && !std::regex_search(glsl, term) && std::regex_search(glsl, m, apart) &&
+        std::regex_search(glsl, std::regex(m[1].str() + R"( = dot \(SkyLightDir, )"))) {
+        glsl = std::regex_replace(glsl, apart, "wbm_ambient_up($&, vAmbientColor, $1 / max(length(SkyLightDir), 1e-4))", std::regex_constants::format_first_only);
+        return true;
+    }
     if (glsl.find("uniform vec4 vAmbientColor;") == std::string::npos || !std::regex_search(glsl, term)) return false;
     glsl = std::regex_replace(glsl, term, "wbm_ambient_up($&, vAmbientColor, dot(normalize(SkyLightDir), vec3($1)))");
     return true;
