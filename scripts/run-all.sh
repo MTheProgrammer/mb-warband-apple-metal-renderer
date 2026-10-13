@@ -26,6 +26,7 @@ export WBM_FUR_SHELLS=${WBM_FUR_SHELLS:-12}     # layers of fur on horses within
 export WBM_HAIR_STRANDS=${WBM_HAIR_STRANDS:-1} # mane and tail as strands in place of layers (0: layers)
 export WBM_PEOPLE_HAIR=${WBM_PEOPLE_HAIR:-1}   # loose strands over the hair and beards of people within a few metres
 export WBM_PARALLAX=${WBM_PARALLAX:-0.05}     # stones stand out from their joints on walls and buildings nearby (0: none)
+export WBM_WATER=${WBM_WATER:-1}                # sun glitter, paler shallows and shore foam on water
 export WBM_EYES=${WBM_EYES:-1}                  # a highlight and a reflection in the eyes of faces
 export WBM_SSS=${WBM_SSS:-1}                    # light scattering in the skin of faces
 # For speed, not looks, so not set here: WBM_UPSCALE=0.67 draws the scene smaller and lets MetalFX enlarge it;

@@ -816,7 +816,7 @@ bool add_water(std::string &fs)
     if (std::regex_search(fs, m, deep) && std::string(m[1]) == out) {
         fs = std::regex_replace(fs, deep,
                                 "$&\n    float wbm_deep = max($2.x - Depth, 0.0);\n"
-                                "    " + out + ".xyz += vec3(0.02, 0.055, 0.045) * LightDif.xyz * exp(-wbm_deep * 1200.0);\n"
+                                "    " + out + ".xyz += vec3(0.014, 0.04, 0.032) * LightDif.xyz * exp(-wbm_deep * 1200.0);\n"
                                 "    float wbm_ragged = 0.6 * texture2D(normal_texture, Tex0 * 9.0).y + 0.4 * texture2D(normal_texture, Tex0 * 23.0 + 0.37).w;\n"
                                 // A narrow line right at the edge, and beyond it patches that thin out over some 20 cm of depth.
                                 "    float wbm_foam = step(1e-7, wbm_deep) * max(0.7 * smoothstep(0.00005, 0.00001, wbm_deep), smoothstep(0.00018, 0.00004, wbm_deep) * smoothstep(0.42, 0.62, wbm_ragged));\n"
@@ -826,9 +826,9 @@ bool add_water(std::string &fs)
     }
     fs = std::regex_replace(fs, encode,
                             "{\n    vec3 wbm_h = normalize(normalize(LightDir_Alpha.xyz) + normalize(CameraDir));\n"
-                            "    float wbm_glint = pow(clamp(dot(normalize(" + normal + "), wbm_h), 0.0, 1.0), 260.0);\n"
-                            "    " + out + ".xyz += LightDif.xyz * (2.5 * wbm_glint * step(0.0, LightDir_Alpha.z));\n"
-                            "    " + out + ".w = max(" + out + ".w, clamp(wbm_glint, 0.0, 1.0) * LightDir_Alpha.w);\n  }\n  $&",
+                            "    float wbm_glint = pow(clamp(dot(normalize(" + normal + "), wbm_h), 0.0, 1.0), 700.0);\n"
+                            "    " + out + ".xyz += LightDif.xyz * (1.1 * wbm_glint * step(0.0, LightDir_Alpha.z));\n"
+                            "    " + out + ".w = max(" + out + ".w, clamp(wbm_glint * 0.6, 0.0, 1.0) * LightDir_Alpha.w);\n  }\n  $&",
                             std::regex_constants::format_first_only);
     return true;
 }
