@@ -11,6 +11,7 @@ export WBM_FXAA=${WBM_FXAA:-1}        # edges smoothed after the fact instead
 export WBM_SHADOWS=${WBM_SHADOWS:-2}  # shadows that soften with distance (PCSS)
 export WBM_DYNAMIC_SHADOWS=${WBM_DYNAMIC_SHADOWS:-1}  # characters cast shadows on everything
 export WBM_PBR=${WBM_PBR:-3}          # microfacet highlights, metalness, reflection of the scene's sky
+export WBM_TRILINEAR=${WBM_TRILINEAR:-1}    # textures blend from one mipmap level to the next instead of switching at a line
 export WBM_SRGB=${WBM_SRGB:-1}        # hardware sRGB texture decoding
 export WBM_AO=${WBM_AO:-1}            # ambient occlusion
 export WBM_CONTACT_SHADOWS=${WBM_CONTACT_SHADOWS:-1}  # screen-space contact shadows

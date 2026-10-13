@@ -44,6 +44,7 @@ static const Option k_options[] = {
      "0=As the game has them|1=Microfacet|2=With metals|3=With metals, reflecting the sky", 0, 0, 0},
     {"Materials and colour", "WBM_MATERIALS", "Materials by texture", "Metal, cloth, leather, skin, wood and stone each shine their own way.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Materials and colour", "WBM_SRGB", "Exact texture colours", "Textures are decoded by the graphics card, before filtering.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    {"Materials and colour", "WBM_TRILINEAR", "Smooth texture detail", "Textures blend from sharp to coarse with distance instead of switching at a visible line.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Materials and colour", "WBM_TONEMAP", "Filmic tone map", "Bright areas roll off smoothly instead of clipping.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Materials and colour", "WBM_HDR", "HDR output", "Highlights go above white on displays that can show it.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
 

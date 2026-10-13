@@ -325,6 +325,9 @@ const float s_parallax_sign[2] = {-1.0f, -1.0f}; // which way the texture runs a
 float s_grade[4];        // WBM_CONTRAST, WBM_SATURATION, WBM_WARMTH: each about -1 to 1, 0 for no change
 std::atomic<float> s_headroom{1.0f};
 NSWindow *s_window;
+// WBM_TRILINEAR: the game asks for most of its textures to switch from one mipmap level to the next at a
+// line (GL_LINEAR_MIPMAP_NEAREST); with this they are blended across the two levels instead, and the line goes.
+bool s_trilinear;
 float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macOS 26 and later)
 
 // Ambient occlusion (WBM_AO=1), applied to the engine's HDR scene buffer when
@@ -1053,7 +1056,7 @@ id<MTLSamplerState> sampler_for(Texture &t)
         d.minFilter = min_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
         d.magFilter = t.mag_filter == GL_LINEAR ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
         d.mipFilter = !mipmapped ? MTLSamplerMipFilterNotMipmapped
-                                 : (t.min_filter == GL_NEAREST_MIPMAP_LINEAR || t.min_filter == GL_LINEAR_MIPMAP_LINEAR)
+                                 : (s_trilinear || t.min_filter == GL_NEAREST_MIPMAP_LINEAR || t.min_filter == GL_LINEAR_MIPMAP_LINEAR)
                                        ? MTLSamplerMipFilterLinear
                                        : MTLSamplerMipFilterNearest;
         d.sAddressMode = address_mode(t.wrap_s);
@@ -4490,6 +4493,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_WARMTH")) s_grade[2] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
     s_shader_options.grade = s_grade[0] != 0 || s_grade[1] != 0 || s_grade[2] != 0;
     if (const char *v = getenv("WBM_LOD_BIAS")) s_lod_bias = (float)atof(v);
+    if (const char *v = getenv("WBM_TRILINEAR")) s_trilinear = atoi(v) != 0;
     const char *ao_env = getenv("WBM_AO");
     s_ao = ao_env && atoi(ao_env) != 0; // off unless set
     if (const char *v = getenv("WBM_AO_RADIUS")) s_ao_radius = (float)atof(v);
