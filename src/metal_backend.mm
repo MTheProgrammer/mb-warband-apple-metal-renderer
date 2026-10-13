@@ -349,6 +349,7 @@ struct Camera {
 };
 Camera s_camera;
 bool s_pass_scene, s_pass_prepass, s_pass_shadow_map;
+uint64_t s_prepass_frame = ~0ull; // the frame in which the engine last drew its depth pre-pass: what follows it in the scene's buffer is a scene, however few its draws (a small room)
 
 // The per-frame shadow map (WBM_DYNAMIC_SHADOWS=1): see record_caster and render_dynamic_shadows.
 bool s_dyn_shadows;
@@ -377,6 +378,13 @@ float s_shaft_strength = 0.7f; // WBM_SHAFT_STRENGTH
 // The sky atlas that PBR reflections sample (see k_xl_sky_sampler), redrawn
 // from the engine's sky dome each frame it is seen.
 id<MTLTexture> s_sky_atlas;
+// Indoors there is no sky to reflect or to take the ambient light's colour from: the room itself stands in for it
+// (WBM_ROOM_PROBE, see update_room_probe). An interior is where the engine gives the sun no colour.
+bool s_room_probe, s_interior;
+int s_room_every = 1; // WBM_ROOM_PROBE_EVERY: frames between updates
+id<MTLTexture> s_room_atlas;
+uint64_t s_room_frame, s_room_updates;
+void update_room_probe();
 id<MTLSamplerState> s_sky_sampler;
 uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
@@ -818,10 +826,14 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
     // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene) &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_room_probe || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene || (s_last.draws > 8 && s_prepass_frame == s_frame_serial)) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         if (s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0) apply_ambient_occlusion();
+        // Indoors is where the engine gives the sun no colour. On leaving, the room is forgotten.
+        s_interior = s_room_probe && s_sun_valid && s_sun_color[0] + s_sun_color[1] + s_sun_color[2] < 0.01f;
+        if (s_interior) update_room_probe();
+        else s_room_atlas = nil;
         if (s_motion_blur) apply_motion_blur();
         if (s_fxaa) apply_fxaa(); // last: edges as they will be shown
         id<MTLTexture> shown = nil;
@@ -859,6 +871,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     if (t.scene) s_scene_frame = s_frame_serial;
     s_pass_scene = t.scene;
     s_pass_prepass = t.prepass;
+    if (t.prepass) s_prepass_frame = s_frame_serial;
     s_pass_shadow_map = t.shadow_map;
     if (s_last.color != t.color) s_last.draws = 0; // a clear restarts the pass on the same target; keep counting
     s_last.color = t.color;
@@ -4175,7 +4188,7 @@ bool prepare_draw()
             id<MTLTexture> texture = t && t->mtl ? t->mtl : s_white;
             id<MTLSamplerState> sampler = t && t->mtl ? sampler_for(*t) : s_samplers.begin()->second;
             if (l.is_sky) { // not one of the game's textures
-                texture = s_sky_atlas ? s_sky_atlas : s_white;
+                texture = s_interior && s_room_atlas ? s_room_atlas : s_sky_atlas ? s_sky_atlas : s_white;
                 if (s_sky_sampler) sampler = s_sky_sampler;
             } else if (l.is_scene_copy) {
                 texture = s_water_scene ? s_water_scene : s_white;
@@ -4364,6 +4377,7 @@ void capture_sky(MTLPrimitiveType primitive, NSUInteger count, MTLIndexType inde
                 float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? 65504.0f : ldexpf((float)(m + 1024), e - 25);
                 return (h & 0x8000) ? -v : v;
             };
+            if (s_interior && s_room_atlas) return; // the room's colours are in use, not the sky's
             std::lock_guard<std::mutex> lock(s_amb_mu);
             for (int face = 0; face < 6; face++)
                 for (int c = 0; c < 3; c++) s_amb_faces[face][c] = to_float(half[face * 4 + c]);
@@ -4372,6 +4386,131 @@ void capture_sky(MTLPrimitiveType primitive, NSUInteger count, MTLIndexType inde
     }
     [blit endEncoding];
     [cmd commit];
+}
+
+// The room probe. Laid out as the sky atlas is, six faces side by side, and
+// read by the same shader code; but filled from the finished picture of the
+// scene itself. Each texel is a direction from the camera: where that
+// direction is on screen, the picture's colour there is blended in, a fifth at
+// a time; where it is not, the texel keeps what it had, drifting very slowly
+// towards the picture's nearest edge so that what was never looked at is not
+// left black. Looking round a room fills it in. It has no depth: everything is
+// taken to be far away, as with any such probe.
+const char k_room_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Params {
+    float4 view[3]; // rows: the world's directions into view space, third axis forwards
+    float4 lens;    // x, y: the projection's scale; z: face size in texels; w: 1 for the first filling
+};
+struct VertexOut {
+    float4 position [[position]];
+};
+vertex VertexOut room_vertex(uint id [[vertex_id]])
+{
+    VertexOut out;
+    out.position = float4(float2((id << 1) & 2, id & 2) * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+fragment float4 room_fragment(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    float n = p.lens.z;
+    int face = clamp(int(in.position.x / n), 0, 5);
+    float2 uv = float2(in.position.x - float(face) * n, in.position.y) / n * 2.0 - 1.0;
+    const float3 forwards[6] = {float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1)};
+    float3 forward = forwards[face], up = face < 4 ? float3(0, 0, 1) : float3(0, 1, 0);
+    float3 d = normalize(forward + cross(forward, up) * uv.x + up * uv.y);
+    float3 v = float3(dot(p.view[0].xyz, d), dot(p.view[1].xyz, d), dot(p.view[2].xyz, d));
+    float2 ndc = v.z > 1.0e-3 ? float2(v.x * p.lens.x, v.y * p.lens.y) / v.z : normalize(v.xy + 1.0e-5) * 4.0;
+    float seen = v.z > 1.0e-3 && all(abs(ndc) < float2(0.98)) ? 1.0 : 0.0;
+    float3 colour = scene.sample(smooth, clamp(ndc, -0.98, 0.98) * 0.5 + 0.5).rgb;
+    return float4(min(max(colour, 0.0), float3(8.0)), p.lens.w > 0.5 ? 1.0 : seen > 0.5 ? 0.2 : 0.006); // lens.w: the first filling, all at once
+}
+)";
+struct RoomParams {
+    float view[3][4];
+    float lens[4];
+};
+id<MTLLibrary> s_room_library;
+id<MTLRenderPipelineState> s_room_pipeline;
+
+void update_room_probe()
+{
+    if (!s_last.color || s_camera.view_frame != s_frame_serial || s_camera.projection_frame != s_frame_serial) return;
+    if (s_room_frame + (uint64_t)s_room_every > s_frame_serial && s_room_atlas) return;
+    const int N = k_xl_sky_face_size;
+    if (!s_room_library) {
+        NSError *error = nil;
+        s_room_library = [s_device newLibraryWithSource:@(k_room_source) options:nil error:&error];
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [s_room_library newFunctionWithName:@"room_vertex"];
+        d.fragmentFunction = [s_room_library newFunctionWithName:@"room_fragment"];
+        MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[0];
+        c.pixelFormat = MTLPixelFormatRGBA16Float;
+        c.blendingEnabled = YES;
+        c.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha, c.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        c.sourceAlphaBlendFactor = MTLBlendFactorZero, c.destinationAlphaBlendFactor = MTLBlendFactorOne;
+        if (s_room_library) s_room_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!s_room_pipeline) {
+            complain("room probe shaders failed: %s", error.localizedDescription.UTF8String);
+            s_room_probe = false;
+            return;
+        }
+    }
+    bool fresh = !s_room_atlas;
+    if (fresh) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:6 * N height:N mipmapped:YES];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_room_atlas = [s_device newTextureWithDescriptor:td];
+        if (!s_sky_sampler) {
+            MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+            sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+            sd.mipFilter = MTLSamplerMipFilterLinear;
+            s_sky_sampler = [s_device newSamplerStateWithDescriptor:sd];
+        }
+    }
+    RoomParams params = {};
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) params.view[r][c] = (float)s_camera.view[r][c];
+    params.lens[0] = (float)s_camera.p00, params.lens[1] = (float)s_camera.p11, params.lens[2] = (float)N, params.lens[3] = fresh ? 1.0f : 0.0f;
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_room_atlas;
+    d.colorAttachments[0].loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:s_room_pipeline];
+    [pass setFragmentTexture:s_last.color atIndex:0];
+    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+    // (A room just entered is filled at once with what can be seen of it, and its nearest edges elsewhere.)
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+    id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+    [blit generateMipmapsForTexture:s_room_atlas];
+    if (s_sky_ambient) {
+        NSUInteger level = 0;
+        while ((N >> level) > 1) level++;
+        id<MTLBuffer> means = [s_device newBufferWithLength:6 * 8 options:MTLResourceStorageModeShared];
+        [blit copyFromTexture:s_room_atlas sourceSlice:0 sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(6, 1, 1)
+                     toBuffer:means destinationOffset:0 destinationBytesPerRow:6 * 8 destinationBytesPerImage:6 * 8];
+        [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+            const uint16_t *half = (const uint16_t *)means.contents;
+            auto to_float = [](uint16_t h) {
+                int e = (h >> 10) & 31, m = h & 1023;
+                float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? 65504.0f : ldexpf((float)(m + 1024), e - 25);
+                return (h & 0x8000) ? -v : v;
+            };
+            std::lock_guard<std::mutex> lock(s_amb_mu);
+            for (int face = 0; face < 6; face++)
+                for (int c = 0; c < 3; c++) s_amb_faces[face][c] = to_float(half[face * 4 + c]);
+            s_amb_faces_valid = true;
+        }];
+    }
+    [blit endEncoding];
+    s_room_frame = s_frame_serial;
+    s_room_updates++;
 }
 
 // Works out the shaders' wbm_amb for this frame. Called at present.
@@ -4394,6 +4533,10 @@ void update_sky_ambient()
         if (brightness > 1e-5f) {
             for (int face = 0; face < 5; face++)
                 for (int c = 0; c < 3; c++) amb[face * 4 + c] = std::min(2.5f, std::max(0.4f, linear[face][c] / brightness));
+            // A room's own colours are stronger than a sky's (torchlit stone has next to no blue): taken whole they turn the shade red.
+            if (s_interior)
+                for (int k = 0; k < 20; k++)
+                    if (k % 4 != 3) amb[k] = 1.0f + (amb[k] - 1.0f) * 0.4f;
             amb[23] = s_sky_ambient_strength;
             // vSunDir is the way the light travels; what reaches the ground is its
             // downward part. A fifth of that comes back up, a little warm.
@@ -4539,6 +4682,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     s_shader_options.hair_strands = s_people_hair;
+    if (const char *v = getenv("WBM_ROOM_PROBE")) s_room_probe = atoi(v) != 0;
+    if (const char *v = getenv("WBM_ROOM_PROBE_EVERY")) s_room_every = std::max(1, atoi(v));
     if (const char *v = getenv("WBM_WATER_REFLECTIONS")) s_water_reflections = atoi(v) != 0;
     if (const char *v = getenv("WBM_WATER_STEPS")) s_water_steps = std::min(64, std::max(4, atoi(v)));
     if (const char *v = getenv("WBM_WATER_EVERY")) s_water_every = std::max(1, atoi(v));
@@ -4654,6 +4799,7 @@ void mtl_dump_stats(FILE *f)
     if (s_velocity_objects) fprintf(f, "moving objects blurred by their own movement: %llu in all\n", (unsigned long long)s_velocity_objects);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
     if (s_water_copies) fprintf(f, "\nscene copied for water to reflect in %llu frames\n", (unsigned long long)s_water_copies);
+    if (s_room_updates) fprintf(f, "\nroom probe updated in %llu frames\n", (unsigned long long)s_room_updates);
     if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
     if (s_sharpen_frames) fprintf(f, "\nsharpened in %llu frames\n", (unsigned long long)s_sharpen_frames);

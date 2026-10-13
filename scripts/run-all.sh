@@ -19,6 +19,7 @@ export WBM_BOUNCE_LIGHT=${WBM_BOUNCE_LIGHT:-1}  # lit surfaces throw a little li
 export WBM_LIGHT_SHAFTS=${WBM_LIGHT_SHAFTS:-1}  # light shafts from the sun
 export WBM_MOTION_BLUR=${WBM_MOTION_BLUR:-0}    # blur from the camera's movement and of things that move by themselves (off for now; 1 turns it on)
 export WBM_SKY_AMBIENT=${WBM_SKY_AMBIENT:-1}    # ambient light tinted by the sky, with ground bounce
+export WBM_ROOM_PROBE=${WBM_ROOM_PROBE:-1}      # indoors, metal reflects the room and shade takes its colour, not the sky's
 export WBM_MATERIALS=${WBM_MATERIALS:-1}        # metalness and roughness by material class
 export WBM_WIND=${WBM_WIND:-1}                  # trees, bushes and grass sway (a strength; 0 for none)
 export WBM_FOLIAGE=${WBM_FOLIAGE:-0.6}          # sunlight through leaves seen from their far side

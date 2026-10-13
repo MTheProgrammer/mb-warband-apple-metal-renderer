@@ -38,6 +38,7 @@ static const Option k_options[] = {
     {"Shadows and light", "WBM_CONTACT_SHADOWS", "Contact shadows", "Short shadows where things touch, finer than the shadow map.", kToggle, "1", "0", "0", NULL, 0, 0, 0},
     {"Shadows and light", "WBM_SKY_AMBIENT", "Light from the sky and the ground", "Shade is tinted by the sky and filled by light off the ground.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Shadows and light", "WBM_BOUNCE_LIGHT", "Bounce light", "Lit surfaces throw a little of their light and colour on what is near. 0 for none.", kSlider, "1", "0", "0", NULL, 0, 3, 0.25},
+    {"Shadows and light", "WBM_ROOM_PROBE", "Rooms light themselves", "Indoors, metal reflects the room and shade takes its colour, not the sky's.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Shadows and light", "WBM_LIGHT_SHAFTS", "Light shafts", "Rays from the sun when it is in view.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
 
     {"Materials and colour", "WBM_PBR", "Highlights", "How surfaces shine.", kChoice, "3", "3", "0",
