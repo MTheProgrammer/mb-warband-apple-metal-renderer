@@ -23,9 +23,38 @@
 //       A second picture, of the saddle, straps and other gear alone, keeps
 //       the coat off those.
 //
+//   texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx]
+//       makes a texture pack of pictures that come back from being enlarged or
+//       repainted elsewhere (Blender, say), named after the game's textures:
+//         <name>, <name>_basecolor     the texture itself (also _albedo, _diffuse);
+//         <name>_normal                its normal map, whatever the game calls
+//                                      it (a picture under the game's own name
+//                                      for the normal map will do as well);
+//         <name>_metallic, <name>_roughness
+//                                      grey pictures of each, or
+//         <name>_orm                   the two as glTF packs them (roughness in
+//                                      green, metalness in blue);
+//         <name>_opacity               what goes into the texture's alpha;
+//         <name>_ao                    how much of the light from all round reaches
+//                                      each spot (ambient occlusion);
+//         <name>_height                the surface's heights, white the highest;
+//       and writes <name>.png, <name>_pbr.png as the renderer wants it (metalness
+//       in red, roughness in green, occlusion in alpha; a horse's coat, in blue,
+//       is kept from the map already in the pack or worked out), and
+//       <name>_depth.png, the heights, for WBM_PARALLAX. Normal maps are taken to have green
+//       pointing up the picture, as glTF and Blender have it, and are turned
+//       about for the game, which has it pointing down (--normals directx:
+//       they are the game's way already); where the game keeps a normal's x in
+//       alpha (the textures of rooms), it is put there. A texture that has lost
+//       its alpha on the way gets the game's own back. --gain g: the pictures
+//       were made g times brighter than the game's, in linear light, to look
+//       right elsewhere; they are brought back.
+//
 // The game's folder is taken from WBM_GAME, or from where Steam puts it.
 
+#include "../src/brf.h"
 #include "../src/material_names.h"
+#include "dds.h"
 
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
@@ -37,86 +66,11 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <dirent.h>
 #include <sys/stat.h>
-
-struct Image {
-    int w = 0, h = 0;
-    std::vector<uint8_t> px; // RGBA, top row first
-};
-
-static bool read_dds(const std::string &path, Image *img)
-{
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    std::vector<uint8_t> d;
-    uint8_t buf[65536];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) d.insert(d.end(), buf, buf + n);
-    fclose(f);
-    if (d.size() < 128 || memcmp(d.data(), "DDS ", 4)) return false;
-    uint32_t h, w, pf, fourcc, bits, rmask;
-    memcpy(&h, &d[12], 4), memcpy(&w, &d[16], 4), memcpy(&pf, &d[80], 4), memcpy(&fourcc, &d[84], 4), memcpy(&bits, &d[88], 4), memcpy(&rmask, &d[92], 4);
-    if (!w || !h || w > 16384 || h > 16384) return false;
-    img->w = (int)w, img->h = (int)h;
-    img->px.assign((size_t)w * h * 4, 255);
-    const uint8_t *data = &d[128];
-    size_t have = d.size() - 128;
-    if (!(pf & 4)) {
-        size_t bpp = bits / 8;
-        if ((bpp != 3 && bpp != 4) || have < (size_t)w * h * bpp) return false;
-        bool bgr = rmask == 0x00ff0000;
-        for (size_t i = 0; i < (size_t)w * h; i++) {
-            const uint8_t *s = data + i * bpp;
-            uint8_t *o = &img->px[i * 4];
-            o[0] = bgr ? s[2] : s[0], o[1] = s[1], o[2] = bgr ? s[0] : s[2], o[3] = bpp == 4 ? s[3] : 255;
-        }
-        return true;
-    }
-    int alpha = !memcmp(&fourcc, "DXT1", 4) ? 0 : !memcmp(&fourcc, "DXT3", 4) ? 3 : !memcmp(&fourcc, "DXT5", 4) ? 5 : -1;
-    if (alpha < 0) return false;
-    size_t block = alpha ? 16 : 8;
-    int bw = ((int)w + 3) / 4, bh = ((int)h + 3) / 4;
-    if (have < (size_t)bw * bh * block) return false;
-    auto c565 = [](uint16_t c, int *o) {
-        o[0] = ((c >> 11) & 31) * 255 / 31, o[1] = ((c >> 5) & 63) * 255 / 63, o[2] = (c & 31) * 255 / 31;
-    };
-    for (int by = 0; by < bh; by++) {
-        for (int bx = 0; bx < bw; bx++) {
-            const uint8_t *b = data + ((size_t)by * bw + bx) * block, *cb = b + (alpha ? 8 : 0);
-            uint16_t c0 = (uint16_t)(cb[0] | cb[1] << 8), c1 = (uint16_t)(cb[2] | cb[3] << 8);
-            int p[4][4];
-            c565(c0, p[0]), c565(c1, p[1]);
-            bool four = alpha || c0 > c1;
-            for (int k = 0; k < 3; k++) {
-                p[2][k] = four ? (2 * p[0][k] + p[1][k]) / 3 : (p[0][k] + p[1][k]) / 2;
-                p[3][k] = four ? (p[0][k] + 2 * p[1][k]) / 3 : 0;
-            }
-            p[0][3] = p[1][3] = p[2][3] = 255, p[3][3] = four ? 255 : 0;
-            int a[8] = {};
-            uint64_t abits = 0;
-            if (alpha == 5) {
-                a[0] = b[0], a[1] = b[1];
-                for (int i = 1; i < 7; i++) a[i + 1] = a[0] > a[1] ? ((7 - i) * a[0] + i * a[1]) / 7 : i < 5 ? ((5 - i) * a[0] + i * a[1]) / 5 : (i == 5 ? 0 : 255);
-                for (int i = 0; i < 6; i++) abits |= (uint64_t)b[2 + i] << (8 * i);
-            }
-            for (int y = 0; y < 4; y++) {
-                for (int x = 0; x < 4; x++) {
-                    int X = bx * 4 + x, Y = by * 4 + y;
-                    if (X >= (int)w || Y >= (int)h) continue;
-                    uint8_t *o = &img->px[((size_t)Y * w + X) * 4];
-                    const int *c = p[(cb[4 + y] >> (2 * x)) & 3];
-                    o[0] = (uint8_t)c[0], o[1] = (uint8_t)c[1], o[2] = (uint8_t)c[2], o[3] = (uint8_t)c[3];
-                    if (alpha == 3) o[3] = (uint8_t)(((b[y * 2 + x / 2] >> (4 * (x & 1))) & 15) * 17);
-                    else if (alpha == 5) o[3] = (uint8_t)a[(abits >> (3 * (y * 4 + x))) & 7];
-                }
-            }
-        }
-    }
-    return true;
-}
 
 // PNG, JPEG and whatever else the system reads.
 static bool read_picture(const std::string &path, Image *img)
@@ -131,6 +85,25 @@ static bool read_picture(const std::string &path, Image *img)
         size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
         img->w = (int)w, img->h = (int)h;
         img->px.assign(w * h * 4, 255);
+        // Eight bits each of red, green, blue and an alpha that the colours are not multiplied by: taken as
+        // they are, alpha and all. (Drawn, as below, the alpha is lost, and with it whatever it stood for.)
+        CGImageAlphaInfo alpha = CGImageGetAlphaInfo(image);
+        bool plain = CGImageGetBitsPerComponent(image) == 8 && CGImageGetBitsPerPixel(image) == 32 && (alpha == kCGImageAlphaLast || alpha == kCGImageAlphaNoneSkipLast) &&
+                     (CGImageGetBitmapInfo(image) & kCGBitmapByteOrderMask) <= kCGBitmapByteOrder32Big && CGColorSpaceGetModel(CGImageGetColorSpace(image)) == kCGColorSpaceModelRGB;
+        if (plain) {
+            CFDataRef data = CGDataProviderCopyData(CGImageGetDataProvider(image));
+            size_t stride = CGImageGetBytesPerRow(image);
+            if (data && (size_t)CFDataGetLength(data) >= stride * (h - 1) + w * 4) {
+                const uint8_t *from = CFDataGetBytePtr(data);
+                for (size_t y = 0; y < h; y++) memcpy(&img->px[y * w * 4], from + y * stride, w * 4);
+                if (alpha == kCGImageAlphaNoneSkipLast)
+                    for (size_t i = 3; i < img->px.size(); i += 4) img->px[i] = 255;
+                CFRelease(data);
+                CGImageRelease(image);
+                return true;
+            }
+            if (data) CFRelease(data);
+        }
         CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
         CGContextRef ctx = CGBitmapContextCreate(img->px.data(), w, h, 8, w * 4, space, (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Big);
         CGColorSpaceRelease(space);
@@ -606,12 +579,290 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     return 0;
 }
 
+// One channel of a picture at a place given in shares of its width and height, between its pixels.
+static float sample_channel(const Image &m, int channel, float u, float v)
+{
+    float x = std::min(std::max(u * (float)m.w - 0.5f, 0.0f), (float)(m.w - 1)), y = std::min(std::max(v * (float)m.h - 0.5f, 0.0f), (float)(m.h - 1));
+    int x0 = (int)x, y0 = (int)y, x1 = std::min(x0 + 1, m.w - 1), y1 = std::min(y0 + 1, m.h - 1);
+    float fx = x - (float)x0, fy = y - (float)y0;
+    auto at = [&](int px, int py) { return (float)m.px[((size_t)py * (size_t)m.w + (size_t)px) * 4 + (size_t)channel]; };
+    return (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) + (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy;
+}
+
+// How far a channel's values spread, in steps of 255: next to nothing for one that holds nothing.
+static float spread(const Image &m, int channel)
+{
+    double sum = 0, squares = 0;
+    size_t n = (size_t)m.w * (size_t)m.h, step = std::max<size_t>(1, n / 20000);
+    size_t taken = 0;
+    for (size_t i = 0; i < n; i += step, taken++) {
+        double v = m.px[i * 4 + (size_t)channel];
+        sum += v, squares += v * v;
+    }
+    double mean = sum / (double)taken;
+    return (float)sqrt(std::max(0.0, squares / (double)taken - mean * mean));
+}
+
+// See the top of the file.
+static int import_pictures(const std::string &in, const std::string &out, float gain, bool normals_up)
+{
+    std::map<std::string, std::string> game = game_textures();
+    if (game.empty()) {
+        fprintf(stderr, "no texture files found; set WBM_GAME to the game's folder\n");
+        return 1;
+    }
+    // Which normal maps the game's materials put with a texture: its own word on what a picture named
+    // <texture>_normal stands in for. (The module last played is read with the game's own files.)
+    std::map<std::string, std::set<std::string>> normals_of;
+    std::set<std::string> in_materials;
+    {
+        std::string root, module = "Native";
+        const char *home = getenv("HOME");
+        if (const char *g = getenv("WBM_GAME")) root = g;
+        else if (home) root = std::string(home) + "/Library/Application Support/Steam/steamapps/common/MountBlade Warband";
+        if (FILE *f = fopen((std::string(home ? home : "") + "/Library/Application Support/MBWarband/last_module_warband").c_str(), "r")) {
+            char text[512];
+            size_t n = fread(text, 1, sizeof text - 1, f);
+            fclose(f);
+            std::string last(text, n);
+            while (!last.empty() && isspace((unsigned char)last.back())) last.pop_back();
+            if (!last.empty()) module = last;
+        }
+        BrfLibrary library;
+        library.scan(root + "/CommonRes");
+        library.scan(root + "/Modules/" + module + "/Resource");
+        auto plain = [](std::string n) {
+            for (char &c : n) c = (char)tolower((unsigned char)c);
+            if (n.size() > 4 && !n.compare(n.size() - 4, 4, ".dds")) n.resize(n.size() - 4);
+            return n;
+        };
+        for (auto &m : library.materials) {
+            std::string diffuse = plain(m.second.diffuse), normal = plain(m.second.normal);
+            in_materials.insert(diffuse);
+            if (!normal.empty() && normal != "none" && game.count(normal)) normals_of[diffuse].insert(normal);
+        }
+    }
+    std::map<std::string, std::string> pictures; // lower-case name without extension -> path
+    DIR *d = opendir(in.c_str());
+    if (!d) {
+        fprintf(stderr, "cannot read the folder %s\n", in.c_str());
+        return 1;
+    }
+    while (struct dirent *e = readdir(d)) {
+        std::string name = e->d_name;
+        size_t dot = name.rfind('.');
+        if (name[0] == '.' || dot == std::string::npos) continue;
+        std::string base = name.substr(0, dot);
+        for (char &c : base) c = (char)tolower((unsigned char)c);
+        pictures[base] = in + "/" + name;
+    }
+    closedir(d);
+    make_folders(out);
+
+    struct Maps {
+        std::string metal, rough, packed, occlusion;
+    };
+    std::map<std::string, Maps> maps; // by the texture they belong to
+    std::map<std::string, std::string> heights; // by the texture they belong to
+    int textures = 0, normal_maps = 0, pbr_maps = 0, depth_maps = 0, skipped = 0, unread = 0, into_alpha = 0;
+    // One picture may stand in for several of the game's files: a normal map shared out under more than one name.
+    std::vector<std::pair<std::string, std::string>> work; // name of the game's, path
+    std::set<std::string> named_normals;
+    for (auto &p : pictures) {
+        std::string name = p.first;
+        bool taken = false, named_normal = false;
+        for (const char *suffix : {"_ao", "_height", "_ambientocclusion", "_displacement"}) {
+            std::string owner = ends_with(name, suffix) ? name.substr(0, name.size() - strlen(suffix)) : "";
+            if (owner.empty() || !game.count(owner)) continue;
+            // The game calls some of its normal maps <name>_height. Beside a base colour or a normal map
+            // named the other way, a picture of that name is the height it says it is.
+            if (game.count(name) && !pictures.count(owner + "_basecolor") && !pictures.count(owner + "_normal")) continue;
+            taken = true;
+            bool height = !strcmp(suffix, "_height") || !strcmp(suffix, "_displacement");
+            if (height) heights[owner] = p.second;
+            else maps[owner].occlusion = p.second;
+        }
+        for (const char *suffix : {"_opacity", "_alpha"}) { // goes into its texture's alpha, below
+            std::string owner = ends_with(name, suffix) ? name.substr(0, name.size() - strlen(suffix)) : "";
+            if (!owner.empty() && game.count(owner) && !game.count(name)) taken = true;
+        }
+        if (taken) continue;
+        // A picture named for what it is, not for the game's file: the texture's own name is under it.
+        for (const char *suffix : {"_basecolor", "_base_color", "_albedo", "_diffuse"}) {
+            std::string owner = ends_with(name, suffix) ? name.substr(0, name.size() - strlen(suffix)) : "";
+            if (!owner.empty() && game.count(owner) && !game.count(name)) name = owner;
+        }
+        const struct {
+            const char *suffix;
+            int kind;
+        } kinds[] = {{"_metallicroughness", 2}, {"_metallic", 0}, {"_metalness", 0}, {"_metal", 0}, {"_roughness", 1}, {"_rough", 1}, {"_orm", 2}};
+        for (auto &k : kinds) {
+            if (!ends_with(name, k.suffix)) continue;
+            std::string owner = name.substr(0, name.size() - strlen(k.suffix));
+            if (!game.count(owner)) continue; // a texture of the game's may itself end that way
+            (k.kind == 0 ? maps[owner].metal : k.kind == 1 ? maps[owner].rough : maps[owner].packed) = p.second;
+            taken = true;
+            break;
+        }
+        if (taken || ends_with(name, "_pbr")) continue; // a map in the renderer's own layout is one for the pack as it is
+        if (ends_with(name, "_normal") && !game.count(name)) {
+            std::string owner = name.substr(0, name.size() - 7);
+            std::vector<std::string> found(normals_of[owner].begin(), normals_of[owner].end());
+            if (found.empty() && in_materials.count(owner)) {
+                // The shaders of the materials that wear this texture read no normal map: there is nothing to replace.
+                unread++;
+                continue;
+            }
+            for (const char *theirs : {"_normalmap", "_n", "_nm", "_bump", "_normal_map", "_height"})
+                if (found.empty() && game.count(owner + theirs)) found.push_back(owner + theirs);
+            if (found.empty()) {
+                fprintf(stderr, "%s: the game has no normal map that goes with %s; left out\n", p.second.c_str(), owner.c_str());
+                skipped++;
+                continue;
+            }
+            for (const std::string &f : found) work.push_back({f, p.second}), named_normals.insert(f);
+            continue;
+        }
+        work.push_back({name, p.second});
+    }
+    for (auto &p : work) {
+        const std::string &name = p.first;
+        bool named_normal = named_normals.count(name) != 0;
+        auto original = game.find(name);
+        Image img;
+        if (original == game.end()) {
+            fprintf(stderr, "%s: the game has no texture of that name; left out\n", p.second.c_str());
+            skipped++;
+            continue;
+        }
+        if (!read_picture(p.second, &img)) {
+            fprintf(stderr, "%s: cannot be read; left out\n", p.second.c_str());
+            skipped++;
+            continue;
+        }
+        Image was;
+        bool have_original = read_dds(original->second, &was);
+        bool normal = named_normal || name.find("normalmap") != std::string::npos || name.find("bump") != std::string::npos || ends_with(name, "_n") || ends_with(name, "_nm") || ends_with(name, "_normal");
+        size_t count = (size_t)img.w * (size_t)img.h;
+        if (normal) {
+            if (normals_up)
+                for (size_t i = 0; i < count; i++) img.px[i * 4 + 1] = (uint8_t)(255 - img.px[i * 4 + 1]);
+            // The textures of rooms keep a normal's x in alpha, and their shaders read it there.
+            bool x_in_alpha = have_original && spread(was, 3) > 4.0f && spread(was, 0) <= 4.0f; // and nothing in red
+            if (x_in_alpha && spread(img, 3) <= 4.0f) {
+                for (size_t i = 0; i < count; i++) img.px[i * 4 + 3] = img.px[i * 4];
+                into_alpha++;
+            }
+            normal_maps++;
+        } else {
+            if (gain != 1.0f) {
+                uint8_t back[256]; // per value: decoded, divided, encoded again
+                for (int v = 0; v < 256; v++) {
+                    float c = (float)v / 255.0f, lin = (c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f)) / gain;
+                    float enc = lin <= 0.0031308f ? lin * 12.92f : 1.055f * powf(lin, 1.0f / 2.4f) - 0.055f;
+                    back[v] = (uint8_t)lroundf(std::min(1.0f, std::max(0.0f, enc)) * 255.0f);
+                }
+                for (size_t i = 0; i < count; i++)
+                    for (size_t k = 0; k < 3; k++) img.px[i * 4 + k] = back[img.px[i * 4 + k]];
+            }
+            // Alpha cuts leaves out and blends faces. It may come as a picture of its own;
+            // a texture that has simply lost it gets the game's back.
+            Image opacity;
+            std::string given;
+            for (const char *suffix : {"_opacity", "_alpha"})
+                if (given.empty() && pictures.count(name + suffix)) given = pictures[name + suffix];
+            if (!given.empty() && read_picture(given, &opacity)) {
+                for (int y = 0; y < img.h; y++)
+                    for (int x = 0; x < img.w; x++)
+                        img.px[((size_t)y * (size_t)img.w + (size_t)x) * 4 + 3] = (uint8_t)lroundf(sample_channel(opacity, 0, ((float)x + 0.5f) / (float)img.w, ((float)y + 0.5f) / (float)img.h));
+            } else if (have_original && spread(was, 3) > 1.0f && spread(img, 3) <= 1.0f) {
+                for (int y = 0; y < img.h; y++)
+                    for (int x = 0; x < img.w; x++)
+                        img.px[((size_t)y * (size_t)img.w + (size_t)x) * 4 + 3] = (uint8_t)lroundf(sample_channel(was, 3, ((float)x + 0.5f) / (float)img.w, ((float)y + 0.5f) / (float)img.h));
+                fprintf(stderr, "%s: the picture has no alpha where the game's texture has; the game's is put back\n", name.c_str());
+            }
+            textures++;
+        }
+        if (!write_png(out + "/" + name + ".png", img)) {
+            fprintf(stderr, "cannot write %s/%s.png\n", out.c_str(), name.c_str());
+            return 1;
+        }
+    }
+    for (auto &m : maps) {
+        const std::string &name = m.first;
+        Image metal, rough, packed, old;
+        bool has_metal = !m.second.metal.empty() && read_picture(m.second.metal, &metal), has_rough = !m.second.rough.empty() && read_picture(m.second.rough, &rough);
+        bool has_packed = !m.second.packed.empty() && read_picture(m.second.packed, &packed);
+        Image occlusion;
+        bool has_occlusion = !m.second.occlusion.empty() && read_picture(m.second.occlusion, &occlusion);
+        bool has_old = read_picture(out + "/" + name + "_pbr.png", &old);
+        if (!has_metal && !has_rough && !has_packed && !has_occlusion) {
+            fprintf(stderr, "%s: its maps cannot be read; left out\n", name.c_str());
+            skipped++;
+            continue;
+        }
+        Image map;
+        for (const Image *i : {&metal, &rough, &packed, &occlusion})
+            if (i->w > map.w) map.w = i->w, map.h = i->h;
+        map.px.assign((size_t)map.w * (size_t)map.h * 4, 255);
+        if (!(has_metal || has_packed) && !has_old) fprintf(stderr, "%s: no metalness given and none in the pack; taken as no metal\n", name.c_str());
+        if (!(has_rough || has_packed) && !has_old) fprintf(stderr, "%s: no roughness given and none in the pack; taken as 0.7\n", name.c_str());
+        // A horse's coat, where no map in the pack has it: worked out as texture_tool pbr does, from the game's own pictures.
+        Image base, spec;
+        bool coat = is_horse(name) && !has_old && game.count(name) && read_dds(game[name], &base);
+        bool has_spec = coat && load_specular(game, name, &spec);
+        for (int y = 0; y < map.h; y++)
+            for (int x = 0; x < map.w; x++) {
+                float u = ((float)x + 0.5f) / (float)map.w, v = ((float)y + 0.5f) / (float)map.h;
+                uint8_t *px = &map.px[((size_t)y * (size_t)map.w + (size_t)x) * 4];
+                px[0] = (uint8_t)lroundf(has_metal ? sample_channel(metal, 0, u, v) : has_packed ? sample_channel(packed, 2, u, v) : has_old ? sample_channel(old, 0, u, v) : 0.0f);
+                px[1] = (uint8_t)lroundf(has_rough ? sample_channel(rough, 0, u, v) : has_packed ? sample_channel(packed, 1, u, v) : has_old ? sample_channel(old, 1, u, v) : 0.7f * 255.0f);
+                px[2] = (uint8_t)lroundf(has_old ? sample_channel(old, 2, u, v) : 0.0f);
+                // Alpha: how much of the light from all round reaches the spot. (glTF's packed map has it in red, but it is often left white there.)
+                px[3] = (uint8_t)lroundf(has_occlusion ? sample_channel(occlusion, 0, u, v) : has_old ? sample_channel(old, 3, u, v) : 255.0f);
+                if (coat) {
+                    float brightest = powf(std::max({sample_channel(base, 0, u, v), sample_channel(base, 1, u, v), sample_channel(base, 2, u, v)}) / 255.0f, 2.2f);
+                    px[2] = (uint8_t)lroundf(coat_at(name, has_spec, has_spec ? sample_luminance(spec, u, v) : 0.0f, u, v, brightest) * 255.0f);
+                }
+            }
+        if (!write_png(out + "/" + name + "_pbr.png", map)) {
+            fprintf(stderr, "cannot write %s/%s_pbr.png\n", out.c_str(), name.c_str());
+            return 1;
+        }
+        pbr_maps++;
+    }
+    for (auto &h : heights) { // as they are, under a name the game has no texture by
+        Image img;
+        if (!read_picture(h.second, &img) || !write_png(out + "/" + h.first + "_depth.png", img)) {
+            fprintf(stderr, "%s: cannot be read; left out\n", h.second.c_str());
+            skipped++;
+            continue;
+        }
+        depth_maps++;
+    }
+    printf("%d textures, %d normal maps, %d maps of metalness, roughness and occlusion and %d of heights written to %s; %d pictures left out", textures, normal_maps, pbr_maps, depth_maps, out.c_str(), skipped);
+    if (unread) printf(", %d normal maps for textures whose materials read none", unread);
+    if (into_alpha) printf("; %d normal maps written the way the game keeps them, x in alpha", into_alpha);
+    printf("\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 4 && !strcmp(argv[1], "import")) {
+        float gain = 1.0f;
+        bool normals_up = true;
+        for (int i = 4; i < argc; i++) {
+            if (!strcmp(argv[i], "--gain") && i + 1 < argc) gain = std::max(0.01f, (float)atof(argv[++i]));
+            else if (!strcmp(argv[i], "--normals") && i + 1 < argc) normals_up = strcmp(argv[++i], "directx") != 0;
+        }
+        return import_pictures(argv[2], argv[3], gain, normals_up);
+    }
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "hair")) return hair_map(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
     if (argc < 3 || (strcmp(argv[1], "export") && strcmp(argv[1], "pbr"))) {
         fprintf(stderr, "usage: texture_tool export <out-folder> [name...]\n       texture_tool pbr <out-folder> [name...]\n"
-                        "       texture_tool hair <picture of the hair alone> <name> <out-folder> [picture of the saddle and straps alone]\n");
+                        "       texture_tool hair <picture of the hair alone> <name> <out-folder> [picture of the saddle and straps alone]\n"
+                        "       texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx]\n");
         return 2;
     }
     bool pbr = !strcmp(argv[1], "pbr");

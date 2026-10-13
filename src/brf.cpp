@@ -127,12 +127,20 @@ void read_mesh(Reader &r, int version, BrfMesh *mesh)
         }
     }
     uint32_t frames = r.u32(); // further poses of a vertex-animated mesh
+    if (mesh) mesh->frames.clear();
     for (uint32_t i = 0; i < frames; i++) {
-        r.skip(4);
-        uint32_t n = r.u32();
-        r.skip((size_t)n * 12);
-        n = r.u32();
-        r.skip((size_t)n * 12);
+        BrfFrame frame;
+        frame.time = (int)r.u32();
+        for (std::vector<float> *list : {&frame.positions, &frame.normals}) {
+            uint32_t n = r.u32();
+            r.need((size_t)n * 12);
+            if (mesh) {
+                list->resize((size_t)n * 3);
+                if (n) memcpy(list->data(), &r.b[r.at], (size_t)n * 12);
+            }
+            r.skip((size_t)n * 12);
+        }
+        if (mesh) mesh->frames.push_back(std::move(frame));
     }
     uint32_t vertices = r.u32();
     size_t size = 0;
@@ -144,6 +152,8 @@ void read_mesh(Reader &r, int version, BrfMesh *mesh)
         mesh->name = name, mesh->material = material, mesh->flags = flags;
         mesh->skinned = bones > 0;
         mesh->has_tangents = size == 41;
+        mesh->positions = positions, mesh->vertex_size = (int)size;
+        mesh->position_of.resize(vertices);
         mesh->vertices.resize(vertices);
         for (uint32_t i = 0; i < vertices; i++) {
             const uint8_t *p = &r.b[r.at + (size_t)i * size];
@@ -153,6 +163,7 @@ void read_mesh(Reader &r, int version, BrfMesh *mesh)
             memcpy(&position, p, 4);
             if (position >= positions) throw std::runtime_error("mesh " + name + ": a vertex outside its positions");
             memcpy(v.position, &r.b[positions_at + (size_t)position * 12], 12);
+            mesh->position_of[i] = position;
             memcpy(v.colour, p + 4, 4);
             memcpy(v.normal, p + 8, 12);
             v.handedness = 1;
@@ -264,7 +275,7 @@ void BrfLibrary::scan(const std::string &folder)
                             BrfSkeleton::Bone bone;
                             bone.parent = (int)r.u32();
                             bone.name = r.str();
-                            r.skip(4);
+                            bone.flags = r.u32();
                             for (float &v : bone.axes) v = r.f32();
                             for (float &v : bone.place) v = r.f32();
                             skeleton.bones.push_back(bone);
@@ -304,6 +315,103 @@ void BrfLibrary::scan(const std::string &folder)
             problems.push_back(name + ": " + e.what());
         }
     }
+}
+
+std::vector<std::string> BrfLibrary::parts_of(const std::string &base_name, int lod) const
+{
+    const std::string stem = lower(base_name) + (lod > 0 ? ".lod" + std::to_string(lod) : std::string());
+    std::vector<std::pair<long, std::string>> found;
+    if (meshes.count(stem)) found.push_back({0, stem});
+    // Everything that begins "stem." lies together in the map.
+    for (auto it = meshes.lower_bound(stem + "."); it != meshes.end() && it->first.compare(0, stem.size() + 1, stem + ".") == 0; ++it) {
+        const std::string rest = it->first.substr(stem.size() + 1);
+        if (rest.empty() || rest.find_first_not_of("0123456789") != std::string::npos) continue;
+        found.push_back({atol(rest.c_str()), it->first});
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> names;
+    for (auto &f : found) names.push_back(f.second);
+    return names;
+}
+
+int BrfLibrary::lods_of(const std::string &base_name) const
+{
+    int most = 0;
+    for (int k = 1; k <= 9; k++)
+        if (!parts_of(base_name, k).empty()) most = k;
+    return most;
+}
+
+bool BrfLibrary::mesh_extent(const std::string &name, std::string *path, size_t *begin, size_t *end) const
+{
+    auto it = meshes.find(lower(name));
+    if (it == meshes.end()) return false;
+    std::vector<uint8_t> data;
+    if (!read_file(files[(size_t)it->second.file], &data)) return false;
+    Reader r{data};
+    r.at = it->second.offset;
+    try {
+        read_mesh(r, it->second.version, nullptr);
+    } catch (const std::exception &) {
+        return false;
+    }
+    *path = files[(size_t)it->second.file], *begin = it->second.offset, *end = r.at;
+    return true;
+}
+
+std::vector<uint8_t> brf_mesh_record(const BrfMesh &mesh)
+{
+    std::vector<uint8_t> out;
+    auto bytes = [&](const void *p, size_t n) { out.insert(out.end(), (const uint8_t *)p, (const uint8_t *)p + n); };
+    auto u32 = [&](uint32_t v) { bytes(&v, 4); };
+    auto str = [&](const std::string &s) { u32((uint32_t)s.size()), bytes(s.data(), s.size()); };
+    str(mesh.name);
+    u32(mesh.flags);
+    str(mesh.material);
+    // Positions, and for each the first vertex that stands there.
+    std::vector<int> first(mesh.positions, -1);
+    for (size_t i = 0; i < mesh.vertices.size(); i++)
+        if (first[mesh.position_of[i]] < 0) first[mesh.position_of[i]] = (int)i;
+    u32(mesh.positions);
+    for (uint32_t p = 0; p < mesh.positions; p++) {
+        const float none[3] = {0, 0, 0};
+        bytes(first[p] >= 0 ? mesh.vertices[(size_t)first[p]].position : none, 12);
+    }
+    // Rigging, bone by bone: the positions it moves and by how much.
+    std::map<uint32_t, std::vector<std::pair<uint32_t, float>>> rig;
+    if (mesh.skinned)
+        for (uint32_t p = 0; p < mesh.positions; p++) {
+            if (first[p] < 0) continue;
+            const BrfVertex &v = mesh.vertices[(size_t)first[p]];
+            for (int k = 0; k < 4; k++)
+                if (v.weight[k] > 0) rig[(uint32_t)lroundf(v.bone[k])].push_back({p, v.weight[k]});
+        }
+    u32((uint32_t)rig.size());
+    for (auto &bone : rig) {
+        u32(bone.first), u32((uint32_t)bone.second.size());
+        for (auto &pair : bone.second) u32(pair.first), bytes(&pair.second, 4);
+    }
+    u32((uint32_t)mesh.frames.size());
+    for (const BrfFrame &frame : mesh.frames) {
+        u32((uint32_t)frame.time);
+        for (const std::vector<float> *list : {&frame.positions, &frame.normals}) u32((uint32_t)(list->size() / 3)), bytes(list->data(), list->size() * 4);
+    }
+    u32((uint32_t)mesh.vertices.size());
+    for (size_t i = 0; i < mesh.vertices.size(); i++) {
+        const BrfVertex &v = mesh.vertices[i];
+        u32(mesh.position_of[i]);
+        bytes(v.colour, 4);
+        bytes(v.normal, 12);
+        if (mesh.vertex_size == 41) {
+            bytes(v.tangent, 12);
+            out.push_back(v.handedness < 0 ? 1 : 0);
+        }
+        bytes(v.uv, 8);
+        if (mesh.vertex_size == 36) bytes(v.uv, 8); // the older layout's second set
+    }
+    u32((uint32_t)(mesh.indices.size() / 3));
+    bytes(mesh.indices.data(), mesh.indices.size() * 4);
+    return out;
 }
 
 bool BrfLibrary::load_mesh(const std::string &name, BrfMesh *mesh) const

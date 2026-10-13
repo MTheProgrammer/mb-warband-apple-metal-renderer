@@ -80,14 +80,26 @@ build/replay: tools/replay.mm $(REPLAY_OBJS) $(DEPS)
 
 # Exports the game's textures and makes metalness maps for texture packs:
 #   build/texture_tool pbr ~/Library/Application\ Support/warband-metal/textures/pbr
-build/texture_tool: tools/texture_tool.mm src/material_names.h
-	$(CXX) -std=c++17 -O2 -mmacosx-version-min=11.0 -fobjc-arc tools/texture_tool.mm -framework Foundation -framework ImageIO -framework CoreGraphics -o $@
+build/texture_tool: tools/texture_tool.mm tools/dds.h src/material_names.h src/brf.cpp src/brf.h
+	$(CXX) -std=c++17 -O2 -mmacosx-version-min=11.0 -fobjc-arc tools/texture_tool.mm src/brf.cpp -framework Foundation -framework ImageIO -framework CoreGraphics -o $@
+
+# Writes one of the game's models, with its rig and textures, as a glTF file for Blender:
+#   build/gltf_export horse_a -o horse_a.glb
+build/gltf_export: tools/gltf_export.cpp tools/dds.h src/brf.cpp src/brf.h
+	@mkdir -p build
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -mmacosx-version-min=11.0 tools/gltf_export.cpp src/brf.cpp -lz -o $@
+
+# The way back: models from Blender into copies of the game's resource files.
+#   build/gltf_import horse_a.glb -o out
+build/gltf_import: tools/gltf_import.cpp src/brf.cpp src/brf.h
+	@mkdir -p build
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -mmacosx-version-min=11.0 tools/gltf_import.cpp src/brf.cpp -o $@
 
 build:
 	mkdir -p build
 
 clean:
-	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/launcher build/*.zip
+	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/gltf_export build/gltf_import build/launcher build/*.zip
 	rm -rf "$(APP)"
 
 distclean:
