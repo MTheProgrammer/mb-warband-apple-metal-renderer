@@ -120,6 +120,7 @@ struct UniformLocation {
     const XlUniform *uniform[2] = {nullptr, nullptr}; // per stage: vertex, fragment
     int texture_index[2] = {-1, -1};                  // set for samplers
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
+    bool is_light_pos = false, is_light_colour = false; // vLightPosDir and vLightDiffuse: the scene's point lights (torches, candles)
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
     bool is_hair_map = false;                         // the wbm_hair_map sampler, which gets the bound texture's hair map
@@ -388,6 +389,12 @@ void update_room_probe();
 id<MTLSamplerState> s_sky_sampler;
 uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
+// WBM_TORCH_SHADOWS, a strength: the engine's point lights (torches, candles, fires) cast no shadows. From the
+// picture's own depth, each pixel is walked towards each light it is lit by; where something is in the way,
+// that light's share is taken off. WBM_TORCH_REACH: how far the walk goes, metres.
+float s_torch_shadows, s_torch_reach = 6.0f;
+float s_light_pos[4][4], s_light_colour[4][4]; // as the engine last gave them, in the world's space
+uint64_t s_lights_frame = ~0ull, s_torch_frames;
 bool s_sun_valid;
 void apply_ambient_occlusion();
 float s_bounce_light; // WBM_BOUNCE_LIGHT: light thrown by lit surfaces on those near them, a strength (1 is plenty); 0 for none
@@ -826,10 +833,10 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
     // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_room_probe || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene || (s_last.draws > 8 && s_prepass_frame == s_frame_serial)) &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_torch_shadows > 0 || s_room_probe || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene || (s_last.draws > 8 && s_prepass_frame == s_frame_serial)) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
-        if (s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0) apply_ambient_occlusion();
+        if (s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_torch_shadows > 0) apply_ambient_occlusion();
         // Indoors is where the engine gives the sun no colour. On leaving, the room is forgotten.
         s_interior = s_room_probe && s_sun_valid && s_sun_color[0] + s_sun_color[1] + s_sun_color[2] < 0.01f;
         if (s_interior) update_room_probe();
@@ -1142,6 +1149,8 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.emplace_back();
                 p.locations.back().name = name;
                 p.locations.back().is_sun_dir = name == "vSunDir";
+                p.locations.back().is_light_pos = name == "vLightPosDir";
+                p.locations.back().is_light_colour = name == "vLightDiffuse";
                 p.locations.back().is_sun_color = name == "vSunColor";
                 p.locations.back().is_sky = name == k_xl_sky_sampler;
                 p.locations.back().is_dyn_map = name == k_xl_dyn_sampler;
@@ -1229,6 +1238,10 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (s_dyn_shadows && l.is_sun_matrix && components == 16 && count >= 1) {
         memcpy(s_sun_matrix, data, sizeof s_sun_matrix); // the same for every program in a scene
         s_sun_matrix_valid = true;
+    }
+    if (s_torch_shadows > 0 && (l.is_light_pos || l.is_light_colour) && components == 4 && count >= 1) {
+        memcpy(l.is_light_pos ? s_light_pos : s_light_colour, data, (size_t)std::min(count, 4) * 16);
+        if (l.is_light_pos) s_lights_frame = s_frame_serial;
     }
     if ((s_contact_shadows || s_light_shafts || s_sky_ambient || s_foliage_backlight > 0) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
         // The UI and other passes set these too; only the values in use while the
@@ -1468,6 +1481,8 @@ struct Params {
     float2 shaft_size; // of the light-shaft textures, in pixels
     float4 shaft;      // xy: the sun's position on screen (0..1), z: how visible it is, w: strength
     float4 bounce;     // x: strength, y: radius in metres
+    float4 lights[4];  // point lights. xyz: where, in view space; w: how bright, 0 for none
+    float4 torch;      // x: strength of their shadows, y: how far towards a light the walk goes, metres
 };
 
 #if WBM_MSAA
@@ -1604,6 +1619,37 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
             float beyond = p.sun.w > 0.0 ? smoothstep(p.sun.w * 0.6, p.sun.w, P.z) : 1.0;
             ao *= 1.0 - p.shadow_strength * hit * smoothstep(0.05, 0.3, facing) * beyond;
         }
+    }
+    // Shadows from torches and the like: see s_torch_shadows.
+    if (p.torch.x > 0.0) {
+        float lit = 0.0, blocked = 0.0;
+        float3 origin = P + n * (0.02 + 0.004 * P.z);
+        for (int k = 0; k < 4; k++) {
+            if (p.lights[k].w <= 0.0) continue;
+            float3 to_light = p.lights[k].xyz - P;
+            float d2 = dot(to_light, to_light), d = sqrt(d2);
+            float3 L = to_light / max(d, 1.0e-4);
+            float facing = dot(n, L);
+            float share = p.lights[k].w * facing * min(1.0 / max(d2, 1.0e-4), 1.0); // as the engine's shaders weigh it
+            if (facing <= 0.05 || share < 0.003) continue;
+            lit += share;
+            float reach = min(d * 0.92, p.torch.y);
+            const int steps = 20;
+            for (int s = 0; s < steps; s++) {
+                float t = (float(s) + noise) / float(steps);
+                float3 S = origin + L * (t * t * reach + 0.03); // finer near the surface
+                if (S.z <= 0.05) break;
+                float2 ndc = float2(S.x * p.p00, S.y * p.p11) / S.z;
+                int2 sc = int2((ndc * 0.5 + 0.5) * p.ao_size);
+                if (any(sc < int2(0)) || any(sc >= int2(p.ao_size))) break;
+                float behind = S.z - z.read(uint2(sc)).x;
+                if (behind > 0.03 + 0.004 * S.z && behind < 0.45 + 0.02 * S.z) {
+                    blocked += share * (1.0 - 0.4 * t);
+                    break;
+                }
+            }
+        }
+        if (lit > 0.0) ao *= 1.0 - p.torch.x * blocked / (lit + 0.05); // the rest stands for the room's ambient light
     }
     return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
 }
@@ -1763,6 +1809,8 @@ struct AOParams { // must match Params in k_ao_source
     float shadow_strength, shadow_length, shaft_size[2];
     float shaft[4];
     float bounce[4];
+    float lights[4][4];
+    float torch[4];
 };
 
 id<MTLLibrary> s_ao_library;
@@ -1900,7 +1948,22 @@ void apply_ambient_occlusion()
             shafts = visible > 0.01f;
         }
     }
-    bool occlude = s_ao || params.shadow_strength > 0;
+    memset(params.lights, 0, sizeof params.lights);
+    params.torch[0] = params.torch[1] = params.torch[2] = params.torch[3] = 0;
+    if (s_torch_shadows > 0 && s_lights_frame == s_frame_serial && s_camera.view_proj_frame == s_frame_serial) {
+        int found = 0;
+        for (int k = 0; k < 4; k++) {
+            const float *w = s_light_pos[k], *col = s_light_colour[k];
+            float power = 0.2126f * col[0] + 0.7152f * col[1] + 0.0722f * col[2];
+            if (!(power > 0.02f) || (w[0] == 0 && w[1] == 0 && w[2] == 0)) continue;
+            double c[4];
+            for (int r = 0; r < 4; r++) c[r] = s_camera.view_proj[r] * w[0] + s_camera.view_proj[4 + r] * w[1] + s_camera.view_proj[8 + r] * w[2] + s_camera.view_proj[12 + r];
+            params.lights[k][0] = (float)(c[0] / s_camera.p00), params.lights[k][1] = (float)(c[1] / s_camera.p11), params.lights[k][2] = (float)c[3], params.lights[k][3] = power;
+            found++;
+        }
+        if (found) params.torch[0] = s_torch_shadows, params.torch[1] = s_torch_reach * scale, s_torch_frames++;
+    }
+    bool occlude = s_ao || params.shadow_strength > 0 || params.torch[0] > 0;
     bool bounce = s_bounce_light > 0 && s_bounce_compute_pipeline && s_bounce_blur_pipeline;
     params.bounce[0] = s_bounce_light * 2.5f, params.bounce[1] = 1.6f * scale, params.bounce[2] = params.bounce[3] = 0;
     if (!occlude && !shafts && !bounce) return;
@@ -2065,7 +2128,7 @@ bool vertex_matrix(Program &p, const char *name, double *out)
 void observe_camera(Program &p)
 {
     double wvp[16], wv[16], w[16], inv[16], m[16];
-    if (s_motion_blur && s_camera.view_proj_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp) &&
+    if ((s_motion_blur || s_torch_shadows > 0) && s_camera.view_proj_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp) &&
         vertex_matrix(p, "matWorld", w) && mat_inverse(w, inv)) {
         memcpy(s_camera.last_view_proj, s_camera.view_proj, sizeof s_camera.view_proj);
         s_camera.last_view_proj_frame = s_camera.view_proj_frame;
@@ -4683,6 +4746,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     s_shader_options.hair_strands = s_people_hair;
     if (const char *v = getenv("WBM_ROOM_PROBE")) s_room_probe = atoi(v) != 0;
+    if (const char *v = getenv("WBM_TORCH_SHADOWS")) s_torch_shadows = std::min(1.0f, std::max(0.0f, (float)atof(v)));
+    if (const char *v = getenv("WBM_TORCH_REACH")) s_torch_reach = std::min(8.0f, std::max(0.3f, (float)atof(v)));
     if (const char *v = getenv("WBM_ROOM_PROBE_EVERY")) s_room_every = std::max(1, atoi(v));
     if (const char *v = getenv("WBM_WATER_REFLECTIONS")) s_water_reflections = atoi(v) != 0;
     if (const char *v = getenv("WBM_WATER_STEPS")) s_water_steps = std::min(64, std::max(4, atoi(v)));
@@ -4799,6 +4864,11 @@ void mtl_dump_stats(FILE *f)
     if (s_velocity_objects) fprintf(f, "moving objects blurred by their own movement: %llu in all\n", (unsigned long long)s_velocity_objects);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
     if (s_water_copies) fprintf(f, "\nscene copied for water to reflect in %llu frames\n", (unsigned long long)s_water_copies);
+    if (s_torch_frames) {
+        fprintf(f, "\nshadows from point lights in %llu frames; lights now:", (unsigned long long)s_torch_frames);
+        for (int k = 0; k < 4; k++) fprintf(f, " [%.1f %.1f %.1f | %.2f %.2f %.2f]", s_light_pos[k][0], s_light_pos[k][1], s_light_pos[k][2], s_light_colour[k][0], s_light_colour[k][1], s_light_colour[k][2]);
+        fprintf(f, "\n");
+    }
     if (s_room_updates) fprintf(f, "\nroom probe updated in %llu frames\n", (unsigned long long)s_room_updates);
     if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
