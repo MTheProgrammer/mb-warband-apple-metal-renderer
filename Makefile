@@ -9,7 +9,7 @@ CXX      := clang++
 CXXFLAGS := -arch x86_64 -std=c++17 -O2 -g -Wall -Wextra -Wno-deprecated-declarations \
             -mmacosx-version-min=11.0 -fvisibility=hidden -fno-c++-static-destructors
 FRAMEWORKS := -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
-              -framework Metal -framework QuartzCore -framework AppKit
+              -framework Metal -framework QuartzCore -framework AppKit -weak_framework MetalFX
 
 HDRS := $(wildcard src/*.h) $(wildcard src/*.inc) src/gl_api.def
 DEPS := build/deps/libdeps.a

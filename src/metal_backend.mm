@@ -10,6 +10,7 @@
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CABase.h>
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -68,7 +69,9 @@ struct Texture {
     int gl_w = 0, gl_h = 0;
     MTLPixelFormat format = MTLPixelFormatInvalid;
     int top_level = -1; // highest mip level that has content
-    int scale = 1;      // storage is this many times the size the game asked for (see s_scale)
+    double scale = 1;   // storage is this many times the size the game asked for (see s_scale and s_render_scale)
+    id<MTLTexture> upscaled; // the scene in this texture enlarged to the screen's size, for upscaled_frame only (see apply_upscale)
+    uint64_t upscaled_frame = 0;
     bool screen_sized = false; // a render target the size of the screen: scaled, and multisampled if that is on
     id<MTLTexture> ms;         // multisampled companion that is rendered into; `mtl` receives the resolve
     id<MTLTexture> srgb_view;  // the same storage read through an sRGB format, made on demand
@@ -81,7 +84,7 @@ struct Texture {
 
 struct Renderbuffer {
     id<MTLTexture> mtl; // multisampled itself when it belongs to a multisampled target
-    int scale = 1;
+    double scale = 1;
     GLenum gl_internal = 0; // as the game asked for it, for frame captures
     int gl_w = 0, gl_h = 0;
 };
@@ -200,7 +203,8 @@ id<MTLCommandBuffer> s_cmd;
 id<MTLRenderCommandEncoder> s_pass;
 id<MTLTexture> s_pass_color, s_pass_depth; // attachments of the open pass
 bool s_pass_screen;
-int s_pass_scale = 1, s_pass_samples = 1;
+double s_pass_scale = 1;
+int s_pass_samples = 1;
 
 // Multisampling (WBM_MSAA). Screen-sized render targets, and the screen, are
 // rendered into multisampled textures that are resolved when each pass ends.
@@ -214,6 +218,14 @@ uint64_t s_scene_frame; // the last frame in which the engine drew into its HDR 
 // half the panel's resolution, so the screen and every screen-sized render
 // target are allocated s_scale times larger and viewports are scaled to match.
 int s_scale = 1;
+// WBM_UPSCALE (for example 0.67): the scene is drawn into targets that share
+// of the screen's size each way, and MetalFX enlarges the finished picture to
+// the screen's own before the engine's last pass puts it there (see
+// apply_upscale). Every screen-sized target but the screen itself is then
+// s_render_scale times the game's size, not s_scale times.
+double s_render_scale = 1;
+bool s_upscale;
+float s_sharpen; // WBM_SHARPEN, 0 to 1: see apply_sharpen
 int s_screen_w, s_screen_h; // the size the game believes the screen has
 
 bool is_screen_sized(int w, int h)
@@ -221,9 +233,9 @@ bool is_screen_sized(int w, int h)
     return w == s_screen_w && h == s_screen_h;
 }
 
-int scale_for(int w, int h)
+double scale_for(int w, int h)
 {
-    return is_screen_sized(w, h) ? s_scale : 1;
+    return is_screen_sized(w, h) ? s_render_scale : 1;
 }
 
 // Uniform data is copied into chunks that live until the GPU has used them.
@@ -618,6 +630,8 @@ bool s_preview_keeps_scene;
 bool s_preview_in_scene; // the model has been drawn into the scene buffer this frame: what follows may be post-processed
 bool s_fxaa;
 void apply_fxaa();
+id<MTLTexture> apply_upscale() API_AVAILABLE(macos(13.0));
+void apply_sharpen(id<MTLTexture> picture);
 // Frame-rate limits (WBM_MAX_FPS, and WBM_MENU_FPS for frames without a 3D scene); 0 for none.
 double s_max_fps, s_menu_fps;
 
@@ -713,7 +727,8 @@ struct Target {
     bool scene = false; // the engine's HDR scene buffer: screen-sized, RGBA16F, with depth
     bool prepass = false; // the engine's depth pre-pass: screen-sized, R16F, with depth
     bool shadow_map = false; // the engine's own shadow map of the scenery: large, square, R32F
-    int scale = 1, samples = 1;
+    double scale = 1;
+    int samples = 1;
 };
 
 // The attachments the bound framebuffer currently describes. Returns false
@@ -785,12 +800,15 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
     // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene) &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
         if (s_ao || s_contact_shadows || s_light_shafts) apply_ambient_occlusion();
         if (s_motion_blur) apply_motion_blur();
         if (s_fxaa) apply_fxaa(); // last: edges as they will be shown
+        id<MTLTexture> shown = nil;
+        if (@available(macOS 13.0, *)) shown = s_upscale ? apply_upscale() : nil;
+        if (s_sharpen > 0) apply_sharpen(shown ? shown : s_last.color);
     }
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (t.color) {
@@ -2278,6 +2296,134 @@ void apply_fxaa()
     s_fxaa_frames++;
 }
 
+// Upscaling (WBM_UPSCALE): the scene was drawn smaller than the screen. MetalFX
+// enlarges it to the screen's size into a texture of its own, which stands in
+// for the scene's when the engine's last pass, the one onto the screen, reads
+// it (see the binding of textures in prepare_draw). Everything before that
+// pass, the engine's own effects and the shim's, works on the smaller picture,
+// which is where the time is saved.
+id<MTLFXSpatialScaler> s_scaler API_AVAILABLE(macos(13.0));
+id<MTLTexture> s_upscaled;
+uint64_t s_upscale_frames;
+
+id<MTLTexture> apply_upscale()
+{
+    id<MTLTexture> scene = s_last.color;
+    if (!scene) return nil;
+    NSUInteger w = (NSUInteger)(s_screen_w * s_scale), h = (NSUInteger)(s_screen_h * s_scale);
+    if (scene.width >= w || scene.height >= h) return nil;
+    if (!s_scaler || s_scaler.inputWidth != scene.width || s_scaler.inputHeight != scene.height || s_scaler.outputWidth != w || s_scaler.outputHeight != h ||
+        s_scaler.colorTextureFormat != scene.pixelFormat) {
+        MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+        d.inputWidth = scene.width, d.inputHeight = scene.height, d.outputWidth = w, d.outputHeight = h;
+        d.colorTextureFormat = d.outputTextureFormat = scene.pixelFormat;
+        // The scene holds colours already encoded for the eye; in its 16-bit form they may also run past white.
+        d.colorProcessingMode = scene.pixelFormat == MTLPixelFormatRGBA16Float ? MTLFXSpatialScalerColorProcessingModeHDR : MTLFXSpatialScalerColorProcessingModePerceptual;
+        s_scaler = [d newSpatialScalerWithDevice:s_device];
+        if (!s_scaler) {
+            complain("WBM_UPSCALE: MetalFX would not make a scaler from %lux%lu to %lux%lu", (unsigned long)scene.width, (unsigned long)scene.height, (unsigned long)w, (unsigned long)h);
+            s_upscale = false;
+            return nil;
+        }
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:scene.pixelFormat width:w height:h mipmapped:NO];
+        td.usage = s_scaler.outputTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        s_upscaled = [s_device newTextureWithDescriptor:td];
+    }
+    s_scaler.colorTexture = scene;
+    s_scaler.outputTexture = s_upscaled;
+    [s_scaler encodeToCommandBuffer:command_buffer()];
+    for (auto &entry : s_textures)
+        if (entry.second.mtl == scene) entry.second.upscaled = s_upscaled, entry.second.upscaled_frame = s_frame_serial;
+    s_upscale_frames++;
+    return s_upscaled;
+}
+
+// Sharpening (WBM_SHARPEN, 0 to 1), after AMD's contrast-adaptive sharpening:
+// each pixel is pushed away from the average of its four neighbours, less
+// where they already differ much (so edges do not ring and noise is not
+// raised), and never past the darkest or brightest of them.
+const char k_sharpen_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexOut {
+    float4 position [[position]];
+};
+vertex VertexOut sharpen_vertex(uint id [[vertex_id]])
+{
+    VertexOut out;
+    out.position = float4(float2((id << 1) & 2, id & 2) * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+fragment float4 sharpen_fragment(VertexOut in [[stage_in]], texture2d<float> picture [[texture(0)]], constant float &amount [[buffer(0)]])
+{
+    int2 at = int2(in.position.xy), most = int2(picture.get_width(), picture.get_height()) - 1;
+    float4 here = picture.read(uint2(at));
+    float3 a = picture.read(uint2(clamp(at + int2(0, -1), int2(0), most))).rgb, b = picture.read(uint2(clamp(at + int2(-1, 0), int2(0), most))).rgb;
+    float3 c = picture.read(uint2(clamp(at + int2(1, 0), int2(0), most))).rgb, d = picture.read(uint2(clamp(at + int2(0, 1), int2(0), most))).rgb;
+    float3 low = min(min(min(a, b), min(c, d)), here.rgb), high = max(max(max(a, b), max(c, d)), here.rgb);
+    // How far there is to go before clipping, against how far apart they are already.
+    float3 room = sqrt(clamp(min(low, 2.0 - high) / max(high, 1e-4), 0.0, 1.0));
+    float3 weight = room * (-0.2 * amount);
+    float3 sharp = (here.rgb + (a + b + c + d) * weight) / (1.0 + 4.0 * weight);
+    return float4(clamp(sharp, low, high), here.a);
+}
+)";
+id<MTLLibrary> s_sharpen_library;
+std::map<int, id<MTLRenderPipelineState>> s_sharpen_pipelines; // by colour format
+id<MTLTexture> s_sharpen_texture;
+uint64_t s_sharpen_frames;
+
+void apply_sharpen(id<MTLTexture> picture)
+{
+    if (!picture) return;
+    if (!s_sharpen_library) {
+        NSError *error = nil;
+        s_sharpen_library = [s_device newLibraryWithSource:@(k_sharpen_source) options:nil error:&error];
+        if (!s_sharpen_library) {
+            complain("sharpening shaders did not compile: %s", error.localizedDescription.UTF8String);
+            s_sharpen = 0;
+            return;
+        }
+    }
+    id<MTLRenderPipelineState> __strong &pipeline = s_sharpen_pipelines[(int)picture.pixelFormat];
+    if (!pipeline) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [s_sharpen_library newFunctionWithName:@"sharpen_vertex"];
+        d.fragmentFunction = [s_sharpen_library newFunctionWithName:@"sharpen_fragment"];
+        d.colorAttachments[0].pixelFormat = picture.pixelFormat;
+        NSError *error = nil;
+        pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!pipeline) {
+            complain("sharpening pipeline failed: %s", error.localizedDescription.UTF8String);
+            s_sharpen = 0;
+            return;
+        }
+    }
+    NSUInteger w = picture.width, h = picture.height;
+    if (!s_sharpen_texture || s_sharpen_texture.width != w || s_sharpen_texture.height != h || s_sharpen_texture.pixelFormat != picture.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:picture.pixelFormat width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_sharpen_texture = [s_device newTextureWithDescriptor:td];
+    }
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_sharpen_texture;
+    d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:pipeline];
+    [pass setFragmentTexture:picture atIndex:0];
+    [pass setFragmentBytes:&s_sharpen length:4 atIndex:0];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+    id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+    [blit copyFromTexture:s_sharpen_texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                toTexture:picture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    s_sharpen_frames++;
+}
+
 // Foliage that the engine hands over in batches, many plants in one buffer and
 // already placed in the world, carries nothing that says how high above its
 // own foot a vertex is, which is what the wind needs. It is worked out here,
@@ -3587,6 +3733,8 @@ bool prepare_draw()
                 if (id<MTLTexture> view = srgb_view_for(*t)) texture = view;
                 else complain("a texture without an sRGB format is bound to %s; it will look too bright", l.name.c_str());
             }
+            // The pass onto the screen reads the scene enlarged, when it has been (see apply_upscale).
+            if (s_pass_screen && t && texture == t->mtl && t->upscaled && t->upscaled_frame == s_frame_serial) texture = t->upscaled;
             bool tracked = index < 16;
             if (!already(tracked && s_set.texture[s][index] == (__bridge void *)texture)) {
                 if (s == 0) [s_pass setVertexTexture:texture atIndex:(NSUInteger)index];
@@ -3967,6 +4115,17 @@ void mtl_attach_window(void *nswindow, int width, int height)
         NSWindow *window = (__bridge NSWindow *)nswindow;
         s_scale = scale_env ? atoi(scale_env) : (int)lround(window.backingScaleFactor);
         s_scale = std::max(1, std::min(4, s_scale));
+        s_render_scale = s_scale;
+        if (const char *v = getenv("WBM_UPSCALE")) {
+            double share = atof(v);
+            if (share >= 0.3 && share < 0.999) {
+                bool can = false;
+                if (@available(macOS 13.0, *)) can = [MTLFXSpatialScalerDescriptor supportsDevice:s_device];
+                if (can) s_upscale = true, s_render_scale = s_scale * share;
+                else complain("WBM_UPSCALE: MetalFX is not available on this machine");
+            }
+        }
+        if (const char *v = getenv("WBM_SHARPEN")) s_sharpen = std::min(1.0f, std::max(0.0f, (float)atof(v)));
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = s_device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -4020,6 +4179,8 @@ void mtl_dump_stats(FILE *f)
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
+    if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
+    if (s_sharpen_frames) fprintf(f, "\nsharpened in %llu frames\n", (unsigned long long)s_sharpen_frames);
     if (s_fxaa_frames) fprintf(f, "\nanti-aliasing (FXAA) applied in %llu frames\n", (unsigned long long)s_fxaa_frames);
     if (s_max_fps > 0 || s_menu_fps > 0) fprintf(f, "\nframe rate limited to %.0f, %.0f without a 3D scene (0: no limit)\n", s_max_fps, s_menu_fps);
     if (s_sky_ambient) {
@@ -4438,8 +4599,8 @@ void mtl_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei 
     if (level == 0) t->gl_internal = internalformat, t->gl_format = format, t->gl_type = type, t->gl_w = width, t->gl_h = height;
     @autoreleasepool {
         // Without data this is a render target: screen-sized ones get the screen's scale.
-        int k = (!pixels && level == 0) ? scale_for(width, height) : 1;
-        if (!ensure_storage(*t, f, level, width * k, height * k)) return;
+        double k = (!pixels && level == 0) ? scale_for(width, height) : 1;
+        if (!ensure_storage(*t, f, level, (int)lround(width * k), (int)lround(height * k))) return;
         t->scale = k;
         if (level == 0) t->screen_sized = !pixels && is_screen_sized(width, height);
         if (!pixels) return;
@@ -4626,7 +4787,7 @@ void mtl_glRenderbufferStorage(GLenum, GLenum internalformat, GLsizei width, GLs
         Renderbuffer &rb = s_renderbuffers[s_rbo];
         rb.gl_internal = internalformat, rb.gl_w = width, rb.gl_h = height;
         rb.scale = scale_for(width, height);
-        rb.mtl = new_depth_texture((NSUInteger)(width * rb.scale), (NSUInteger)(height * rb.scale),
+        rb.mtl = new_depth_texture((NSUInteger)lround(width * rb.scale), (NSUInteger)lround(height * rb.scale),
                                    is_screen_sized(width, height) ? s_msaa : 1);
     }
 }

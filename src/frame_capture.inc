@@ -205,7 +205,7 @@ void write_state()
             } else if (kind == 1) {
                 MTLTextureSwizzleChannels sw = t.mtl.swizzle;
                 r.i((int64_t)t.mtl.pixelFormat).i((int64_t)t.mtl.width).i((int64_t)t.mtl.height).i((int64_t)t.mtl.mipmapLevelCount).i((int64_t)t.mtl.usage);
-                r.i(sw.red).i(sw.green).i(sw.blue).i(sw.alpha).i(t.top_level).i(t.scale);
+                r.i(sw.red).i(sw.green).i(sw.blue).i(sw.alpha).i(t.top_level).i((int)lround(t.scale));
                 std::vector<std::vector<uint8_t>> levels = read_texture(t.mtl, std::max(t.top_level, 0));
                 r.i((int64_t)levels.size());
                 for (auto &level : levels) r.blob(level.data(), level.size());
