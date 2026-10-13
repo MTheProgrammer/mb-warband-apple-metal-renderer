@@ -1729,6 +1729,7 @@ const char k_tonemap_functions[] = R"(
 vec3 wbm_filmic(vec3 x)
 {
     const float knee = 0.6;
+    x = max(x, vec3(0.0)); // below black there is nothing: left negative, it comes out of the encoding that follows as white
     vec3 over = max(x - knee, vec3(0.0));
     return min(x, vec3(knee)) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
 }

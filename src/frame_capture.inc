@@ -260,9 +260,11 @@ void capture_at_frame_end()
     }
     if (!s_capture_requested) return;
     s_capture_requested = 0;
-    const char *dir = getenv("WBM_OUT");
-    char path[1200];
-    snprintf(path, sizeof path, "%s/capture_%06llu.wbcap", dir ? dir : ".", (unsigned long long)s_frame_serial);
+    // Beside the run's log: where WBM_OUT says, or else where the log goes without it (not the game's own folder, which is the working directory).
+    const char *dir = getenv("WBM_OUT"), *home = getenv("HOME");
+    char path[1200], logs[1024];
+    snprintf(logs, sizeof logs, "%s/Library/Logs/warband-metal", home ? home : ".");
+    snprintf(path, sizeof path, "%s/capture_%06llu.wbcap", dir ? dir : logs, (unsigned long long)s_frame_serial);
     s_rec = fopen(path, "wb");
     if (!s_rec) {
         complain("cannot write a frame capture to %s", path);
