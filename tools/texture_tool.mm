@@ -23,7 +23,7 @@
 //       A second picture, of the saddle, straps and other gear alone, keeps
 //       the coat off those.
 //
-//   texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx]
+//   texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx] [--dds]
 //       makes a texture pack of pictures that come back from being enlarged or
 //       repainted elsewhere (Blender, say), named after the game's textures:
 //         <name>, <name>_basecolor     the texture itself (also _albedo, _diffuse);
@@ -48,7 +48,10 @@
 //       alpha (the textures of rooms), it is put there. A texture that has lost
 //       its alpha on the way gets the game's own back. --gain g: the pictures
 //       were made g times brighter than the game's, in linear light, to look
-//       right elsewhere; they are brought back.
+//       right elsewhere; they are brought back. --dds: the pack is written as
+//       .dds files in the game's own compression, with their smaller sizes,
+//       not as PNG: a quarter to an eighth of the video memory, and no
+//       unpacking when a scene loads, for a little blockiness.
 //
 // The game's folder is taken from WBM_GAME, or from where Steam puts it.
 
@@ -60,6 +63,8 @@
 #import <ImageIO/ImageIO.h>
 
 #include <algorithm>
+#include <dispatch/dispatch.h>
+#include <unistd.h>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -579,6 +584,196 @@ static int hair_map(const std::string &picture, std::string name, const std::str
     return 0;
 }
 
+// ---- compressed files -------------------------------------------------------------------
+//
+// A texture as a .dds file in the game's own kinds of compression (DXT1, or DXT5 where alpha holds
+// something), with every smaller size down to one pixel: the renderer hands such a file to the GPU as it
+// is, where a PNG is unpacked to four bytes a pixel. A block of sixteen pixels becomes two colours and,
+// for each pixel, which of four blends of the two it is nearest.
+
+static uint16_t pack565(const float *c)
+{
+    auto q = [](float v, float top) { return (uint16_t)lroundf(std::min(255.0f, std::max(0.0f, v)) * top / 255.0f); };
+    return (uint16_t)(q(c[0], 31) << 11 | q(c[1], 63) << 5 | q(c[2], 31));
+}
+
+static void unpack565(uint16_t v, float *c)
+{
+    c[0] = (float)((v >> 11) * 255 / 31), c[1] = (float)(((v >> 5) & 63) * 255 / 63), c[2] = (float)((v & 31) * 255 / 31);
+}
+
+// Which blend each pixel takes, and how far off the block is in all.
+static float assign(const float px[16][3], uint16_t c0, uint16_t c1, uint8_t *which)
+{
+    float p[4][3];
+    unpack565(c0, p[0]), unpack565(c1, p[1]);
+    for (int k = 0; k < 3; k++) p[2][k] = (2 * p[0][k] + p[1][k]) / 3, p[3][k] = (p[0][k] + 2 * p[1][k]) / 3;
+    float total = 0;
+    for (int i = 0; i < 16; i++) {
+        float best = 1e30f;
+        for (int n = 0; n < 4; n++) {
+            float d = 0;
+            for (int k = 0; k < 3; k++) d += (px[i][k] - p[n][k]) * (px[i][k] - p[n][k]);
+            if (d < best) best = d, which[i] = (uint8_t)n;
+        }
+        total += best;
+    }
+    return total;
+}
+
+static void encode_colour(const float px[16][3], uint8_t *out)
+{
+    // The two colours: the ends of the pixels' spread along the line they lie nearest to.
+    float mean[3] = {0, 0, 0}, cov[6] = {0, 0, 0, 0, 0, 0}, lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
+    for (int i = 0; i < 16; i++)
+        for (int k = 0; k < 3; k++) mean[k] += px[i][k] / 16, lo[k] = std::min(lo[k], px[i][k]), hi[k] = std::max(hi[k], px[i][k]);
+    for (int i = 0; i < 16; i++) {
+        float d[3] = {px[i][0] - mean[0], px[i][1] - mean[1], px[i][2] - mean[2]};
+        cov[0] += d[0] * d[0], cov[1] += d[0] * d[1], cov[2] += d[0] * d[2], cov[3] += d[1] * d[1], cov[4] += d[1] * d[2], cov[5] += d[2] * d[2];
+    }
+    float axis[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
+    for (int n = 0; n < 4; n++) {
+        float next[3] = {cov[0] * axis[0] + cov[1] * axis[1] + cov[2] * axis[2], cov[1] * axis[0] + cov[3] * axis[1] + cov[4] * axis[2],
+                         cov[2] * axis[0] + cov[4] * axis[1] + cov[5] * axis[2]};
+        float length = sqrtf(next[0] * next[0] + next[1] * next[1] + next[2] * next[2]);
+        if (length < 1e-6f) break;
+        for (int k = 0; k < 3; k++) axis[k] = next[k] / length;
+    }
+    float length = sqrtf(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]), least = 1e30f, most = -1e30f;
+    if (length > 1e-6f)
+        for (float &a : axis) a /= length;
+    for (int i = 0; i < 16; i++) {
+        float t = (px[i][0] - mean[0]) * axis[0] + (px[i][1] - mean[1]) * axis[1] + (px[i][2] - mean[2]) * axis[2];
+        least = std::min(least, t), most = std::max(most, t);
+    }
+    float e0[3], e1[3];
+    for (int k = 0; k < 3; k++) e0[k] = mean[k] + axis[k] * most, e1[k] = mean[k] + axis[k] * least;
+    uint16_t c0 = pack565(e0), c1 = pack565(e1);
+    uint8_t which[16];
+    float error = assign(px, c0, c1, which);
+    // Once more: with every pixel's blend fixed, the two colours that fit them best.
+    for (int pass = 0; pass < 2 && c0 != c1; pass++) {
+        static const float share[4] = {1.0f, 0.0f, 2.0f / 3.0f, 1.0f / 3.0f};
+        float aa = 0, ab = 0, bb = 0, ax[3] = {0, 0, 0}, bx[3] = {0, 0, 0};
+        for (int i = 0; i < 16; i++) {
+            float a = share[which[i]], b = 1 - a;
+            aa += a * a, ab += a * b, bb += b * b;
+            for (int k = 0; k < 3; k++) ax[k] += a * px[i][k], bx[k] += b * px[i][k];
+        }
+        float det = aa * bb - ab * ab;
+        if (fabsf(det) < 1e-4f) break;
+        float n0[3], n1[3];
+        for (int k = 0; k < 3; k++) n0[k] = (ax[k] * bb - bx[k] * ab) / det, n1[k] = (bx[k] * aa - ax[k] * ab) / det;
+        uint16_t t0 = pack565(n0), t1 = pack565(n1);
+        uint8_t again[16];
+        float better = assign(px, t0, t1, again);
+        if (better >= error) break;
+        error = better, c0 = t0, c1 = t1;
+        memcpy(which, again, 16);
+    }
+    // The first colour has to be the larger number, or the block is read as three blends and a hole.
+    if (c0 < c1) {
+        std::swap(c0, c1);
+        static const uint8_t other[4] = {1, 0, 3, 2};
+        for (uint8_t &w : which) w = other[w];
+    }
+    if (c0 == c1) memset(which, 0, 16);
+    uint32_t bits = 0;
+    for (int i = 0; i < 16; i++) bits |= (uint32_t)which[i] << (2 * i);
+    memcpy(out, &c0, 2), memcpy(out + 2, &c1, 2), memcpy(out + 4, &bits, 4);
+}
+
+static void encode_alpha(const uint8_t *a, uint8_t *out)
+{
+    uint8_t hi = 0, lo = 255;
+    for (int i = 0; i < 16; i++) hi = std::max(hi, a[i]), lo = std::min(lo, a[i]);
+    out[0] = hi, out[1] = lo; // the larger first: eight blends
+    uint64_t bits = 0;
+    for (int i = 0; i < 16 && hi != lo; i++) {
+        int best = 0, off = 1000;
+        for (int n = 0; n < 8; n++) {
+            int value = n == 0 ? hi : n == 1 ? lo : ((8 - n) * hi + (n - 1) * lo) / 7;
+            if (abs(value - a[i]) < off) off = abs(value - a[i]), best = n;
+        }
+        bits |= (uint64_t)best << (3 * i);
+    }
+    memcpy(out + 2, &bits, 6);
+}
+
+// `colour`: the picture is colour as the eye sees it, and its smaller sizes are averaged as light.
+static bool write_dds(const std::string &path, const Image &img, bool colour)
+{
+    bool alpha = false;
+    for (size_t i = 3; i < img.px.size() && !alpha; i += 4) alpha = img.px[i] != 255;
+    const size_t block = alpha ? 16 : 8;
+    static float to_light[256];
+    static bool ready = false;
+    if (!ready) {
+        for (int v = 0; v < 256; v++) to_light[v] = powf((float)v / 255.0f, 2.2f);
+        ready = true;
+    }
+    std::vector<uint8_t> file(128, 0);
+    uint32_t levels = 0;
+    Image level = img;
+    for (;;) {
+        const int w = level.w, h = level.h, across = (w + 3) / 4, down = (h + 3) / 4;
+        size_t at = file.size();
+        file.resize(at + (size_t)across * (size_t)down * block);
+        uint8_t *out = file.data() + at;
+        const Image *from = &level;
+        dispatch_apply((size_t)down, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t by) {
+          for (int bx = 0; bx < across; bx++) {
+              float px[16][3];
+              uint8_t a[16];
+              for (int i = 0; i < 16; i++) { // past the edge, the edge again
+                  int x = std::min(bx * 4 + i % 4, w - 1), y = std::min((int)by * 4 + i / 4, h - 1);
+                  const uint8_t *p = &from->px[((size_t)y * (size_t)w + (size_t)x) * 4];
+                  px[i][0] = p[0], px[i][1] = p[1], px[i][2] = p[2], a[i] = p[3];
+              }
+              uint8_t *to = out + (by * (size_t)across + (size_t)bx) * block;
+              if (alpha) encode_alpha(a, to);
+              encode_colour(px, to + (alpha ? 8 : 0));
+          }
+        });
+        levels++;
+        if (w == 1 && h == 1) break;
+        Image half;
+        half.w = std::max(w / 2, 1), half.h = std::max(h / 2, 1);
+        half.px.resize((size_t)half.w * (size_t)half.h * 4);
+        for (int y = 0; y < half.h; y++)
+            for (int x = 0; x < half.w; x++)
+                for (int k = 0; k < 4; k++) {
+                    float sum = 0;
+                    for (int n = 0; n < 4; n++) {
+                        int sx = std::min(x * 2 + n % 2, w - 1), sy = std::min(y * 2 + n / 2, h - 1);
+                        uint8_t v = level.px[((size_t)sy * (size_t)w + (size_t)sx) * 4 + (size_t)k];
+                        sum += colour && k < 3 ? to_light[v] : (float)v / 255.0f;
+                    }
+                    sum /= 4;
+                    half.px[((size_t)y * (size_t)half.w + (size_t)x) * 4 + (size_t)k] = (uint8_t)lroundf((colour && k < 3 ? powf(sum, 1.0f / 2.2f) : sum) * 255.0f);
+                }
+        level = std::move(half);
+    }
+    auto put = [&](size_t at, uint32_t v) { memcpy(&file[at], &v, 4); };
+    memcpy(&file[0], "DDS ", 4);
+    put(4, 124), put(8, 0x000A1007); // caps, height, width, pixel format, mipmap count, linear size
+    put(12, (uint32_t)img.h), put(16, (uint32_t)img.w), put(20, (uint32_t)(((size_t)img.w + 3) / 4 * (((size_t)img.h + 3) / 4) * block)), put(28, levels);
+    put(76, 32), put(80, 4); // a pixel format named by four letters
+    memcpy(&file[84], alpha ? "DXT5" : "DXT1", 4);
+    put(108, 0x00401008); // a texture, with smaller sizes
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(file.data(), 1, file.size(), f) == file.size();
+    return fclose(f) == 0 && ok;
+}
+
+// One of a pack's files, in the kind asked for; a file of the same name in the other kind makes way.
+static bool write_texture(const std::string &stem, const Image &img, bool dds, bool colour)
+{
+    unlink((stem + (dds ? ".png" : ".dds")).c_str());
+    return dds ? write_dds(stem + ".dds", img, colour) : write_png(stem + ".png", img);
+}
+
 // One channel of a picture at a place given in shares of its width and height, between its pixels.
 static float sample_channel(const Image &m, int channel, float u, float v)
 {
@@ -604,7 +799,7 @@ static float spread(const Image &m, int channel)
 }
 
 // See the top of the file.
-static int import_pictures(const std::string &in, const std::string &out, float gain, bool normals_up)
+static int import_pictures(const std::string &in, const std::string &out, float gain, bool normals_up, bool dds)
 {
     std::map<std::string, std::string> game = game_textures();
     if (game.empty()) {
@@ -658,6 +853,29 @@ static int import_pictures(const std::string &in, const std::string &out, float 
     }
     closedir(d);
     make_folders(out);
+    // A set of pictures may go by a shorter name than the game's texture: nordic_helmets_basecolor, for the
+    // game's nordic_helmets_diff. Where the game has no texture of a set's name but has one with such an
+    // ending, the set is that texture's.
+    {
+        std::map<std::string, std::string> renamed;
+        for (auto &p : pictures) {
+            std::string name = p.first;
+            for (const char *suffix : {"_basecolor", "_base_color", "_albedo", "_diffuse", "_normal", "_metallicroughness", "_metallic", "_metalness", "_metal",
+                                       "_roughness", "_rough", "_orm", "_ao", "_ambientocclusion", "_height", "_displacement", "_opacity", "_alpha"}) {
+                if (!ends_with(name, suffix)) continue;
+                std::string owner = name.substr(0, name.size() - strlen(suffix));
+                if (game.count(owner) || game.count(name)) break;
+                for (const char *theirs : {"_diff", "_diffuse", "_d", "_color", "_col"})
+                    if (game.count(owner + theirs)) {
+                        name = owner + theirs + suffix;
+                        break;
+                    }
+                break;
+            }
+            renamed.emplace(name, p.second);
+        }
+        pictures.swap(renamed);
+    }
 
     struct Maps {
         std::string metal, rough, packed, occlusion;
@@ -783,8 +1001,8 @@ static int import_pictures(const std::string &in, const std::string &out, float 
             }
             textures++;
         }
-        if (!write_png(out + "/" + name + ".png", img)) {
-            fprintf(stderr, "cannot write %s/%s.png\n", out.c_str(), name.c_str());
+        if (!write_texture(out + "/" + name, img, dds, !normal)) {
+            fprintf(stderr, "cannot write %s/%s\n", out.c_str(), name.c_str());
             return 1;
         }
     }
@@ -795,7 +1013,7 @@ static int import_pictures(const std::string &in, const std::string &out, float 
         bool has_packed = !m.second.packed.empty() && read_picture(m.second.packed, &packed);
         Image occlusion;
         bool has_occlusion = !m.second.occlusion.empty() && read_picture(m.second.occlusion, &occlusion);
-        bool has_old = read_picture(out + "/" + name + "_pbr.png", &old);
+        bool has_old = read_picture(out + "/" + name + "_pbr.png", &old) || read_dds(out + "/" + name + "_pbr.dds", &old);
         if (!has_metal && !has_rough && !has_packed && !has_occlusion) {
             fprintf(stderr, "%s: its maps cannot be read; left out\n", name.c_str());
             skipped++;
@@ -825,7 +1043,7 @@ static int import_pictures(const std::string &in, const std::string &out, float 
                     px[2] = (uint8_t)lroundf(coat_at(name, has_spec, has_spec ? sample_luminance(spec, u, v) : 0.0f, u, v, brightest) * 255.0f);
                 }
             }
-        if (!write_png(out + "/" + name + "_pbr.png", map)) {
+        if (!write_texture(out + "/" + name + "_pbr", map, dds, false)) {
             fprintf(stderr, "cannot write %s/%s_pbr.png\n", out.c_str(), name.c_str());
             return 1;
         }
@@ -833,7 +1051,7 @@ static int import_pictures(const std::string &in, const std::string &out, float 
     }
     for (auto &h : heights) { // as they are, under a name the game has no texture by
         Image img;
-        if (!read_picture(h.second, &img) || !write_png(out + "/" + h.first + "_depth.png", img)) {
+        if (!read_picture(h.second, &img) || !write_texture(out + "/" + h.first + "_depth", img, dds, false)) {
             fprintf(stderr, "%s: cannot be read; left out\n", h.second.c_str());
             skipped++;
             continue;
@@ -851,18 +1069,19 @@ int main(int argc, char **argv)
 {
     if (argc >= 4 && !strcmp(argv[1], "import")) {
         float gain = 1.0f;
-        bool normals_up = true;
+        bool normals_up = true, dds = false;
         for (int i = 4; i < argc; i++) {
             if (!strcmp(argv[i], "--gain") && i + 1 < argc) gain = std::max(0.01f, (float)atof(argv[++i]));
             else if (!strcmp(argv[i], "--normals") && i + 1 < argc) normals_up = strcmp(argv[++i], "directx") != 0;
+            else if (!strcmp(argv[i], "--dds")) dds = true;
         }
-        return import_pictures(argv[2], argv[3], gain, normals_up);
+        return import_pictures(argv[2], argv[3], gain, normals_up, dds);
     }
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "hair")) return hair_map(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
     if (argc < 3 || (strcmp(argv[1], "export") && strcmp(argv[1], "pbr"))) {
         fprintf(stderr, "usage: texture_tool export <out-folder> [name...]\n       texture_tool pbr <out-folder> [name...]\n"
                         "       texture_tool hair <picture of the hair alone> <name> <out-folder> [picture of the saddle and straps alone]\n"
-                        "       texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx]\n");
+                        "       texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx] [--dds]\n");
         return 2;
     }
     bool pbr = !strcmp(argv[1], "pbr");
