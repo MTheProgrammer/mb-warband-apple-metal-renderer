@@ -159,6 +159,7 @@ struct Program {
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     int grade_offset = -1;    // fragment stage, wbm_grade
+    int parallax_offset = -1; // fragment stage, wbm_parallax
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
     int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
@@ -310,6 +311,8 @@ LastPass s_last;
 // thread and handed to the final shader.
 bool s_hdr;
 float s_hdr_peak = 4.0f; // WBM_HDR_PEAK: the most headroom to use
+float s_parallax;
+const float s_parallax_sign[2] = {-1.0f, -1.0f}; // which way the texture runs against the surface's own axes, found by trial // WBM_PARALLAX: depth of stone and ground, in texture coordinates (0.03 is plenty); 0 for none
 float s_grade[4];        // WBM_CONTRAST, WBM_SATURATION, WBM_WARMTH: each about -1 to 1, 0 for no change
 std::atomic<float> s_headroom{1.0f};
 NSWindow *s_window;
@@ -1064,7 +1067,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
+    p.yflip_offset = p.samples_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -1128,6 +1131,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
             else if (u.name == "wbm_grade" && s == 1) p.grade_offset = u.offset;
+            else if (u.name == "wbm_parallax" && s == 1) p.parallax_offset = u.offset;
             else if (u.name == k_xl_limit_uniform) p.limit_offset = u.offset;
             else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
             else if (u.name == k_xl_dyn_near_uniform) p.dyn_near_offset = u.offset;
@@ -3526,7 +3530,7 @@ bool prepare_draw()
         }
     }
     Texture *diffuse = nullptr; // the diffuse texture says what the surface is
-    if ((p->material_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->wind_offset >= 0 || p->leaf_sun_offset >= 0 || p->gaze_offset >= 0 || p->fur_offset >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
+    if ((p->material_offset >= 0 || p->parallax_offset >= 0 || p->pbr_offset >= 0 || p->skin_offset[0] >= 0 || p->skin_offset[1] >= 0 || p->wind_offset >= 0 || p->leaf_sun_offset >= 0 || p->gaze_offset >= 0 || p->fur_offset >= 0 || s_debug_skin) && p->alpha_texture_location >= 0) {
         UniformLocation &l = p->locations[(size_t)p->alpha_texture_location];
         diffuse = (l.unit >= 0 && l.unit < MAX_UNITS) ? find(s_textures, s_bound_texture[l.unit]) : nullptr;
     }
@@ -3667,6 +3671,13 @@ bool prepare_draw()
         const float has[4] = {diffuse && diffuse->pbr ? 1.0f : 0.0f, 0, 0, 0};
         if (memcmp(p->uniform_data[1].data() + p->pbr_offset, has, 16)) {
             memcpy(p->uniform_data[1].data() + p->pbr_offset, has, 16);
+            p->uniform_dirty[1] = true;
+        }
+    }
+    if (p->parallax_offset >= 0) { // stone, brick and the ground have depth; a painted shield has not
+        const float parallax[4] = {diffuse && diffuse->material == MAT_STONE ? s_parallax : 0.0f, s_parallax_sign[0], s_parallax_sign[1], 0};
+        if (memcmp(p->uniform_data[1].data() + p->parallax_offset, parallax, 16)) {
+            memcpy(p->uniform_data[1].data() + p->parallax_offset, parallax, 16);
             p->uniform_dirty[1] = true;
         }
     }
@@ -4083,6 +4094,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     s_shader_options.hair_strands = s_people_hair;
+    if (const char *v = getenv("WBM_PARALLAX")) s_parallax = std::min(0.15f, std::max(0.0f, (float)atof(v)));
+    s_shader_options.parallax = s_parallax > 0;
     if (const char *v = getenv("WBM_WATER")) s_shader_options.water = atoi(v) != 0;
     if (const char *v = getenv("WBM_EYES_MOVE")) s_gaze_strength = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_SSS_BACKLIGHT")) s_skin_backlight = std::max(0.0f, (float)atof(v));

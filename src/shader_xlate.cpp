@@ -830,6 +830,70 @@ bool add_water(std::string &fs)
     return true;
 }
 
+// Parallax. See XlOptions::parallax. The surface is walked down along the
+// line of sight in eight steps until the texture's height is above the line,
+// and the last step is split by where the two cross. Far off, where a texel is
+// smaller than a pixel, there is nothing to see of it and it fades out.
+// Every later use of the texture coordinate in the shader takes the moved one.
+bool add_parallax(std::string &fs)
+{
+    const char *needed[] = {"uniform sampler2D diffuse_texture;", "uniform sampler2D normal_texture;", "varying vec2 Tex0;", "varying vec3 SunLightDir;"};
+    for (const char *n : needed)
+        if (fs.find(n) == std::string::npos) return false;
+    // Not the terrain's shaders (the ones that blend a second texture in): one tile of the ground
+    // covers metres, and a depth that suits a wall's stones only smears sand and grass.
+    if (fs.find("uniform sampler2D diffuse_texture_2;") != std::string::npos) return false;
+    // Not faces, hair or coats, whose shaders have the same inputs.
+    if (fs.find("max ((0.2 * (") != std::string::npos || fs.find("0.800118") != std::string::npos || fs.find("wbm_skin_lit") != std::string::npos) return false;
+    size_t body = fs.find("void main ()");
+    if (body != std::string::npos) body = fs.find('{', body);
+    if (body == std::string::npos) return false;
+    std::string head = fs.substr(0, body + 1), rest = fs.substr(body + 1);
+    rest = std::regex_replace(rest, std::regex(R"(\bTex0\b)"), "wbm_uv");
+    fs = head +
+         "\n  vec2 wbm_uv = Tex0;\n"
+         "  if (wbm_parallax.x > 0.0) {\n"
+         "    vec2 wbm_dx = dFdx(Tex0), wbm_dy = dFdy(Tex0);\n"
+         "    float wbm_near = 1.0 - smoothstep(0.0015, 0.005, max(length(wbm_dx), length(wbm_dy)));\n"
+         "    vec3 wbm_v = normalize(wbm_tview);\n"         "    float wbm_blur = 0.012 / max(max(length(wbm_dx), length(wbm_dy)), 1e-6);\n"
+         "    vec2 wbm_bx = wbm_dx * max(wbm_blur, 1.0), wbm_by = wbm_dy * max(wbm_blur, 1.0);\n"
+         "    if (wbm_near > 0.0 && wbm_v.z > 0.0) {\n"
+         "      vec2 wbm_step = wbm_v.xy * vec2(wbm_parallax.y, wbm_parallax.z) / max(wbm_v.z, 0.4) * (wbm_parallax.x * wbm_near / 8.0);\n"
+         "      float wbm_layer = 1.0, wbm_h = 0.0, wbm_was = 1.0;\n"
+         "      for (int wbm_i = 0; wbm_i < 8; wbm_i++) {\n"
+         // Read well blurred: it is the stones and the joints between them that have depth, not the grain painted on them.
+         "        wbm_h = smoothstep(0.1, 0.5, dot(textureGrad(diffuse_texture, wbm_uv, wbm_bx, wbm_by).xyz, vec3(0.3333)));\n"
+         "        if (wbm_h >= wbm_layer) break;\n"
+         "        wbm_was = wbm_layer - wbm_h;\n"
+         "        wbm_uv -= wbm_step;\n"
+         "        wbm_layer -= 0.125;\n"
+         "      }\n"
+         "      float wbm_over = wbm_h - wbm_layer;\n" // how far past the surface the last step went
+         "      if (wbm_over > 0.0) wbm_uv += wbm_step * (wbm_over / max(wbm_over + wbm_was, 1e-4));\n"
+         "    }\n"
+         "  }" +
+         rest;
+    fs.insert(0, "varying vec3 wbm_tview;\n");
+    return true;
+}
+
+// The vertex shader's part: the direction to the eye in the surface's own
+// space (along the texture, across it, and out), which the engine's shaders
+// work out for the sun but not for the eye. For meshes without bones.
+bool add_parallax_vertex(std::string &vs)
+{
+    static const std::regex basis(R"(\((tmpvar_\d+) \* -\(vSunDir\.xyz\)\))");
+    std::smatch m;
+    const char *needed[] = {"uniform vec4 vCameraPos;", "uniform mat4 matWorld;", "attribute vec3 inPosition;", "varying vec3 SunLightDir;"};
+    for (const char *n : needed)
+        if (vs.find(n) == std::string::npos) return false;
+    size_t end = vs.rfind('}');
+    if (vs.find("matWorldArray") != std::string::npos || !std::regex_search(vs, m, basis) || end == std::string::npos) return false;
+    vs.insert(end, "  wbm_tview = " + std::string(m[1]) + " * (vCameraPos.xyz - (matWorld * vec4(inPosition, 1.0)).xyz);\n");
+    vs.insert(0, "varying vec3 wbm_tview;\n");
+    return true;
+}
+
 // People's hair as strands. The engine's hair shader draws a rigid mesh whose
 // binormal is the way the hair runs. For characters near the camera the backend
 // draws ribbons over it (build_strands), all of whose vertices sit at a root on
@@ -1694,6 +1758,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool hair_strands = options.hair_strands && add_hair_strands(glsl, vertex);
     if (!vertex && options.water) add_water(glsl);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
+    // The fragment's half only where the vertex shader of this program has supplied the eye's direction.
+    bool parallax = options.parallax && (vertex ? add_parallax_vertex(glsl) : varyings.location.count("wbm_tview") && add_parallax(glsl)); // last: it takes over the texture coordinate wherever the others left it
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output || options.grade) && rewrite_final_pass(glsl, options);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
@@ -1714,6 +1780,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (eyes) out << k_eye_function;
     if (!vertex && (fur || hair_strands)) out << k_strand_function;
     if (fur) out << k_fur_function;
+    if (parallax && !vertex) out << "uniform vec4 wbm_parallax;\n";
     if (hair_strands && !vertex) out << k_people_hair_function;
     if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\nuniform vec4 wbm_drift;\n" : "");
     if (leaf) out << k_leaf_function;

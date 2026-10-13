@@ -105,6 +105,12 @@ struct XlOptions {
     // a paler, greener colour where the water is shallow, and foam along the
     // shore (the last two where the game's depth effects are on).
     bool water = false;
+    // Parallax: in the engine's normal-mapped shaders the texture is looked up
+    // where the line of sight meets a surface with depth, the texture's own
+    // brightness standing for height (mortar and cracks are dark), so that
+    // stones and bricks shift against each other as the eye moves. Adds the
+    // wbm_parallax uniform (x: depth in texture coordinates, 0 for none).
+    bool parallax = false;
     // Eyes that catch the light: faces have their eyes painted on, at the same
     // place in every face texture, since all heads share one layout. There the
     // engine's skin shader gets a small sharp highlight from the sun and a
