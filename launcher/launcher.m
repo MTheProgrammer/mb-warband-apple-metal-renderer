@@ -54,7 +54,7 @@ static const Option k_options[] = {
     {"Horses", "WBM_FUR_SHELLS", "Fur layers", "Layers of short fur on horses nearby; more is finer and slower. 0 for none.", kSlider, "12", "6", "0", NULL, 0, 24, 1},
     {"Horses", "WBM_HAIR_STRANDS", "Mane and tail as strands", "Strands that hang, swing and stream behind. Needs a texture pack with hair maps.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
 
-    {"Materials and colour", "WBM_PARALLAX", "Depth in stone", "Stones stand out from their joints on walls and buildings nearby. 0 for none.", kSlider, "0.025", "0", "0", NULL, 0, 0.05, 0.005},
+    {"Materials and colour", "WBM_PARALLAX", "Depth in stone", "Stones stand out from their joints on walls and buildings nearby, by this many metres. 0 for none.", kSlider, "0.05", "0", "0", NULL, 0, 0.12, 0.01},
     {"Materials and colour", "WBM_WATER", "Water", "Glitter from the sun, paler shallows and foam at the shore. Not yet tried in a scene.", kToggle, "0", "0", "0", NULL, 0, 0, 0},
 
     {"Trees and grass", "WBM_WIND", "Wind", "How much trees, bushes and grass sway. 0 for none.", kSlider, "1", "1", "0", NULL, 0, 2, 0.1},

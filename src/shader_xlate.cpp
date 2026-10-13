@@ -840,9 +840,6 @@ bool add_parallax(std::string &fs)
     const char *needed[] = {"uniform sampler2D diffuse_texture;", "uniform sampler2D normal_texture;", "varying vec2 Tex0;", "varying vec3 SunLightDir;"};
     for (const char *n : needed)
         if (fs.find(n) == std::string::npos) return false;
-    // Not the terrain's shaders (the ones that blend a second texture in): one tile of the ground
-    // covers metres, and a depth that suits a wall's stones only smears sand and grass.
-    if (fs.find("uniform sampler2D diffuse_texture_2;") != std::string::npos) return false;
     // Not faces, hair or coats, whose shaders have the same inputs.
     if (fs.find("max ((0.2 * (") != std::string::npos || fs.find("0.800118") != std::string::npos || fs.find("wbm_skin_lit") != std::string::npos) return false;
     size_t body = fs.find("void main ()");
@@ -854,11 +851,13 @@ bool add_parallax(std::string &fs)
          "\n  vec2 wbm_uv = Tex0;\n"
          "  if (wbm_parallax.x > 0.0) {\n"
          "    vec2 wbm_dx = dFdx(Tex0), wbm_dy = dFdy(Tex0);\n"
-         "    float wbm_near = 1.0 - smoothstep(0.0015, 0.005, max(length(wbm_dx), length(wbm_dy)));\n"
-         "    vec3 wbm_v = normalize(wbm_tview);\n"         "    float wbm_blur = 0.012 / max(max(length(wbm_dx), length(wbm_dy)), 1e-6);\n"
+         "    float wbm_near = 1.0 - smoothstep(0.004, 0.012, length(dFdx(wbm_tview)));\n" // metres to the pixel
+         "    vec3 wbm_v = normalize(wbm_tview);\n"         // The depth is in metres: how much of the texture a metre of this surface covers is had from how fast each changes across the screen.
+         "    float wbm_per_metre = min(length(wbm_dx) / max(length(dFdx(wbm_tview)), 1e-6), 4.0);\n"
+         "    float wbm_blur = 0.03 * wbm_per_metre / max(max(length(wbm_dx), length(wbm_dy)), 1e-6);\n"
          "    vec2 wbm_bx = wbm_dx * max(wbm_blur, 1.0), wbm_by = wbm_dy * max(wbm_blur, 1.0);\n"
          "    if (wbm_near > 0.0 && wbm_v.z > 0.0) {\n"
-         "      vec2 wbm_step = wbm_v.xy * vec2(wbm_parallax.y, wbm_parallax.z) / max(wbm_v.z, 0.4) * (wbm_parallax.x * wbm_near / 8.0);\n"
+         "      vec2 wbm_step = wbm_v.xy * vec2(wbm_parallax.y, wbm_parallax.z) / max(wbm_v.z, 0.4) * (wbm_parallax.x * wbm_per_metre * wbm_near / 8.0);\n"
          "      float wbm_layer = 1.0, wbm_h = 0.0, wbm_was = 1.0;\n"
          "      for (int wbm_i = 0; wbm_i < 8; wbm_i++) {\n"
          // Read well blurred: it is the stones and the joints between them that have depth, not the grain painted on them.

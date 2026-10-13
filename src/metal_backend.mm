@@ -312,7 +312,7 @@ LastPass s_last;
 bool s_hdr;
 float s_hdr_peak = 4.0f; // WBM_HDR_PEAK: the most headroom to use
 float s_parallax;
-const float s_parallax_sign[2] = {-1.0f, -1.0f}; // which way the texture runs against the surface's own axes, found by trial // WBM_PARALLAX: depth of stone and ground, in texture coordinates (0.03 is plenty); 0 for none
+const float s_parallax_sign[2] = {-1.0f, -1.0f}; // which way the texture runs against the surface's own axes, found by trial // WBM_PARALLAX: depth of stone and brick, metres (0.05 is plenty); 0 for none
 float s_grade[4];        // WBM_CONTRAST, WBM_SATURATION, WBM_WARMTH: each about -1 to 1, 0 for no change
 std::atomic<float> s_headroom{1.0f};
 NSWindow *s_window;
@@ -4094,7 +4094,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_FUR_DENSITY")) s_fur_density = std::max(1.0f, (float)atof(v));
     s_shader_options.fur = s_fur_strength > 0 || s_shader_options.eyes; // the horse's eye rides on the same rewrite
     s_shader_options.hair_strands = s_people_hair;
-    if (const char *v = getenv("WBM_PARALLAX")) s_parallax = std::min(0.15f, std::max(0.0f, (float)atof(v)));
+    if (const char *v = getenv("WBM_PARALLAX")) s_parallax = std::min(0.3f, std::max(0.0f, (float)atof(v)));
     s_shader_options.parallax = s_parallax > 0;
     if (const char *v = getenv("WBM_WATER")) s_shader_options.water = atoi(v) != 0;
     if (const char *v = getenv("WBM_EYES_MOVE")) s_gaze_strength = std::max(0.0f, (float)atof(v));
