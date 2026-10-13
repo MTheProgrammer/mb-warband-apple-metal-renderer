@@ -14,6 +14,7 @@ export WBM_PBR=${WBM_PBR:-3}          # microfacet highlights, metalness, reflec
 export WBM_SRGB=${WBM_SRGB:-1}        # hardware sRGB texture decoding
 export WBM_AO=${WBM_AO:-1}            # ambient occlusion
 export WBM_CONTACT_SHADOWS=${WBM_CONTACT_SHADOWS:-1}  # screen-space contact shadows
+export WBM_BOUNCE_LIGHT=${WBM_BOUNCE_LIGHT:-1}  # lit surfaces throw a little light and colour on what is near (a strength; 0: none)
 export WBM_LIGHT_SHAFTS=${WBM_LIGHT_SHAFTS:-1}  # light shafts from the sun
 export WBM_MOTION_BLUR=${WBM_MOTION_BLUR:-0}    # blur from the camera's movement (off for now; 1 turns it on)
 export WBM_SKY_AMBIENT=${WBM_SKY_AMBIENT:-1}    # ambient light tinted by the sky, with ground bounce

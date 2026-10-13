@@ -370,6 +370,7 @@ uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
 bool s_sun_valid;
 void apply_ambient_occlusion();
+float s_bounce_light; // WBM_BOUNCE_LIGHT: light thrown by lit surfaces on those near them, a strength (1 is plenty); 0 for none
 
 // Ambient light from the captured sky (WBM_SKY_AMBIENT=1), see k_xl_ambient_uniform.
 bool s_sky_ambient;
@@ -805,10 +806,10 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
     // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene) &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
-        if (s_ao || s_contact_shadows || s_light_shafts) apply_ambient_occlusion();
+        if (s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0) apply_ambient_occlusion();
         if (s_motion_blur) apply_motion_blur();
         if (s_fxaa) apply_fxaa(); // last: edges as they will be shown
         id<MTLTexture> shown = nil;
@@ -1439,6 +1440,7 @@ struct Params {
     float shadow_strength, shadow_length;
     float2 shaft_size; // of the light-shaft textures, in pixels
     float4 shaft;      // xy: the sun's position on screen (0..1), z: how visible it is, w: strength
+    float4 bounce;     // x: strength, y: radius in metres
 };
 
 #if WBM_MSAA
@@ -1651,6 +1653,79 @@ fragment float4 shaft_apply(VertexOut in [[stage_in]], texture2d<float> shafts [
     constexpr sampler smooth(filter::linear, address::clamp_to_edge);
     return float4(shafts.sample(smooth, in.position.xy / p.depth_size).rgb, 0.0);
 }
+
+// Bounce light: what is lit throws some of its light, in its own colour, on
+// what is near it; a red cloak warms the wall beside it, sunlit ground lights
+// the underside of a shield. From the picture itself: for each pixel, a ring
+// of others within a metre or two is asked how bright they are and whether
+// they lie on the side its surface faces, the nearer the more.
+//
+// bounce_compute, half resolution: the light arriving, linear. bounce_blur:
+// smoothed over 5x5 texels of like depth. bounce_apply: the scene's colour is
+// multiplied by one plus it, which takes the surface's own colour for what it
+// reflects.
+fragment float4 bounce_compute(VertexOut in [[stage_in]], texture2d<float> z [[texture(0)]], texture2d<float> scene [[texture(1)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    int2 c = int2(in.position.xy);
+    float3 P = view_position(z, c, p);
+    if (P.z > p.fade_start * 2.0) return float4(0.0);
+    float3 right = view_position(z, c + int2(1, 0), p) - P, left = P - view_position(z, c - int2(1, 0), p);
+    float3 down = view_position(z, c + int2(0, 1), p) - P, up = P - view_position(z, c - int2(0, 1), p);
+    float3 dx = abs(right.z) < abs(left.z) ? right : left;
+    float3 dy = abs(down.z) < abs(up.z) ? down : up;
+    float3 n = normalize(cross(dy, dx));
+    if (dot(n, P) > 0.0) n = -n;
+    float radius = p.bounce.y;
+    float radius_px = clamp(radius * abs(p.p00) / P.z * 0.5 * p.ao_size.x, 4.0, 0.2 * p.ao_size.x);
+    float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+    float3 sum = float3(0.0);
+    const int directions = 6, steps = 3;
+    for (int i = 0; i < directions; i++) {
+        float angle = (float(i) + noise) * (6.2831853 / float(directions));
+        float2 dir = float2(cos(angle), sin(angle));
+        for (int s = 0; s < steps; s++) {
+            float t = (float(s) + fract(noise * 7.0 + 0.37 * float(i)) + 0.3) / float(steps);
+            int2 q = c + int2(dir * radius_px * t);
+            if (any(q < int2(0)) || any(q >= int2(p.ao_size))) continue;
+            float3 Q = view_position(z, q, p);
+            if (Q.z > 1.0e5) continue; // the sky lights by other means
+            float3 v = Q - P;
+            float dd = dot(v, v);
+            float facing = max(dot(v, n) * rsqrt(dd + 1e-6) - 0.08, 0.0);          // it lies on the side this surface faces
+            float reach = saturate(1.0 - dd / (radius * radius * 4.0));             // and not too far off
+            float3 colour = scene.sample(smooth, (float2(q) + 0.5) / p.ao_size, level(1.0)).rgb;
+            colour = pow(max(colour, 0.0), float3(2.2));                            // the scene holds colours as shown
+            sum += min(colour, float3(4.0)) * (facing * reach);
+        }
+    }
+    float fade = 1.0 - smoothstep(p.fade_start, p.fade_start * 2.0, P.z);
+    return float4(sum * (fade / float(directions * steps)), 1.0);
+}
+
+fragment float4 bounce_blur(VertexOut in [[stage_in]], texture2d<float> light [[texture(0)]], texture2d<float> z [[texture(1)]], constant Params &p [[buffer(0)]])
+{
+    int2 c = int2(in.position.xy);
+    float zc = load_z(z, c, p);
+    float3 total = float3(0.0);
+    float weight = 0.0;
+    for (int j = -2; j <= 2; j++) {
+        for (int i = -2; i <= 2; i++) {
+            int2 t = clamp(c + int2(i, j) * 2, int2(0), int2(p.ao_size) - 1);
+            float w = exp(-abs(load_z(z, t, p) - zc) / (0.03 * zc + 0.02));
+            total += light.read(uint2(t)).rgb * w;
+            weight += w;
+        }
+    }
+    return float4(weight > 0.0001 ? total / weight : float3(0.0), 1.0);
+}
+
+fragment float4 bounce_apply(VertexOut in [[stage_in]], texture2d<float> light [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler smooth(filter::linear, address::clamp_to_edge);
+    float3 l = light.sample(smooth, in.position.xy / p.depth_size).rgb * p.bounce.x;
+    return float4(pow(1.0 + l, float3(1.0 / 2.2)) - 1.0, 0.0); // the scene is multiplied by one plus this, in its own encoding
+}
 )";
 
 struct AOParams { // must match Params in k_ao_source
@@ -1660,12 +1735,17 @@ struct AOParams { // must match Params in k_ao_source
     float sun[4];
     float shadow_strength, shadow_length, shaft_size[2];
     float shaft[4];
+    float bounce[4];
 };
 
 id<MTLLibrary> s_ao_library;
 id<MTLRenderPipelineState> s_ao_linearize_pipeline, s_ao_compute_pipeline, s_ao_blur_pipeline;
 id<MTLTexture> s_ao_z_texture, s_ao_blurred_texture;
 id<MTLRenderPipelineState> s_shaft_mask_pipeline, s_shaft_blur_pipeline, s_shaft_apply_pipeline;
+id<MTLRenderPipelineState> s_bounce_compute_pipeline, s_bounce_blur_pipeline;
+std::map<int, id<MTLRenderPipelineState>> s_bounce_apply_pipelines; // by colour format
+id<MTLTexture> s_bounce_texture, s_bounce_blurred_texture;
+uint64_t s_bounce_frames;
 id<MTLTexture> s_shaft_mask_texture, s_shaft_texture;
 std::map<std::pair<int, int>, id<MTLRenderPipelineState>> s_ao_apply_pipelines; // by colour format and sample count
 id<MTLTexture> s_ao_texture;
@@ -1702,6 +1782,15 @@ bool ao_setup()
     d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
     d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
     s_shaft_apply_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    d.colorAttachments[0].blendingEnabled = NO;
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"bounce_compute"];
+    s_bounce_compute_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    d.fragmentFunction = [s_ao_library newFunctionWithName:@"bounce_blur"];
+    s_bounce_blur_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!s_bounce_compute_pipeline || !s_bounce_blur_pipeline) {
+        complain("bounce light pipeline failed: %s", error.localizedDescription.UTF8String);
+        s_bounce_light = 0;
+    }
     if (!s_ao_linearize_pipeline || !s_ao_compute_pipeline || !s_ao_blur_pipeline || !s_shaft_mask_pipeline ||
         !s_shaft_blur_pipeline || !s_shaft_apply_pipeline) {
         complain("ambient occlusion pipeline failed: %s", error.localizedDescription.UTF8String);
@@ -1785,7 +1874,9 @@ void apply_ambient_occlusion()
         }
     }
     bool occlude = s_ao || params.shadow_strength > 0;
-    if (!occlude && !shafts) return;
+    bool bounce = s_bounce_light > 0 && s_bounce_compute_pipeline && s_bounce_blur_pipeline;
+    params.bounce[0] = s_bounce_light * 2.5f, params.bounce[1] = 1.6f * scale, params.bounce[2] = params.bounce[3] = 0;
+    if (!occlude && !shafts && !bounce) return;
     params.reversed = s_reverse_depth ? 1.0f : 0.0f;
     params.fade_start = 60.0f * scale; // beyond this the effect fades out, and is gone at twice it
 
@@ -1840,6 +1931,37 @@ void apply_ambient_occlusion()
         [pass endEncoding];
     };
     half_pass(s_ao_z_texture, s_ao_linearize_pipeline, s_last.depth, nil);
+    if (bounce) { // before occlusion, which then darkens this light with the rest
+        id<MTLRenderPipelineState> __strong &add = s_bounce_apply_pipelines[(int)s_last.color.pixelFormat];
+        if (!add) {
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [s_ao_library newFunctionWithName:@"ao_vertex"];
+            pd.fragmentFunction = [s_ao_library newFunctionWithName:@"bounce_apply"];
+            MTLRenderPipelineColorAttachmentDescriptor *c = pd.colorAttachments[0];
+            c.pixelFormat = s_last.color.pixelFormat;
+            c.blendingEnabled = YES; // colour = colour already there * (1 + light); alpha untouched
+            c.sourceRGBBlendFactor = MTLBlendFactorDestinationColor;
+            c.destinationRGBBlendFactor = MTLBlendFactorOne;
+            c.sourceAlphaBlendFactor = MTLBlendFactorZero;
+            c.destinationAlphaBlendFactor = MTLBlendFactorOne;
+            NSError *error = nil;
+            add = [s_device newRenderPipelineStateWithDescriptor:pd error:&error];
+            if (!add) complain("bounce light apply pipeline failed: %s", error.localizedDescription.UTF8String);
+        }
+        if (!s_bounce_texture || s_bounce_texture.width != aw || s_bounce_texture.height != ah) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:aw height:ah mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            s_bounce_texture = [s_device newTextureWithDescriptor:td];
+            s_bounce_blurred_texture = [s_device newTextureWithDescriptor:td];
+        }
+        if (add) {
+            half_pass(s_bounce_texture, s_bounce_compute_pipeline, s_ao_z_texture, s_last.color);
+            half_pass(s_bounce_blurred_texture, s_bounce_blur_pipeline, s_bounce_texture, s_ao_z_texture);
+            onto_scene(add, s_bounce_blurred_texture);
+            s_bounce_frames++;
+        }
+    }
     if (occlude) {
         half_pass(s_ao_texture, s_ao_compute_pipeline, s_ao_z_texture, nil);
         half_pass(s_ao_blurred_texture, s_ao_blur_pipeline, s_ao_texture, s_ao_z_texture);
@@ -4044,6 +4166,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_hdr = s_shader_options.hdr_output = hdr_env && atoi(hdr_env) != 0;                  // off unless set
     s_shader_options.filmic_tonemap = tonemap_env && atoi(tonemap_env) != 0;              // off unless set
     if (const char *v = getenv("WBM_HDR_PEAK")) s_hdr_peak = std::max(1.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_BOUNCE_LIGHT")) s_bounce_light = std::min(4.0f, std::max(0.0f, (float)atof(v)));
     if (const char *v = getenv("WBM_CONTRAST")) s_grade[0] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
     if (const char *v = getenv("WBM_SATURATION")) s_grade[1] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
     if (const char *v = getenv("WBM_WARMTH")) s_grade[2] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
@@ -4204,6 +4327,7 @@ void mtl_dump_stats(FILE *f)
             (unsigned long long)s_call_stats.uniform_reuses);
     if (s_blur_frames) fprintf(f, "\nmotion blur applied in %llu frames\n", (unsigned long long)s_blur_frames);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
+    if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
     if (s_sharpen_frames) fprintf(f, "\nsharpened in %llu frames\n", (unsigned long long)s_sharpen_frames);
     if (s_fxaa_frames) fprintf(f, "\nanti-aliasing (FXAA) applied in %llu frames\n", (unsigned long long)s_fxaa_frames);
