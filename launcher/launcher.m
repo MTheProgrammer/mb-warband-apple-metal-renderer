@@ -21,7 +21,7 @@ typedef NS_ENUM(int, Kind) { kToggle, kSlider, kChoice };
 // An option. `everything`, `fast` and `plain` are its values in the three
 // presets; an empty value leaves the variable unset. For a choice, `choices`
 // is "value=label|value=label"; for a toggle, on is `everything` (or "1").
-// A fourth preset is made from the first (see preset_value).
+// The second preset in the list is made from the first (see preset_value).
 typedef struct {
     const char *group, *env, *title, *help;
     Kind kind;
@@ -68,7 +68,7 @@ static const Option k_options[] = {
     {"Speed", "WBM_MENU_FPS", "Limit in menus", "The same for menus and loading screens.", kChoice, "", "60", "", "=The game's own|60=60|30=30", 0, 0, 0},
 };
 static const int k_option_count = sizeof k_options / sizeof k_options[0];
-static NSString *const k_presets[] = {@"Everything on", @"Faster", @"Everything but hair", @"As the game looks"};
+static NSString *const k_presets[] = {@"Everything on", @"Everything but hair", @"Faster", @"As the game looks"};
 static const int k_preset_count = 4;
 
 static NSString *S(const char *s) { return s ? @(s) : @""; }
@@ -83,11 +83,11 @@ static BOOL is_game(NSString *game) { return game.length && [[NSFileManager defa
 // "Everything but hair" is "Everything on" without the fur layers and the strands, which cost the most of all.
 static NSString *preset_value(const Option *o, int preset)
 {
-    if (preset == 2) {
+    if (preset == 1) {
         if (!strcmp(o->env, "WBM_FUR_SHELLS") || !strcmp(o->env, "WBM_HAIR_STRANDS") || !strcmp(o->env, "WBM_PEOPLE_HAIR")) return @"0";
         return S(o->everything);
     }
-    return S(preset == 0 ? o->everything : preset == 1 ? o->fast : o->plain);
+    return S(preset == 0 ? o->everything : preset == 2 ? o->fast : o->plain);
 }
 
 // WBM_GAME, then the Steam default, then the folder chosen on an earlier run.
