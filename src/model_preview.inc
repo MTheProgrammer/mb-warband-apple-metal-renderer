@@ -432,6 +432,24 @@ void preview_draw(bool prepass)
     double target[3];
     for (int r = 0; r < 3; r++) target[r] = inverse_view[8 + r] * ahead + inverse_view[12 + r];
     translation(target[0] - pv.centre[0], target[1] - pv.centre[1], target[2] - pv.centre[2], world);
+    // Two aids for trying things out. WBM_PREVIEW_MOVE="x y z" puts the model that
+    // many metres from where it would be (to sink a sheet of water into the ground
+    // of a scene, say). WBM_PREVIEW_SWING=n swings it to and fro about its own
+    // origin n times a second, as a weapon is swung: a rigid thing that moves.
+    static const char *move = getenv("WBM_PREVIEW_MOVE"), *swing = getenv("WBM_PREVIEW_SWING");
+    double by[3];
+    if (move && sscanf(move, "%lf %lf %lf", &by[0], &by[1], &by[2]) == 3)
+        for (int k = 0; k < 3; k++) world[12 + k] += by[k];
+    if (swing && atof(swing) > 0) {
+        double angle = 1.2 * sin(6.2831853 * atof(swing) * s_wind_time), c = cos(angle), sn = sin(angle);
+        const double turn[16] = {1, 0, 0, 0, 0, c, sn, 0, 0, -sn, c, 0, 0, 0, 0, 1}; // about the model's x axis
+        double place[16], turned[16];
+        translation(target[0], target[1], target[2], place);
+        if (move)
+            for (int k = 0; k < 3; k++) place[12 + k] += by[k];
+        mat_mul(place, turn, turned);
+        memcpy(world, turned, sizeof world);
+    }
     if (rp.camera_moved) mat_mul(rp.delta, rp.view, seen);
     else memcpy(seen, rp.view, sizeof seen);
     projection[0] = rp.p00, projection[5] = rp.p11, projection[10] = rp.A, projection[14] = rp.B, projection[11] = rp.C;
@@ -456,6 +474,7 @@ void preview_draw(bool prepass)
     bool posed = preview_pose(s_wind_time, &pose);
     s_depth_test = true, s_depth_mask = true, s_depth_func = GL_LEQUAL, s_cull = false, s_blend = false;
     for (PreviewPart &part : pv.parts) {
+        if (prepass && part.material.shader.find("water") != std::string::npos) continue; // water is not in the engine's pre-pass: it asks it how deep the bed lies
         GLuint id = part.program[prepass ? 1 : 0];
         Program *p = find(s_programs, id);
         if (!p) continue;
