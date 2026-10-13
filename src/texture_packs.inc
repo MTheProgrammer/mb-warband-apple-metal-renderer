@@ -312,11 +312,13 @@ bool replace_from_pack(Texture &t, const KnownTexture &known)
 }
 
 // A pack may also hold, for the game's texture `name`, a file name_pbr: red is
-// metalness and green roughness, laid out like the texture itself. It is kept
+// metalness, green roughness, and alpha how much of the light from all round
+// reaches the spot (ambient occlusion), laid out like the texture itself. It is kept
 // beside the texture and given to shaders that ask for one (k_xl_pbr_sampler).
 void attach_pbr_map(Texture &t, const KnownTexture &known)
 {
     t.pbr = nil;
+    t.depth = nil;
     t.hair = nil;
     t.hair_colour[3] = 0;
     if (s_pack_files.empty()) return;
@@ -331,6 +333,12 @@ void attach_pbr_map(Texture &t, const KnownTexture &known)
             t.hair = map.mtl;
             read_hair_colour(hair->second, t.hair_colour);
         }
+        else s_pack_stats.failed++;
+    }
+    auto depth = s_pack_files.find(name + "_depth"); // the surface's heights, white the highest: for parallax
+    if (depth != s_pack_files.end()) {
+        Texture map;
+        if (load_replacement(map, depth->second, known.flipped)) t.depth = map.mtl;
         else s_pack_stats.failed++;
     }
     auto it = s_pack_files.find(name + "_pbr");

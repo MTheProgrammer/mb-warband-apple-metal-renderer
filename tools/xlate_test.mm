@@ -33,7 +33,7 @@ int main(int argc, char **argv)
     std::string dir = argv[1];
     bool verbose = false;
     XlOptions options;
-    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0, sky = 0, dynamic = 0, ambient_vs = 0, ambient_fs = 0, materials = 0, skin = 0, windy = 0;
+    int softened = 0, smoothed = 0, srgb_programs = 0, srgb_samplers = 0, pbr = 0, env = 0, final_passes = 0, sky = 0, dynamic = 0, ambient_vs = 0, ambient_fs = 0, materials = 0, skin = 0, windy = 0, torch = 0, torch_vs = 0, torch_lit = 0;
     bool reported_amb = false;
     int dump = -1;
     for (int i = 2; i < argc; i++) {
@@ -53,6 +53,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-t")) options.filmic_tonemap = true;
         if (!strcmp(argv[i], "-r")) options.hdr_output = options.grade = true;
         if (!strcmp(argv[i], "-g")) options.srgb_textures = true;
+        if (!strcmp(argv[i], "-T")) options.torch_shadows = true;
+        if (!strcmp(argv[i], "-L")) options.torch_shadows = options.torch_lighting = true;
         if (!strcmp(argv[i], "-d") && i + 1 < argc) dump = atoi(argv[++i]);
     }
     const std::map<std::string, int> attribs = {{"inPosition", 0}, {"inNormal", 1},   {"inColor0", 2},
@@ -78,6 +80,9 @@ int main(int argc, char **argv)
         materials += p.fs.msl.find("wbm_material") != std::string::npos;
         skin += p.fs.msl.find("wbm_skin_sun") != std::string::npos || p.vs.msl.find("wbm_skin_wrap") != std::string::npos;
         windy += p.vs.msl.find("wbm_sway") != std::string::npos;
+        torch += p.fs.msl.find("wbm_torch_setup") != std::string::npos;
+        torch_vs += p.vs.msl.find("wbm_torch_at") != std::string::npos;
+        torch_lit += p.fs.msl.find("wbm_torch_diffuse(") != std::string::npos || p.fs.msl.find("wbm_torch_shine(") != std::string::npos;
         for (const XlStage *st : {&p.vs, &p.fs})
             for (const XlUniform &u : st->uniforms)
                 if (u.name.compare(0, 7, "wbm_amb") == 0 && !reported_amb) {
@@ -135,6 +140,8 @@ int main(int argc, char **argv)
     if (options.sky_ambient) printf("%d programs take ambient light from the sky (%d in the vertex stage, %d in the fragment stage)\n", ambient_vs + ambient_fs, ambient_vs, ambient_fs);
     if (options.materials) printf("%d programs take material classes\n", materials);
     if (options.skin_scattering || options.foliage_backlight) printf("%d programs scatter light in skin or leaves\n", skin);
+    if (options.torch_shadows) printf("%d programs take shadows from point lights, of %d whose vertex shader knows of such lights\n", torch, torch_vs);
+    if (options.torch_lighting) printf("%d programs weigh point lights per pixel\n", torch_lit);
     if (options.wind) printf("%d programs can sway in the wind\n", windy);
     if (options.pbr_sky) printf("%d programs reflect the captured sky\n", sky);
     if (options.pbr_specular || options.pbr_environment || options.pbr_sky) printf("%d programs use microfacet specular highlights\n", pbr);

@@ -63,6 +63,7 @@ struct Texture {
     float hair_colour[4] = {0, 0, 0, 0}; // the long hair's own colour, as painted (0 to 1); w 1 when a hair map came with one
     id<MTLTexture> hair;   // a pack's hair map for this texture (<name>_hair), see k_fur_function in shader_xlate.cpp
     id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
+    id<MTLTexture> depth;  // a pack's map of the surface's heights (<name>_depth), for parallax
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
     GLint gl_internal = 0;
     GLenum gl_format = 0, gl_type = 0;
@@ -120,13 +121,15 @@ struct UniformLocation {
     const XlUniform *uniform[2] = {nullptr, nullptr}; // per stage: vertex, fragment
     int texture_index[2] = {-1, -1};                  // set for samplers
     bool srgb = false;                                // sampler: bind an sRGB view (XlStage::srgb_samplers)
-    bool is_light_pos = false, is_light_colour = false; // vLightPosDir and vLightDiffuse: the scene's point lights (torches, candles)
     bool is_sun_dir = false, is_sun_color = false;    // vSunDir and vSunColor, which contact shadows read
     bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
     bool is_hair_map = false;                         // the wbm_hair_map sampler, which gets the bound texture's hair map
     bool is_fur_map = false;                          // the wbm_fur_map sampler, which gets the same map
+    bool is_depth_map = false;                        // the wbm_depth_map sampler, which gets the bound texture's map of heights
     bool is_pbr_map = false;                          // the wbm_pbr_map sampler, which gets the bound texture's metalness map
     bool is_scene_copy = false;                       // the wbm_scene sampler, which gets the scene as it was before water was drawn
+    bool is_light_indices = false;                    // iLightIndices: the order in which a shader takes the point lights
+    bool is_torch_map = false;                        // the wbm_torch_map sampler, which gets the point lights' cubes of depth
     bool is_dyn_map = false;                          // the wbm_dyn_map sampler, which gets the per-frame shadow map
     bool is_sun_matrix = false;                       // matSunViewProj, the engine's shadow-space matrix
     GLint unit = 0;                                   // sampler: the texture unit the game assigned
@@ -165,6 +168,8 @@ struct Program {
     int water_offset = -1;    // fragment stage, wbm_water[3]: see copy_scene_for_water
     int limit_offset = -1;    // fragment stage, see k_xl_limit_uniform
     int dyn_window_offset = -1, dyn_near_offset = -1, dyn_bias_offset = -1;
+    int torch_offset = -1, torch_light_offset = -1; // fragment stage, see k_xl_torch_sampler
+    int light_pos_location = -1, light_colour_location = -1, light_count_location = -1; // vLightPosDir, vLightDiffuse, iLightPointCount
     int amb_offset[2] = {-1, -1}; // per stage, see k_xl_ambient_uniform
     int material_offset = -1;     // fragment stage, see k_xl_material_uniform
     int pbr_offset = -1;          // fragment stage, see k_xl_pbr_sampler
@@ -389,12 +394,23 @@ void update_room_probe();
 id<MTLSamplerState> s_sky_sampler;
 uint64_t s_sky_frame;
 float s_sun_dir[4], s_sun_color[4];
-// WBM_TORCH_SHADOWS, a strength: the engine's point lights (torches, candles, fires) cast no shadows. From the
-// picture's own depth, each pixel is walked towards each light it is lit by; where something is in the way,
-// that light's share is taken off. WBM_TORCH_REACH: how far the walk goes, metres.
-float s_torch_shadows, s_torch_reach = 6.0f;
-float s_light_pos[4][4], s_light_colour[4][4]; // as the engine last gave them, in the world's space
-uint64_t s_lights_frame = ~0ull, s_torch_frames;
+// WBM_TORCH_SHADOWS, a strength: the engine's point lights (torches, candles, fires) cast no shadows. Each
+// frame the scene is drawn from every such light into a cube of depths, and the shaders those lights reach look
+// their own surface up in it (see render_torch_shadows, and add_torch_fragment in shader_xlate.cpp).
+// WBM_TORCH_MAP: the width of a cube's face, texels.
+float s_torch_shadows;
+int s_torch_size = 1024;
+struct TorchPlace {
+    float at[3];
+};
+std::vector<TorchPlace> s_torch_seen, s_torch_wanted; // the lights of this frame's draws so far, and those of the last frame's
+float s_torch_cube[4][3];                             // where the light of each cube stood when it was drawn
+int s_torch_cubes;
+float s_torch_params[4]; // the shaders' wbm_torch
+uint64_t s_torch_frame = ~0ull, s_torch_frames, s_torch_casters;
+id<MTLTexture> s_torch_map;
+id<MTLSamplerState> s_torch_sampler;
+bool casting() { return s_dyn_shadows || s_torch_shadows > 0; } // whether what the pre-pass draws is recorded, to cast shadows
 bool s_sun_valid;
 void apply_ambient_occlusion();
 float s_bounce_light; // WBM_BOUNCE_LIGHT: light thrown by lit surfaces on those near them, a strength (1 is plenty); 0 for none
@@ -833,10 +849,10 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     // The engine has drawn the scene and is moving to another target: this is
     // where post-processing starts, and the point to darken the scene first.
     // (A scene is told from other uses of its buffer by the number of draws; a previewed model is a scene of few.)
-    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_torch_shadows > 0 || s_room_probe || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene || (s_last.draws > 8 && s_prepass_frame == s_frame_serial)) &&
+    if ((s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_room_probe || s_motion_blur || s_fxaa || s_upscale || s_sharpen > 0) && s_last.scene && s_last.color != t.color && (s_last.draws > 100 || s_preview_in_scene || (s_last.draws > 8 && s_prepass_frame == s_frame_serial)) &&
         s_last.occluded_in_frame != s_frame_serial) {
         s_last.occluded_in_frame = s_frame_serial;
-        if (s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0 || s_torch_shadows > 0) apply_ambient_occlusion();
+        if (s_ao || s_contact_shadows || s_light_shafts || s_bounce_light > 0) apply_ambient_occlusion();
         // Indoors is where the engine gives the sun no colour. On leaving, the room is forgotten.
         s_interior = s_room_probe && s_sun_valid && s_sun_color[0] + s_sun_color[1] + s_sun_color[2] < 0.01f;
         if (s_interior) update_room_probe();
@@ -1100,7 +1116,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = -1;
+    p.yflip_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -1149,13 +1165,14 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.emplace_back();
                 p.locations.back().name = name;
                 p.locations.back().is_sun_dir = name == "vSunDir";
-                p.locations.back().is_light_pos = name == "vLightPosDir";
-                p.locations.back().is_light_colour = name == "vLightDiffuse";
                 p.locations.back().is_sun_color = name == "vSunColor";
                 p.locations.back().is_sky = name == k_xl_sky_sampler;
                 p.locations.back().is_dyn_map = name == k_xl_dyn_sampler;
+                p.locations.back().is_torch_map = name == k_xl_torch_sampler;
+                p.locations.back().is_light_indices = name == "iLightIndices";
                 p.locations.back().is_scene_copy = name == "wbm_scene";
                 p.locations.back().is_pbr_map = name == k_xl_pbr_sampler;
+                p.locations.back().is_depth_map = name == "wbm_depth_map";
                 p.locations.back().is_fur_map = name == "wbm_fur_map";
                 p.locations.back().is_hair_map = name == "wbm_hair_map";
                 p.locations.back().is_sun_matrix = name == "matSunViewProj";
@@ -1173,6 +1190,8 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_dyn_window_uniform) p.dyn_window_offset = u.offset;
             else if (u.name == k_xl_dyn_near_uniform) p.dyn_near_offset = u.offset;
             else if (u.name == k_xl_dyn_bias_uniform) p.dyn_bias_offset = u.offset;
+            else if (u.name == k_xl_torch_uniform && s == 1) p.torch_offset = u.offset;
+            else if (u.name == k_xl_torch_light_uniform && s == 1 && u.array_stride == 16) p.torch_light_offset = u.offset;
             else if (u.name == k_xl_ambient_uniform) p.amb_offset[s] = u.offset;
             else if (u.name == k_xl_material_uniform) p.material_offset = u.offset;
             else if (u.name == k_xl_pbr_uniform) p.pbr_offset = u.offset;
@@ -1196,6 +1215,13 @@ void link_program(GLuint program_id, Program &p)
         auto it = p.location_by_name.find(name);
         return it == p.location_by_name.end() ? nullptr : p.locations[(size_t)it->second].uniform[0];
     };
+    auto location_of = [&](const char *name) {
+        auto it = p.location_by_name.find(name);
+        return it == p.location_by_name.end() ? -1 : (int)it->second;
+    };
+    p.light_pos_location = location_of("vLightPosDir");
+    p.light_colour_location = location_of("vLightDiffuse");
+    p.light_count_location = location_of("iLightPointCount");
     p.u_wvp = vertex_uniform("matWorldViewProj");
     p.u_world = vertex_uniform("matWorld");
     p.u_bones = vertex_uniform("matWorldArray");
@@ -1235,13 +1261,21 @@ void set_uniform(GLint loc, const void *data, int count, int components, bool da
     if (!p || loc < 0 || (size_t)loc >= p->locations.size()) return;
     UniformLocation &l = p->locations[(size_t)loc];
     if ((l.texture_index[0] >= 0 || l.texture_index[1] >= 0) && data_is_int) l.unit = *(const GLint *)data;
+    // The shaders take an object's point lights in the order of iLightIndices, four numbers, the nearest light
+    // first. The game sets it as though it were one number, so the other three stay 0, and every light after
+    // the first is the scene's light 0 over again: of two torches in a room, the walls saw one. The rest of the
+    // order is filled in here.
+    GLint light_order[4];
+    if (s_torch_shadows > 0 && l.is_light_indices && data_is_int && count == 1 && components == 1) {
+        light_order[0] = *(const GLint *)data;
+        for (int i = 0, next = 1; i < 4 && next < 4; i++)
+            if (i != light_order[0]) light_order[next++] = i;
+        data = light_order;
+        count = 4;
+    }
     if (s_dyn_shadows && l.is_sun_matrix && components == 16 && count >= 1) {
         memcpy(s_sun_matrix, data, sizeof s_sun_matrix); // the same for every program in a scene
         s_sun_matrix_valid = true;
-    }
-    if (s_torch_shadows > 0 && (l.is_light_pos || l.is_light_colour) && components == 4 && count >= 1) {
-        memcpy(l.is_light_pos ? s_light_pos : s_light_colour, data, (size_t)std::min(count, 4) * 16);
-        if (l.is_light_pos) s_lights_frame = s_frame_serial;
     }
     if ((s_contact_shadows || s_light_shafts || s_sky_ambient || s_foliage_backlight > 0) && (l.is_sun_dir || l.is_sun_color) && components == 4 && count >= 1) {
         // The UI and other passes set these too; only the values in use while the
@@ -1481,8 +1515,6 @@ struct Params {
     float2 shaft_size; // of the light-shaft textures, in pixels
     float4 shaft;      // xy: the sun's position on screen (0..1), z: how visible it is, w: strength
     float4 bounce;     // x: strength, y: radius in metres
-    float4 lights[4];  // point lights. xyz: where, in view space; w: how bright, 0 for none
-    float4 torch;      // x: strength of their shadows, y: how far towards a light the walk goes, metres
 };
 
 #if WBM_MSAA
@@ -1619,37 +1651,6 @@ fragment float4 ao_compute(VertexOut in [[stage_in]], texture2d<float> z [[textu
             float beyond = p.sun.w > 0.0 ? smoothstep(p.sun.w * 0.6, p.sun.w, P.z) : 1.0;
             ao *= 1.0 - p.shadow_strength * hit * smoothstep(0.05, 0.3, facing) * beyond;
         }
-    }
-    // Shadows from torches and the like: see s_torch_shadows.
-    if (p.torch.x > 0.0) {
-        float lit = 0.0, blocked = 0.0;
-        float3 origin = P + n * (0.02 + 0.004 * P.z);
-        for (int k = 0; k < 4; k++) {
-            if (p.lights[k].w <= 0.0) continue;
-            float3 to_light = p.lights[k].xyz - P;
-            float d2 = dot(to_light, to_light), d = sqrt(d2);
-            float3 L = to_light / max(d, 1.0e-4);
-            float facing = dot(n, L);
-            float share = p.lights[k].w * facing * min(1.0 / max(d2, 1.0e-4), 1.0); // as the engine's shaders weigh it
-            if (facing <= 0.05 || share < 0.003) continue;
-            lit += share;
-            float reach = min(d * 0.92, p.torch.y);
-            const int steps = 20;
-            for (int s = 0; s < steps; s++) {
-                float t = (float(s) + noise) / float(steps);
-                float3 S = origin + L * (t * t * reach + 0.03); // finer near the surface
-                if (S.z <= 0.05) break;
-                float2 ndc = float2(S.x * p.p00, S.y * p.p11) / S.z;
-                int2 sc = int2((ndc * 0.5 + 0.5) * p.ao_size);
-                if (any(sc < int2(0)) || any(sc >= int2(p.ao_size))) break;
-                float behind = S.z - z.read(uint2(sc)).x;
-                if (behind > 0.03 + 0.004 * S.z && behind < 0.45 + 0.02 * S.z) {
-                    blocked += share * (1.0 - 0.4 * t);
-                    break;
-                }
-            }
-        }
-        if (lit > 0.0) ao *= 1.0 - p.torch.x * blocked / (lit + 0.05); // the rest stands for the room's ambient light
     }
     return float4(mix(ao, 1.0, smoothstep(p.fade_start, p.fade_start * 2.0, P.z)));
 }
@@ -1809,8 +1810,6 @@ struct AOParams { // must match Params in k_ao_source
     float shadow_strength, shadow_length, shaft_size[2];
     float shaft[4];
     float bounce[4];
-    float lights[4][4];
-    float torch[4];
 };
 
 id<MTLLibrary> s_ao_library;
@@ -1948,22 +1947,7 @@ void apply_ambient_occlusion()
             shafts = visible > 0.01f;
         }
     }
-    memset(params.lights, 0, sizeof params.lights);
-    params.torch[0] = params.torch[1] = params.torch[2] = params.torch[3] = 0;
-    if (s_torch_shadows > 0 && s_lights_frame == s_frame_serial && s_camera.view_proj_frame == s_frame_serial) {
-        int found = 0;
-        for (int k = 0; k < 4; k++) {
-            const float *w = s_light_pos[k], *col = s_light_colour[k];
-            float power = 0.2126f * col[0] + 0.7152f * col[1] + 0.0722f * col[2];
-            if (!(power > 0.02f) || (w[0] == 0 && w[1] == 0 && w[2] == 0)) continue;
-            double c[4];
-            for (int r = 0; r < 4; r++) c[r] = s_camera.view_proj[r] * w[0] + s_camera.view_proj[4 + r] * w[1] + s_camera.view_proj[8 + r] * w[2] + s_camera.view_proj[12 + r];
-            params.lights[k][0] = (float)(c[0] / s_camera.p00), params.lights[k][1] = (float)(c[1] / s_camera.p11), params.lights[k][2] = (float)c[3], params.lights[k][3] = power;
-            found++;
-        }
-        if (found) params.torch[0] = s_torch_shadows, params.torch[1] = s_torch_reach * scale, s_torch_frames++;
-    }
-    bool occlude = s_ao || params.shadow_strength > 0 || params.torch[0] > 0;
+    bool occlude = s_ao || params.shadow_strength > 0;
     bool bounce = s_bounce_light > 0 && s_bounce_compute_pipeline && s_bounce_blur_pipeline;
     params.bounce[0] = s_bounce_light * 2.5f, params.bounce[1] = 1.6f * scale, params.bounce[2] = params.bounce[3] = 0;
     if (!occlude && !shafts && !bounce) return;
@@ -2128,7 +2112,7 @@ bool vertex_matrix(Program &p, const char *name, double *out)
 void observe_camera(Program &p)
 {
     double wvp[16], wv[16], w[16], inv[16], m[16];
-    if ((s_motion_blur || s_torch_shadows > 0) && s_camera.view_proj_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp) &&
+    if (s_motion_blur && s_camera.view_proj_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp) &&
         vertex_matrix(p, "matWorld", w) && mat_inverse(w, inv)) {
         memcpy(s_camera.last_view_proj, s_camera.view_proj, sizeof s_camera.view_proj);
         s_camera.last_view_proj_frame = s_camera.view_proj_frame;
@@ -2906,6 +2890,7 @@ struct CasterDraw {
     // `push` metres, hanging as the drawn hair does at `share` of its length,
     // casting only where `alpha`, here the hair map, says long hair.
     uint64_t mesh = 0; // see mesh_id
+    bool scenery = false; // in the engine's own shadow map already: not for the sun's
     bool hair = false;
     int strand = 0; // 1: a horse's mane and tail as strands (push: the mane's length, share: the tail's); 2: a person's (push: the longest strand)
     float drift[3] = {0, 0, 0};
@@ -3156,6 +3141,58 @@ fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[te
     if (diffuse.sample(s, in.uv).a < in.cutoff) discard_fragment();
     return float4(in.depth);
 }
+
+// The same casters, seen from the point lights (see render_torch_shadows). Here m takes object space to the
+// world. Every draw is made six times per light, once for each face of the light's cube: the instance says
+// which, and the layer of the map to draw into follows from it.
+struct Torches {
+    float4 light[4]; // xyz: where the light of each cube is
+    float4 depth;    // a face holds x + y / (distance along its axis)
+};
+struct TorchOut {
+    float4 position [[position]];
+    float2 uv;
+    float cutoff [[flat]];
+    uint layer [[render_target_array_index]];
+};
+
+static TorchOut torch_finish(float4 world, float2 uv, float4 params, constant Torches &t, uint instance)
+{
+    float3 r = world.xyz / world.w - t.light[instance / 6].xyz;
+    float3 c; // across the face, down it, and along its axis, as a cube map's faces are laid out
+    switch (instance % 6) {
+    case 0: c = float3(-r.z, -r.y, r.x); break;
+    case 1: c = float3(r.z, -r.y, -r.x); break;
+    case 2: c = float3(r.x, r.z, r.y); break;
+    case 3: c = float3(r.x, -r.z, -r.y); break;
+    case 4: c = float3(r.x, -r.y, r.z); break;
+    default: c = float3(-r.x, -r.y, -r.z); break;
+    }
+    TorchOut out;
+    out.position = float4(c.x, -c.y, t.depth.x * c.z + t.depth.y, c.z);
+    out.uv = uv;
+    out.cutoff = params.x;
+    out.layer = instance;
+    return out;
+}
+
+vertex TorchOut torch_static(StaticIn in [[stage_in]], constant Caster &c [[buffer(0)]], constant Torches &t [[buffer(1)]], uint instance [[instance_id]])
+{
+    return torch_finish(c.m * float4(in.position, 1.0), in.uv, c.params, t, instance);
+}
+
+vertex TorchOut torch_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]], constant Torches &t [[buffer(1)]], uint instance [[instance_id]])
+{
+    float4 p = float4(in.position, 1.0);
+    float4 skinned = c.bones[int(in.indices.x)] * p * in.weights.x + c.bones[int(in.indices.y)] * p * in.weights.y +
+                     c.bones[int(in.indices.z)] * p * in.weights.z + c.bones[int(in.indices.w)] * p * in.weights.w;
+    return torch_finish(c.m * skinned, in.uv, c.params, t, instance);
+}
+
+fragment void torch_cutout(TorchOut in [[stage_in]], texture2d<float> diffuse [[texture(0)]], sampler s [[sampler(0)]])
+{
+    if (diffuse.sample(s, in.uv).a < in.cutoff) discard_fragment();
+}
 )";
 
 id<MTLLibrary> s_caster_library;
@@ -3178,15 +3215,17 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
     }
     // Cut-out scenery (bushes, grass, leaves) is drawn here all the same: the
     // engine's map is too coarse for twigs, whose shadows all but vanish in it.
-    if (!late && p->alpha_texture_location < 0 && s_scenery.count(mesh)) {
+    bool scenery = !late && p->alpha_texture_location < 0 && s_scenery.count(mesh);
+    if (scenery) {
         s_dyn_stats.scenery++;
-        return;
+        if (!(s_torch_shadows > 0)) return; // a torch's map has no other to lean on: it takes the scenery too
     }
     if (!late && s_overlays.count(mesh)) {
         s_dyn_stats.overlays++;
         return;
     }
     CasterDraw c{};
+    c.scenery = scenery;
     memcpy(c.key.format, s_last_key.format, sizeof c.key.format);
     memcpy(c.key.slot, s_last_key.slot, sizeof c.key.slot);
     memcpy(c.key.offset, s_last_key.offset, sizeof c.key.offset);
@@ -3243,7 +3282,7 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
         }
         s_velocity_draws.push_back(v);
     }
-    if (late || s_dyn_shadows) (late ? s_late_casters : s_casters).push_back(c);
+    if (late || casting()) (late ? s_late_casters : s_casters).push_back(c);
     else if (c.bones >= 0) s_caster_bones.resize((size_t)c.bones * 32 * 16); // not wanted for shadows: give the matrices back
 }
 
@@ -3755,6 +3794,245 @@ id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned,
     return state;
 }
 
+// Compiles the casters' shaders, once. False when they cannot be had; shadows are then off for good.
+bool caster_setup()
+{
+    if (s_caster_library) return true;
+    NSError *error = nil;
+    // The default language version follows the SDK the game was built with,
+    // which is too old for vertex amplification.
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion2_2;
+    s_caster_library = [s_device newLibraryWithSource:@(k_caster_source) options:options error:&error];
+    if (!s_caster_library) {
+        complain("shadow caster shaders did not compile: %s", error.localizedDescription.UTF8String);
+        s_dyn_shadows = false;
+        s_torch_shadows = 0;
+        return false;
+    }
+    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+    dd.depthCompareFunction = MTLCompareFunctionLess;
+    dd.depthWriteEnabled = YES;
+    s_caster_depth_state = [s_device newDepthStencilStateWithDescriptor:dd];
+    return true;
+}
+
+// ---- shadows from point lights -------------------------------------------------------------
+//
+// The engine's point lights (torches, candles, fires; four at most) cast no shadows. Here the casters
+// recorded for the sun's map are drawn once more from each light, into the six faces of a cube of depths
+// per light, in one pass: every draw is instanced, six times per light, and each instance goes to its own
+// layer of the map. Shaders lit by these lights then compare their surface's distance from a light with
+// what the light's cube holds that way (add_torch_fragment in shader_xlate.cpp).
+//
+// Which lights there are is learnt from the draws themselves (see note_torches), so the maps are drawn for
+// the lights of the frame before: they stand still, or nearly.
+
+// The cubes: one of the right size once there is something to draw into it, a token one before that, since
+// a shader that samples the map has to be given a texture of its kind whether or not there are shadows.
+id<MTLTexture> torch_map(bool real)
+{
+    NSUInteger size = real ? (NSUInteger)s_torch_size : 1;
+    if (!s_torch_map || (real && s_torch_map.width != size)) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+        td.textureType = MTLTextureTypeCubeArray;
+        td.pixelFormat = MTLPixelFormatDepth32Float;
+        td.width = td.height = size;
+        td.arrayLength = 4;
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_torch_map = [s_device newTextureWithDescriptor:td];
+    }
+    if (!s_torch_sampler) {
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; // compares, and blends the four answers around the point asked for
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.compareFunction = MTLCompareFunctionLessEqual;
+        s_torch_sampler = [s_device newSamplerStateWithDescriptor:sd];
+    }
+    return s_torch_map;
+}
+
+std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> s_torch_pipelines[4]; // [skinned * 2 + cutout]
+
+id<MTLRenderPipelineState> torch_pipeline(const PipelineKey &key, bool skinned, bool cutout)
+{
+    auto &cache = s_torch_pipelines[skinned * 2 + cutout];
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [s_caster_library newFunctionWithName:skinned ? @"torch_skinned" : @"torch_static"];
+    d.fragmentFunction = cutout ? [s_caster_library newFunctionWithName:@"torch_cutout"] : nil; // depth alone otherwise
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+    const int wanted[4] = {0, 4, 7, 8};
+    bool uses_constant = false;
+    for (int n = 0; n < (skinned ? 4 : 2); n++) {
+        int i = wanted[n];
+        if (key.format[i] && key.slot[i] != CONSTANT_SLOT) {
+            vd.attributes[i].format = (MTLVertexFormat)key.format[i];
+            vd.attributes[i].offset = key.offset[i];
+            vd.attributes[i].bufferIndex = VERTEX_SLOT_BASE + key.slot[i];
+        } else { // the mesh has no such attribute: it reads the constant buffer
+            vd.attributes[i].format = MTLVertexFormatFloat4;
+            vd.attributes[i].offset = 0;
+            vd.attributes[i].bufferIndex = CONSTANT_SLOT;
+            uses_constant = true;
+        }
+    }
+    for (int sl = 0; sl < MAX_VERTEX_SLOTS; sl++) {
+        if (!key.stride[sl]) continue;
+        vd.layouts[VERTEX_SLOT_BASE + sl].stride = key.stride[sl];
+        vd.layouts[VERTEX_SLOT_BASE + sl].stepFunction = MTLVertexStepFunctionPerVertex;
+    }
+    if (uses_constant) {
+        vd.layouts[CONSTANT_SLOT].stride = 16;
+        vd.layouts[CONSTANT_SLOT].stepFunction = MTLVertexStepFunctionConstant;
+        vd.layouts[CONSTANT_SLOT].stepRate = 0;
+    }
+    d.vertexDescriptor = vd;
+    d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; // needed to choose a layer per instance
+    NSError *error = nil;
+    id<MTLRenderPipelineState> state = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!state) complain("point light shadow pipeline failed: %s", error.localizedDescription.UTF8String);
+    cache[key] = state;
+    return state;
+}
+
+// inv_frame, p00 and p11 are render_dynamic_shadows' own: they turn a recorded draw's clip space back into the world.
+void render_torch_shadows(const std::vector<CasterDraw> &casters, const std::vector<float> &bones, const double *inv_frame, double p00, double p11)
+{
+    s_torch_cubes = 0;
+    if (s_torch_wanted.empty()) return;
+    const size_t static_size = 256, skinned_size = 2304; // as for the sun's map
+    size_t total = 0;
+    for (const CasterDraw &c : casters) total += c.bones >= 0 || c.own_bones ? skinned_size : static_size;
+    if (!total) return;
+    id<MTLBuffer> uniforms = [s_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+    uint8_t *base = (uint8_t *)uniforms.contents;
+
+    // Depth as a perspective projection gives it, from 5 cm to as far as a torch's light is worth following.
+    const double near = 0.05, far = 80.0;
+    struct {
+        float light[4][4], depth[4];
+    } torches = {};
+    int cubes = (int)std::min<size_t>(4, s_torch_wanted.size());
+    for (int k = 0; k < cubes; k++) memcpy(torches.light[k], s_torch_wanted[(size_t)k].at, 12);
+    torches.depth[0] = (float)(far / (far - near));
+    torches.depth[1] = (float)(-far * near / (far - near));
+
+    id<MTLTexture> map = torch_map(true);
+    id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.depthAttachment.texture = map;
+    d.depthAttachment.loadAction = MTLLoadActionClear;
+    d.depthAttachment.storeAction = MTLStoreActionStore;
+    d.depthAttachment.clearDepth = 1.0;
+    d.renderTargetArrayLength = 24;
+    id<MTLRenderCommandEncoder> pass = [cmd renderCommandEncoderWithDescriptor:d];
+    [pass setDepthStencilState:s_caster_depth_state];
+    [pass setCullMode:MTLCullModeNone];
+    [pass setVertexBuffer:s_constant_attrib offset:0 atIndex:CONSTANT_SLOT];
+    [pass setVertexBytes:&torches length:sizeof torches atIndex:1];
+    size_t at = 0, drawn = 0;
+    void *last_pipeline = nullptr;
+    for (const CasterDraw &c : casters) {
+        bool skinned = c.bones >= 0 || c.own_bones;
+        size_t size = skinned ? skinned_size : static_size;
+        // Hair's extra layers and strands are the sun's affair; the head they grow on casts here.
+        id<MTLRenderPipelineState> pipeline = c.hair || c.strand ? nil : torch_pipeline(c.key, skinned, c.alpha != nil);
+        if (!pipeline) {
+            at += size;
+            continue;
+        }
+        double object[16], placed[16], m[16];
+        for (int i = 0; i < 16; i++) object[i] = c.wvp[i];
+        if (!c.world) {
+            for (int col = 0; col < 4; col++) {
+                placed[col * 4 + 0] = object[col * 4 + 0] / p00;
+                placed[col * 4 + 1] = object[col * 4 + 1] / p11;
+                placed[col * 4 + 2] = object[col * 4 + 3];
+                placed[col * 4 + 3] = col == 3 ? 1.0 : 0.0;
+            }
+            mat_mul(inv_frame, placed, m);
+        }
+        float m32[16];
+        for (int i = 0; i < 16; i++) m32[i] = (float)(c.world ? object[i] : m[i]);
+        memcpy(base + at, m32, 64);
+        const float params[4] = {c.cutoff, 0, 0, 0};
+        memcpy(base + at + 96, params, 16);
+        if (skinned) memcpy(base + at + 144, c.own_bones ? c.own_bones->data() : &bones[(size_t)c.bones * 32 * 16], 32 * 64);
+        if (last_pipeline != (__bridge void *)pipeline) {
+            [pass setRenderPipelineState:pipeline];
+            last_pipeline = (__bridge void *)pipeline;
+        }
+        [pass setVertexBuffer:uniforms offset:at atIndex:0];
+        for (int i = 0; i < c.slots; i++) [pass setVertexBuffer:c.vertex[i] offset:c.vertex_offset[i] atIndex:(NSUInteger)(VERTEX_SLOT_BASE + i)];
+        if (c.alpha) {
+            [pass setFragmentTexture:c.alpha atIndex:0];
+            [pass setFragmentSamplerState:c.alpha_sampler atIndex:0];
+        }
+        [pass drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:c.index_count indexType:c.index_type indexBuffer:c.indices indexBufferOffset:c.index_offset instanceCount:(NSUInteger)cubes * 6];
+        at += size;
+        drawn++;
+    }
+    [pass endEncoding];
+    [cmd commit];
+
+    s_torch_cubes = cubes;
+    for (int k = 0; k < cubes; k++) memcpy(s_torch_cube[k], s_torch_wanted[(size_t)k].at, 12);
+    s_torch_params[0] = s_torch_shadows, s_torch_params[1] = torches.depth[0], s_torch_params[2] = torches.depth[1], s_torch_params[3] = 2.0f / (float)s_torch_size;
+    s_torch_frame = s_frame_serial;
+    s_torch_frames++;
+    s_torch_casters += drawn;
+}
+
+// One value of a uniform the game sets, from whichever stage's block holds it.
+bool uniform_value(Program &p, int location, int element, void *out, size_t bytes)
+{
+    if (location < 0) return false;
+    const UniformLocation &l = p.locations[(size_t)location];
+    for (int s = 0; s < 2; s++) {
+        const XlUniform *u = l.uniform[s];
+        if (!u || element >= std::max(1, u->array_size)) continue;
+        size_t at = (size_t)u->offset + (size_t)element * (size_t)u->array_stride;
+        if (at + bytes > p.uniform_data[s].size()) continue;
+        memcpy(out, p.uniform_data[s].data() + at, bytes);
+        return true;
+    }
+    return false;
+}
+
+// Called for a draw into the scene by a program that takes shadows from point lights: notes the lights the
+// engine has given it, for the next frame's maps, and fills in the shaders' wbm_torch_light, which says for
+// each of them which cube, if any, was drawn from where it stands.
+void note_torches(Program &p, float lights[4][4])
+{
+    int count = 4; // a shader that is not told how many uses what it is given
+    uniform_value(p, p.light_count_location, 0, &count, 4);
+    bool drawn = s_torch_frame == s_frame_serial;
+    for (int i = 0; i < std::min(count, 4); i++) {
+        float at[4], colour[4];
+        if (!uniform_value(p, p.light_pos_location, i, at, 16) || !uniform_value(p, p.light_colour_location, i, colour, 16)) continue;
+        // The slots past those in use hold whatever was there before.
+        if (!(0.2126f * colour[0] + 0.7152f * colour[1] + 0.0722f * colour[2] > 0.02f) || !(fabsf(at[0]) + fabsf(at[1]) + fabsf(at[2]) < 1.0e6f)) continue;
+        auto near_to = [&](const float *other) {
+            float d = 0;
+            for (int k = 0; k < 3; k++) d += (at[k] - other[k]) * (at[k] - other[k]);
+            return d < 0.3f * 0.3f; // a flame flickers about; a light that has moved farther is another light
+        };
+        bool known = false;
+        for (const TorchPlace &seen : s_torch_seen) known = known || near_to(seen.at);
+        if (!known && s_torch_seen.size() < 4) s_torch_seen.push_back(TorchPlace{{at[0], at[1], at[2]}});
+        memcpy(lights[i], at, 12);
+        for (int k = 0; drawn && k < s_torch_cubes; k++)
+            if (near_to(s_torch_cube[k])) {
+                memcpy(lights[i], s_torch_cube[k], 12); // where the map was drawn from, to the letter
+                lights[i][3] = (float)(k + 1);
+                break;
+            }
+    }
+}
+
 // p is the program of a main-pass draw that has both a world-view-projection
 // and a world matrix set, from which the camera is recovered.
 void render_dynamic_shadows(Program &p)
@@ -3768,7 +4046,6 @@ void render_dynamic_shadows(Program &p)
     casters.insert(casters.end(), s_late_ready.begin(), s_late_ready.end());
     s_dyn_window[2] = s_dyn_window[3] = 0; // no map, until this succeeds
     s_dyn_near[2] = s_dyn_near[3] = 0;
-    if (!s_sun_matrix_valid) return;
 
     double wvp[16], world[16], inv[16], view_proj[16], sun[16];
     if (!vertex_matrix(p, "matWorldViewProj", wvp) || !vertex_matrix(p, "matWorld", world) || !mat_inverse(world, inv)) return;
@@ -3797,22 +4074,10 @@ void render_dynamic_shadows(Program &p)
     rigid(view_proj, frame);
     if (!mat_inverse(frame, inv_frame)) return;
 
-    if (!s_caster_library) {
-        NSError *error = nil;
-        // The default language version follows the SDK the game was built with,
-        // which is too old for vertex amplification.
-        MTLCompileOptions *options = [MTLCompileOptions new];
-        options.languageVersion = MTLLanguageVersion2_2;
-        s_caster_library = [s_device newLibraryWithSource:@(k_caster_source) options:options error:&error];
-        if (!s_caster_library) {
-            complain("shadow caster shaders did not compile: %s", error.localizedDescription.UTF8String);
-            s_dyn_shadows = false;
-            return;
-        }
-        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
-        dd.depthCompareFunction = MTLCompareFunctionLess;
-        dd.depthWriteEnabled = YES;
-        s_caster_depth_state = [s_device newDepthStencilStateWithDescriptor:dd];
+    if (!caster_setup()) return;
+    if (s_torch_shadows > 0) render_torch_shadows(casters, bones, inv_frame, p00, p11);
+    if (!s_dyn_shadows || !s_sun_matrix_valid) return;
+    if (!s_dyn_map) {
         // The fine window needs every draw rasterised twice in one go.
         s_caster_halves = s_dyn_near_range > 0 && [s_device supportsVertexAmplificationCount:2] ? 2 : 1;
         const NSUInteger size = k_xl_dyn_size;
@@ -3903,7 +4168,7 @@ void render_dynamic_shadows(Program &p)
     for (const CasterDraw &c : casters) {
         bool skinned = c.bones >= 0 || c.own_bones;
         size_t size = skinned ? skinned_size : static_size;
-        id<MTLRenderPipelineState> pipeline = caster_pipeline(c.key, skinned, c.alpha != nil, c.hair, c.strand);
+        id<MTLRenderPipelineState> pipeline = c.scenery ? nil : caster_pipeline(c.key, skinned, c.alpha != nil, c.hair, c.strand);
         if (!pipeline) {
             at += size;
             continue;
@@ -4191,7 +4456,9 @@ bool prepare_draw()
         }
     }
     if (p->parallax_offset >= 0) { // stone, brick and the ground have depth; a painted shield has not
-        const float parallax[4] = {diffuse && diffuse->material == MAT_STONE ? s_parallax : 0.0f, s_parallax_sign[0], s_parallax_sign[1], 0};
+        // (And whatever a pack has given a map of its heights: w says that there is one to read.)
+        bool mapped = diffuse && diffuse->depth;
+        const float parallax[4] = {mapped || (diffuse && diffuse->material == MAT_STONE) ? s_parallax : 0.0f, s_parallax_sign[0], s_parallax_sign[1], mapped ? 1.0f : 0.0f};
         if (memcmp(p->uniform_data[1].data() + p->parallax_offset, parallax, 16)) {
             memcpy(p->uniform_data[1].data() + p->parallax_offset, parallax, 16);
             p->uniform_dirty[1] = true;
@@ -4211,6 +4478,21 @@ bool prepare_draw()
     if (p->dyn_bias_offset >= 0 && memcmp(p->uniform_data[1].data() + p->dyn_bias_offset, &s_dyn_bias, 4)) {
         memcpy(p->uniform_data[1].data() + p->dyn_bias_offset, &s_dyn_bias, 4);
         p->uniform_dirty[1] = true;
+    }
+    if (p->torch_offset >= 0 && p->torch_light_offset >= 0) {
+        float lights[4][4] = {}, torch[4] = {};
+        if (s_pass_scene) {
+            note_torches(*p, lights);
+            if (s_torch_frame == s_frame_serial) memcpy(torch, s_torch_params, sizeof torch);
+        }
+        if (memcmp(p->uniform_data[1].data() + p->torch_light_offset, lights, sizeof lights)) {
+            memcpy(p->uniform_data[1].data() + p->torch_light_offset, lights, sizeof lights);
+            p->uniform_dirty[1] = true;
+        }
+        if (memcmp(p->uniform_data[1].data() + p->torch_offset, torch, sizeof torch)) {
+            memcpy(p->uniform_data[1].data() + p->torch_offset, torch, sizeof torch);
+            p->uniform_dirty[1] = true;
+        }
     }
     float limit = s_pass_screen ? 1.0f : 65000.0f;
     if (p->limit_offset >= 0 && memcmp(p->uniform_data[1].data() + p->limit_offset, &limit, 4)) {
@@ -4256,11 +4538,17 @@ bool prepare_draw()
             } else if (l.is_scene_copy) {
                 texture = s_water_scene ? s_water_scene : s_white;
                 if (s_sky_sampler) sampler = s_sky_sampler;
+            } else if (l.is_torch_map) {
+                texture = torch_map(false);
+                sampler = s_torch_sampler;
             } else if (l.is_dyn_map) {
                 texture = s_dyn_map ? s_dyn_map : s_white;
                 if (s_dyn_sampler) sampler = s_dyn_sampler;
             } else if (l.is_hair_map) {
                 texture = diffuse && diffuse->hair ? diffuse->hair : s_white;
+                sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
+            } else if (l.is_depth_map) {
+                texture = diffuse && diffuse->depth ? diffuse->depth : s_white;
                 sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
             } else if (l.is_pbr_map || l.is_fur_map) {
                 texture = diffuse && diffuse->pbr ? diffuse->pbr : s_white;
@@ -4296,7 +4584,7 @@ bool prepare_draw()
     // (Played back with the camera moved, the sky only turns while the scene also
     // shifts, so the sky's matrices do not give the scene's camera; a draw that
     // tests depth does. In the game the two agree and the sky comes first.)
-    if (s_dyn_shadows && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world && (!s_replaying || s_depth_test))
+    if (casting() && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world && (!s_replaying || s_depth_test))
         render_dynamic_shadows(*p);
     if (s_pass_scene && (((s_ao || s_contact_shadows || s_light_shafts || s_foliage_backlight > 0) && s_camera.view_frame != s_frame_serial) ||
                          (s_motion_blur && s_camera.view_proj_frame != s_frame_serial)))
@@ -4747,7 +5035,9 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.hair_strands = s_people_hair;
     if (const char *v = getenv("WBM_ROOM_PROBE")) s_room_probe = atoi(v) != 0;
     if (const char *v = getenv("WBM_TORCH_SHADOWS")) s_torch_shadows = std::min(1.0f, std::max(0.0f, (float)atof(v)));
-    if (const char *v = getenv("WBM_TORCH_REACH")) s_torch_reach = std::min(8.0f, std::max(0.3f, (float)atof(v)));
+    if (const char *v = getenv("WBM_TORCH_MAP")) s_torch_size = std::min(4096, std::max(128, atoi(v)));
+    s_shader_options.torch_shadows = s_torch_shadows > 0;
+    if (const char *v = getenv("WBM_TORCH_LIGHTING")) s_shader_options.torch_lighting = s_torch_shadows > 0 && atoi(v) != 0; // off unless set; rides on the shadows' rewrite
     if (const char *v = getenv("WBM_ROOM_PROBE_EVERY")) s_room_every = std::max(1, atoi(v));
     if (const char *v = getenv("WBM_WATER_REFLECTIONS")) s_water_reflections = atoi(v) != 0;
     if (const char *v = getenv("WBM_WATER_STEPS")) s_water_steps = std::min(64, std::max(4, atoi(v)));
@@ -4864,11 +5154,9 @@ void mtl_dump_stats(FILE *f)
     if (s_velocity_objects) fprintf(f, "moving objects blurred by their own movement: %llu in all\n", (unsigned long long)s_velocity_objects);
     if (s_shell_draws) fprintf(f, "\n%llu layers of fur drawn\n", (unsigned long long)s_shell_draws);
     if (s_water_copies) fprintf(f, "\nscene copied for water to reflect in %llu frames\n", (unsigned long long)s_water_copies);
-    if (s_torch_frames) {
-        fprintf(f, "\nshadows from point lights in %llu frames; lights now:", (unsigned long long)s_torch_frames);
-        for (int k = 0; k < 4; k++) fprintf(f, " [%.1f %.1f %.1f | %.2f %.2f %.2f]", s_light_pos[k][0], s_light_pos[k][1], s_light_pos[k][2], s_light_colour[k][0], s_light_colour[k][1], s_light_colour[k][2]);
-        fprintf(f, "\n");
-    }
+    if (s_torch_frames)
+        fprintf(f, "\nshadows from point lights drawn in %llu frames, %.0f casters per frame on average; %d lights now, in cubes %d texels wide\n", (unsigned long long)s_torch_frames,
+                (double)s_torch_casters / (double)s_torch_frames, s_torch_cubes, s_torch_size);
     if (s_room_updates) fprintf(f, "\nroom probe updated in %llu frames\n", (unsigned long long)s_room_updates);
     if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
@@ -4976,7 +5264,7 @@ void mtl_present(bool capture, uint32_t frame)
             s_casters.clear();
             s_caster_bones.clear();
         }
-        if (!s_dyn_shadows) s_caster_bones.clear(), s_prepass_meshes.clear();
+        if (!casting()) s_caster_bones.clear(), s_prepass_meshes.clear();
         s_prepass_solid.clear();
         s_past_objects.clear();
         for (const VelocityDraw &v : s_velocity_draws) {
@@ -4989,11 +5277,13 @@ void mtl_present(bool capture, uint32_t frame)
         s_velocity_draws.clear();
         s_past_frame = s_frame_serial;
         if (s_sky_ambient) update_sky_ambient();
-        if (s_dyn_shadows) {
+        if (casting()) {
             s_late_ready.swap(s_late_casters);
             s_late_casters.clear();
             s_prepass_meshes.clear();
         }
+        s_torch_wanted.swap(s_torch_seen);
+        s_torch_seen.clear();
         if (s_dyn_shadows && s_dyn_frame + 2 < s_frame_serial) // the map has gone stale
             s_dyn_window[2] = s_dyn_window[3] = s_dyn_near[2] = s_dyn_near[3] = 0;
         if (s_hdr && s_frame_serial % 30 == 0) {
@@ -5863,15 +6153,15 @@ void mtl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *i
         }
         s_blend = blend, s_blend_src = blend_src, s_blend_dst = blend_dst, s_blend_eq = blend_eq;
         if (shells) memset(s_shell_now, 0, sizeof s_shell_now);
-        if ((s_dyn_shadows || s_motion_blur) && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
-        if (s_dyn_shadows && s_pass_scene && primitive == MTLPrimitiveTypeTriangle && s_depth_test && s_depth_mask)
+        if ((casting() || s_motion_blur) && s_pass_prepass && primitive == MTLPrimitiveTypeTriangle) record_caster((NSUInteger)count, index_type, b->mtl, offset, false);
+        if (casting() && s_pass_scene && primitive == MTLPrimitiveTypeTriangle && s_depth_test && s_depth_mask)
             record_caster((NSUInteger)count, index_type, b->mtl, offset, true);
         if (s_dyn_shadows && s_pass_shadow_map) record_scenery((NSUInteger)count, offset);
-        if (s_dyn_shadows && s_pass_scene && !s_depth_test) record_overlay((NSUInteger)count, offset);
+        if (casting() && s_pass_scene && !s_depth_test) record_overlay((NSUInteger)count, offset);
         // So is a marker that floats over a soldier's head: the pre-pass draws it as a solid thing, without a
         // texture to cut it out by, and the main pass then blends it in, unlit. (Soldiers fading in at a
         // distance are blended too, but lit.)
-        if (s_dyn_shadows && s_pass_scene && s_depth_test && s_blend && s_prepass_solid.count(mesh_id((NSUInteger)count, offset))) {
+        if (casting() && s_pass_scene && s_depth_test && s_blend && s_prepass_solid.count(mesh_id((NSUInteger)count, offset))) {
             Program *mp = find(s_programs, s_program);
             if (mp && !(mp->input_mask & 2u)) record_overlay((NSUInteger)count, offset); // and it is unlit: its shader takes no normals
         }

@@ -28,12 +28,23 @@ const char *const k_xl_dyn_sampler = "wbm_dyn_map";
 const char *const k_xl_dyn_window_uniform = "wbm_dyn";
 const char *const k_xl_dyn_near_uniform = "wbm_dyn_near";
 const char *const k_xl_dyn_bias_uniform = "wbm_dyn_bias";
+const char *const k_xl_torch_sampler = "wbm_torch_map";
+const char *const k_xl_torch_uniform = "wbm_torch";
+const char *const k_xl_torch_light_uniform = "wbm_torch_light";
 
 namespace {
 
 struct Varyings {
     std::map<std::string, int> location;
     int next = 0;
+    // From add_torch_vertex to add_torch_fragment: the varying the vertex shader puts the point lights' sum in
+    // (alone, or with the rest of the light when torch_shared), and those it puts their highlights in.
+    std::string torch_total;
+    bool torch_shared = false;
+    std::vector<std::string> torch_gloss;
+    // With torch_lighting: 1 when the vertex shader passes on the surface's own axes (wbm_torch_tbn), for a
+    // fragment shader that works in them, 2 when it works in the world's, 0 when it does neither.
+    int torch_space = 0;
 };
 
 // Locations a declaration of this type occupies.
@@ -945,7 +956,9 @@ bool add_parallax(std::string &fs)
          "      float wbm_layer = 1.0, wbm_h = 0.0, wbm_was = 1.0;\n"
          "      for (int wbm_i = 0; wbm_i < 8; wbm_i++) {\n"
          // Read well blurred: it is the stones and the joints between them that have depth, not the grain painted on them.
-         "        wbm_h = smoothstep(0.1, 0.5, dot(textureGrad(diffuse_texture, wbm_uv, wbm_bx, wbm_by).xyz, vec3(0.3333)));\n"
+         // (Unless a pack has the surface's heights as a map of their own: wbm_parallax.w says so, and they are read as they are.)
+         "        wbm_h = wbm_parallax.w > 0.0 ? textureGrad(wbm_depth_map, wbm_uv, wbm_dx, wbm_dy).x\n"
+         "                                     : smoothstep(0.1, 0.5, dot(textureGrad(diffuse_texture, wbm_uv, wbm_bx, wbm_by).xyz, vec3(0.3333)));\n"
          "        if (wbm_h >= wbm_layer) break;\n"
          "        wbm_was = wbm_layer - wbm_h;\n"
          "        wbm_uv -= wbm_step;\n"
@@ -956,7 +969,7 @@ bool add_parallax(std::string &fs)
          "    }\n"
          "  }" +
          rest;
-    fs.insert(0, "varying vec3 wbm_tview;\n");
+    fs.insert(0, "varying vec3 wbm_tview;\nuniform sampler2D wbm_depth_map;\n");
     return true;
 }
 
@@ -1815,6 +1828,323 @@ void decode_srgb_in_hardware(std::string &fs, std::vector<std::string> &samplers
     }
 }
 
+// Shadows from the engine's point lights (torches, candles, fires), which in the game cast none. The backend
+// draws the scene from each light into a cube of depths (see render_torch_shadows); here the shaders learn to
+// look their own surface up in them.
+//
+// The engine weighs most of these lights at the vertices and hands the fragment shader their sum, so a light
+// cannot simply be switched off for a pixel. The vertex shader therefore also passes on how much each light
+// contributed (wbm_torch_w) and where the surface is (wbm_torch_at); the fragment shader works out what share
+// of the sum the lights it can see account for, and scales the sum by that. Lights the fragment shader weighs
+// itself are scaled one by one.
+const char *const k_torch_function = R"(
+uniform samplerCubeArrayShadow wbm_torch_map;
+uniform vec4 wbm_torch_light[4]; // xyz: where the engine's light of that number is; w: 1 + the number of its cube, 0 for none
+uniform vec4 wbm_torch;          // x: strength, 0 for no maps; y, z: a cube's depth is y + z / distance along the face's axis; w: a texel's width at distance 1
+vec4 wbm_torch_s = vec4(1.0);    // how much of each light reaches this pixel
+vec3 wbm_torch_ratio = vec3(1.0);
+float wbm_torch_gloss = 1.0;
+float wbm_torch_seen(int i, vec3 n, float turn)
+{
+    vec4 light = wbm_torch_light[i];
+    if (light.w <= 0.0) return 1.0;
+    vec3 v = wbm_torch_at - light.xyz;
+    if (dot(n, v) > 0.0) n = -n; // towards the light
+    vec3 a = abs(v);
+    float texel = max(a.x, max(a.y, a.z)) * wbm_torch.w;
+    float len = max(length(v), 1.0e-4);
+    // The surface is moved off itself before the comparison, farther the more it is seen edge-on from the light.
+    float slant = sqrt(clamp(1.0 - pow(dot(n, v) / len, 2.0), 0.0, 1.0));
+    v += n * (texel * (1.0 + 2.5 * slant) + 0.012);
+    a = abs(v);
+    float depth = wbm_torch.y + wbm_torch.z / max(max(a.x, max(a.y, a.z)), 1.0e-3);
+    vec3 d = v / len;
+    vec3 side = normalize(cross(d, abs(d.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 up = cross(d, side);
+    vec2 k = vec2(cos(turn), sin(turn)) * texel * 1.5;
+    float lit = texture(wbm_torch_map, vec4(v + side * k.x + up * k.y, light.w - 1.0), depth);
+    lit += texture(wbm_torch_map, vec4(v - side * k.y + up * k.x, light.w - 1.0), depth);
+    lit += texture(wbm_torch_map, vec4(v - side * k.x - up * k.y, light.w - 1.0), depth);
+    lit += texture(wbm_torch_map, vec4(v + side * k.y - up * k.x, light.w - 1.0), depth);
+    return lit * 0.25;
+}
+void wbm_torch_setup()
+{
+    if (wbm_torch.x <= 0.0) return;
+    vec3 n = cross(dFdx(wbm_torch_at), dFdy(wbm_torch_at));
+    n = dot(n, n) > 0.0 ? normalize(n) : vec3(0.0, 0.0, 1.0);
+    float turn = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.2831853;
+    vec3 all = vec3(0.0), kept = vec3(0.0);
+    float gloss = 0.0, gloss_kept = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (wbm_torch_light[i].w <= 0.0) continue;
+        float s = mix(1.0, wbm_torch_seen(i, n, turn), wbm_torch.x);
+        wbm_torch_s[i] = s;
+        vec3 c = vLightDiffuse[i].xyz * wbm_torch_w[i];
+        all += c;
+        kept += c * s;
+        vec3 to = wbm_torch_light[i].xyz - wbm_torch_at;
+        float g = dot(vLightDiffuse[i].xyz, vec3(0.3333)) / max(dot(to, to), 1.0e-4); // highlights go by nearness alone
+        gloss += g;
+        gloss_kept += g * s;
+    }
+    wbm_torch_ratio = (kept + 1.0e-6) / (all + 1.0e-6);
+    wbm_torch_gloss = (gloss_kept + 1.0e-6) / (gloss + 1.0e-6);
+}
+)";
+
+// The vertex shader's part. Where the engine sums its point lights:
+//   total = (total + ((facing * vLightDiffuse[i]) * (1.0/(dot (to_light, to_light)))));
+// each light's weight is kept as well. What becomes of the sum is noted for the fragment shader's part: it is
+// either passed on by itself, or added to the rest of the light at once, and then its share of the whole goes along.
+bool add_torch_vertex(std::string &vs, Varyings &varyings, bool lighting)
+{
+    static const std::regex to_light(R"(vLightPosDir\[[^;]*?\]\.xyz - (\w+)(\.xyz)?\))");
+    static const std::regex term(R"((total_\d+) = \(\1 \+ \(\(\s*([^;]*?)\s*\* vLightDiffuse\[(\w+)\]\) \* \(1\.0/\(\s*dot \((\w+), \4\)\s*\)\)\)\);)");
+    static const std::regex gloss_term(R"((total_\d+) = \(\1 \+ \(\(\s*\(1\.0/\(dot \((\w+), \2\)\)\)\s*\* vLightDiffuse\[\w+\]\) \* pow \()");
+    std::smatch m;
+    size_t body = vs.find("void main ()");
+    if (body != std::string::npos) body = vs.find('{', body);
+    if (body == std::string::npos || !std::regex_search(vs, m, to_light)) return false;
+    const std::string at = m[1];
+    auto varying = [&](const std::string &name) { return std::regex_search(vs, std::regex("varying \\w+ " + name + ";")); };
+    // Where a sum ends up: in a varying, at once or by way of one temporary.
+    auto destination = [&](const std::string &total) -> std::string {
+        std::smatch d;
+        if (!std::regex_search(vs, d, std::regex("\\n\\s*(\\w+) = " + total + "(\\.xyz)?;"))) return "";
+        std::string to = d[1];
+        if (!varying(to) && std::regex_search(vs, d, std::regex("\\n\\s*(\\w+) = " + to + ";"))) to = d[1];
+        return varying(to) ? to : "";
+    };
+    if (std::regex_search(vs, m, gloss_term)) {
+        std::string to = destination(m[1]);
+        if (!to.empty()) varyings.torch_gloss.push_back(to);
+    }
+    if (std::regex_search(vs, m, term)) {
+        const std::string total = m[1];
+        vs = std::regex_replace(vs, term, "$&\n      wbm_torch_w[$3] += ($2) / dot($4, $4);");
+        varyings.torch_total = destination(total);
+        if (varyings.torch_total.empty() && std::regex_search(vs, m, std::regex("\\n\\s*(\\w+) = \\(\\1 \\+ " + total + "\\);"))) {
+            const std::string sum = m[1];
+            size_t after = (size_t)m.position(0) + (size_t)m.length(0);
+            vs.insert(after, "\n  wbm_torch_share = " + total + ".xyz / max(" + sum + ".xyz, vec3(1.0e-5));");
+            // The whole may pass through other variables on its way to a varying.
+            static const std::regex assignment(R"(\n\s*(\w+)(\.\w+)? = ([^;]*);)");
+            std::vector<std::string> carriers = {sum};
+            for (std::sregex_iterator it(vs.begin() + (std::ptrdiff_t)after, vs.end(), assignment), none; it != none; ++it) {
+                const std::string to = (*it)[1], from = (*it)[3];
+                bool carried = false;
+                for (const std::string &name : carriers) carried = carried || std::regex_search(from, std::regex("\\b" + name + "\\b"));
+                if (!carried) continue;
+                if (!varying(to)) {
+                    carriers.push_back(to);
+                    continue;
+                }
+                varyings.torch_total = to;
+                varyings.torch_shared = true;
+                break;
+            }
+        }
+    }
+    body = vs.find('{', vs.find("void main ()"));
+    vs.insert(body + 1, "\n  wbm_torch_w = vec4(0.0);\n  wbm_torch_share = vec3(1.0);");
+    vs.insert(vs.rfind('}'), "  wbm_torch_at = " + at + ".xyz;\n");
+    vs.insert(0, "varying vec3 wbm_torch_at;\nvarying vec4 wbm_torch_w;\nvarying vec3 wbm_torch_share;\n");
+    // For lights weighed again at each pixel (see k_torch_lighting_function): the engine's standard shaders
+    // either light in the surface's own space, and then have the matrix that leads there from the world, or
+    // light in the world's.
+    if (lighting && varyings.torch_total == "VertexLighting" && !varyings.torch_shared && vs.find("varying vec3 ViewDir;") != std::string::npos) {
+        static const std::regex basis(R"(\((tmpvar_\d+) \* -\(vSunDir\.xyz\)\))");
+        bool own = std::regex_search(vs, m, basis);
+        vs.insert(vs.rfind('}'), "  wbm_torch_tbn = " + (own ? std::string(m[1]) : std::string("mat3(1.0)")) + ";\n");
+        vs.insert(0, "varying mat3 wbm_torch_tbn;\n");
+        varyings.torch_space = own ? 1 : 2;
+    }
+    return true;
+}
+
+// With torch_lighting, the lights the engine weighs at the vertices are weighed at each pixel instead, in its
+// standard shaders: with the normal the shader has there (from its normal map, when it has one), and with a
+// highlight per light of the kind the sun's has. LOBE is that highlight; `first` is the light a shader with
+// a normal map already weighs per pixel by itself, -1 for none.
+const char *const k_torch_lighting_function = R"(
+vec3 wbm_torch_diffuse(vec3 n, int first)
+{
+    vec3 sum = vec3(0.0);
+    n = normalize(n);
+    for (int i = 0; i < 4 && i < iLightPointCount; i++) {
+        if (i == first) continue;
+        vec3 to = vLightPosDir[i].xyz - wbm_torch_at;
+        sum += vLightDiffuse[i].xyz * (clamp(dot(n, normalize(wbm_torch_tbn * to)), 0.0, 1.0) / max(dot(to, to), 1.0e-4) * wbm_torch_s[i]);
+    }
+    return sum;
+}
+vec3 wbm_torch_shine(vec3 n, vec3 view, int first)
+{
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < 4 && i < iLightPointCount; i++) {
+        if (i == first) continue;
+        vec3 to = vLightPosDir[i].xyz - wbm_torch_at;
+        vec3 l = normalize(wbm_torch_tbn * to);
+        sum += vLightDiffuse[i].xyz * (LOBE / max(dot(to, to), 1.0e-4) * wbm_torch_s[i]);
+    }
+    return sum;
+}
+)";
+
+// The fragment shader's part, where the program's vertex shader has done its own.
+bool add_torch_fragment(std::string &fs, const Varyings &varyings, bool room_fill)
+{
+    static const std::regex colour(R"(vLightDiffuse\[((?:[^\[\]]|\[[^\[\]]*\])*)\])");
+    size_t main_at = fs.find("void main ()");
+    size_t body = main_at != std::string::npos ? fs.find('{', main_at) : std::string::npos;
+    if (body == std::string::npos || !varyings.location.count("wbm_torch_at")) return false;
+    std::string head = fs.substr(0, main_at), open = fs.substr(main_at, body + 1 - main_at), rest = fs.substr(body + 1);
+    std::string start = "\n  wbm_torch_setup();";
+    bool any = false;
+    if (std::regex_search(rest, colour)) { // lights weighed here, each by itself
+        rest = std::regex_replace(rest, colour, "(vLightDiffuse[$1] * wbm_torch_s[$1])");
+        any = true;
+    }
+    auto scale = [&](const std::string &name, const std::string &by) {
+        std::smatch m;
+        if (!std::regex_search(head, m, std::regex("varying (vec[34]) " + name + ";"))) return;
+        rest = std::regex_replace(rest, std::regex("\\b" + name + "\\b"), "wbm_torch_" + name);
+        start += "\n  " + std::string(m[1]) + " wbm_torch_" + name + " = " + name + ";\n  wbm_torch_" + name + ".xyz *= " + by + ";";
+        any = true;
+    };
+    // Lights weighed per pixel, where this shader and the program's vertex shader work in the same space.
+    std::string normal, first = "-1", lighting;
+    std::smatch m;
+    static const std::regex mapped(R"(\n\s*(normal_\d+)(\.\w+)? = )");
+    bool has_map = head.find("uniform sampler2D normal_texture;") != std::string::npos;
+    if (varyings.torch_space == 1 && has_map && head.find("varying vec4 PointLightDir;") != std::string::npos && std::regex_search(rest, m, mapped))
+        normal = m[1], first = "iLightIndices[0]";
+    if (varyings.torch_space == 2 && !has_map && head.find("varying vec3 SunLightDir;") != std::string::npos) normal = "SunLightDir";
+    if (!normal.empty() && head.find("varying vec3 ViewDir;") != std::string::npos) {
+        // The normal has to be there by the time the light is asked for.
+        size_t ready = normal == "SunLightDir" ? 0 : rest.find(';', rest.find(normal + ".z = ") != std::string::npos ? rest.find(normal + ".z = ") : (size_t)m.position(0) + 1);
+        auto replace = [&](const std::string &name, const std::string &with) {
+            std::smatch use;
+            if (!std::regex_search(head, std::regex("varying vec[34] " + name + ";")) || !std::regex_search(rest, use, std::regex("\\b" + name + "\\b(\\.xyz)?"))) return false;
+            if (ready == std::string::npos || (size_t)use.position(0) < ready) return false;
+            rest = std::regex_replace(rest, std::regex("\\b" + name + "\\b(\\.xyz)?"), with);
+            return true;
+        };
+        bool lit = replace(varyings.torch_total, "wbm_torch_diffuse(" + normal + ", " + first + ")");
+        bool shone = false;
+        for (const std::string &name : varyings.torch_gloss) shone = replace(name, "wbm_torch_shine(" + normal + ", ViewDir, " + first + ")") || shone;
+        if (lit || shone) {
+            lighting = std::regex_replace(k_torch_lighting_function, std::regex("LOBE"),
+                                          fs.find("wbm_specular(") != std::string::npos ? "wbm_specular(view, l, n, fMaterialPower)"
+                                                                                       : "pow(clamp(dot(normalize(normalize(view) + l), normalize(n)), 0.0, 1.0), fMaterialPower)");
+            any = true;
+        }
+    }
+    // A room's walls and floors add their ambient light as one flat colour: where no torch reaches, in a
+    // torch's shadow for one, a wall is its picture and nothing more, whatever its normal map says. But a
+    // room's ambient light is its torches' light come back off the other walls, and more of it comes from
+    // the side they are on. So it is weighed by how far the surface, by its map, is turned towards the
+    // lights: half as much turned away, half as much again turned towards them, the same on the whole.
+    static const std::regex room_normal(R"(dot \((\w+), normalize\(vec_to_light_0\)\))");
+    static const std::regex room_ambient(R"(= \(vAmbientColor \+ )");
+    std::string fill;
+    if (room_fill && head.find("varying vec3 vec_to_light_2;") != std::string::npos && head.find("uniform int iLightIndices[4];") != std::string::npos &&
+        std::regex_search(rest, m, room_normal) && std::regex_search(rest, room_ambient)) {
+        rest = std::regex_replace(rest, room_ambient, "= ((vAmbientColor * wbm_torch_fill(" + std::string(m[1]) + ")) + ", std::regex_constants::format_first_only);
+        fill = R"(
+float wbm_torch_fill(vec3 n)
+{
+    vec3 to[3] = vec3[3](vec_to_light_0, vec_to_light_1, vec_to_light_2);
+    float all = 0.0, towards = 0.0;
+    for (int k = 0; k < 3; k++) {
+        float w = dot(vLightDiffuse[iLightIndices[k]].xyz, vec3(0.3333)) / max(dot(to[k], to[k]), 1.0e-4);
+        all += w;
+        towards += w * (0.5 + 0.5 * dot(normalize(n), normalize(to[k])));
+    }
+    return all > 1.0e-6 ? 0.5 + towards / all : 1.0;
+}
+)";
+        any = true;
+    }
+    if (!varyings.torch_total.empty()) scale(varyings.torch_total, varyings.torch_shared ? "1.0 - wbm_torch_share * (1.0 - wbm_torch_ratio)" : "wbm_torch_ratio");
+    for (const std::string &name : varyings.torch_gloss) scale(name, "wbm_torch_gloss");
+    if (!any) return false;
+    std::string declared = "varying vec3 wbm_torch_at;\nvarying vec4 wbm_torch_w;\nvarying vec3 wbm_torch_share;\n";
+    if (head.find("uniform vec4 vLightDiffuse[4];") == std::string::npos) declared += "uniform vec4 vLightDiffuse[4];\n";
+    if (!lighting.empty()) {
+        declared += "varying mat3 wbm_torch_tbn;\n";
+        for (const char *needed : {"uniform vec4 vLightPosDir[4];", "uniform int iLightPointCount;", "uniform int iLightIndices[4];", "uniform float fMaterialPower;"})
+            if (head.find(needed) == std::string::npos) declared += std::string(needed) + "\n";
+    }
+    fs = declared + head + k_torch_function + lighting + fill + open + start + rest;
+    return true;
+}
+
+// A pack's map of a surface (k_xl_pbr_sampler) in the shaders that have no highlight of their own to steer
+// with it, which is most of what buildings are drawn with:
+//   - its alpha is how much of the light from all round reaches the spot (ambient occlusion): the ambient
+//     light is scaled by it where the shader adds that itself, and the whole by half as much where the
+//     vertex shader has already summed the light;
+//   - its roughness and metalness give the sun a highlight where the shader lights by a normal map and has
+//     none: next to nothing on plaster, a sheen on planed wood or wet stone.
+// `declared`: the sampler and its uniform are in the shader already.
+const char *const k_surface_function = R"(
+float wbm_ao_at(vec2 uv)
+{
+    return wbm_pbr.x > 0.0 ? texture(wbm_pbr_map, uv).a : 1.0;
+}
+vec3 wbm_map_shine(vec3 n, vec3 view, vec3 light, vec3 colour, vec2 uv)
+{
+    if (wbm_pbr.x <= 0.0) return vec3(0.0);
+    vec4 m = texture(wbm_pbr_map, uv);
+    vec3 v = normalize(view), l = normalize(light);
+    n = normalize(n);
+    vec3 h = normalize(v + l);
+    float nl = clamp(dot(n, l), 0.0, 1.0), nh = clamp(dot(n, h), 0.0, 1.0), lh = clamp(dot(l, h), 0.0, 1.0);
+    float a = max(m.g * m.g, 0.01), a2 = a * a;
+    float d = nh * nh * (a2 - 1.0) + 1.0;
+    float seen = 0.25 / (max(lh * lh, 0.1) * (m.g + 0.5));
+    vec3 f0 = mix(vec3(0.04), vec3(0.7), m.r);
+    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - lh, 5.0);
+    return colour * fresnel * (a2 / (d * d) * seen * nl * m.a);
+}
+)";
+
+bool add_surface_maps(std::string &fs, const Varyings &varyings, bool declared)
+{
+    size_t main_at = fs.find("void main ()");
+    size_t body = main_at != std::string::npos ? fs.find('{', main_at) : std::string::npos;
+    if (body == std::string::npos || fs.find("uniform sampler2D diffuse_texture;") == std::string::npos || fs.find("varying vec2 Tex0;") == std::string::npos) return false;
+    std::string head = fs.substr(0, main_at), open = fs.substr(main_at, body + 1 - main_at), rest = fs.substr(body + 1);
+    const std::string uv = rest.find("vec2 wbm_uv") != std::string::npos ? "wbm_uv" : "Tex0";
+    bool any = false;
+    static const std::regex ambient(R"(\b(vAmbientColor|vGroundAmbientColor)\b)");
+    if (std::regex_search(rest, ambient)) {
+        rest = std::regex_replace(rest, ambient, "($1 * wbm_ao_at(" + uv + "))");
+        any = true;
+    } else if (head.find("varying vec4 Color;") != std::string::npos && head.find("varying vec4 SunLight;") != std::string::npos) {
+        rest.insert(rest.rfind('}'), "  gl_FragColor.xyz *= mix(1.0, wbm_ao_at(" + uv + "), 0.5);\n");
+        any = true;
+    }
+    static const std::regex lit(R"(dot \(SunLightDir, (normal_\d+)\))");
+    static const std::regex encode(R"(\n(\s*)(\w+)\.xyz = pow \(\2\.xyz, output_gamma_inv\.xyz\);)");
+    static const std::regex shadow(R"(\b(sun_amount_\d+)\b)");
+    std::smatch m, e, sh;
+    if (rest.find("wbm_specular(") == std::string::npos && rest.find("fSpecular") == std::string::npos && head.find("uniform vec4 vSunColor;") != std::string::npos &&
+        varyings.location.count("ViewDir") && std::regex_search(rest, m, lit) && std::regex_search(rest, e, encode)) {
+        size_t at = (size_t)e.position(0);
+        bool shaded = std::regex_search(rest, sh, shadow) && (size_t)sh.position(0) < at;
+        rest.insert(at, "\n  " + std::string(e[2]) + ".xyz += wbm_map_shine(" + std::string(m[1]) + ", ViewDir, SunLightDir, vSunColor.xyz" + (shaded ? " * " + std::string(sh[1]) : std::string()) + ", " + uv + ");");
+        if (head.find("varying vec3 ViewDir;") == std::string::npos) head.insert(0, "varying vec3 ViewDir;\n");
+        any = true;
+    }
+    if (!any) return false;
+    if (!declared) head.insert(0, std::string("uniform sampler2D ") + k_xl_pbr_sampler + ";\nuniform vec4 " + k_xl_pbr_uniform + ";\n");
+    fs = head + k_surface_function + open + rest;
+    return true;
+}
+
 // Rewrites the declarations and built-ins that changed between GLSL 1.20 and
 // 4.50. Attributes and varyings get explicit locations so that the two stages
 // and the vertex descriptor agree without relying on declaration order.
@@ -1822,6 +2152,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
                       const XlOptions &options, std::vector<std::string> &srgb_samplers, std::string &log)
 {
     std::string glsl = source;
+    if (vertex && options.torch_shadows) add_torch_vertex(glsl, varyings, options.torch_lighting); // first: it goes by the shapes the engine's own code has
     int shadow_filter = options.pcss_shadows ? 2 : options.soft_shadows ? 1 : 0;
     bool shadows = !vertex && (shadow_filter || options.dynamic_shadows) && rewrite_shadows(glsl, shadow_filter, options.dynamic_shadows);
     bool soft_shadows = shadows && shadow_filter != 0;
@@ -1844,6 +2175,8 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     // The fragment's half only where the vertex shader of this program has supplied the eye's direction.
     bool parallax = options.parallax && (vertex ? add_parallax_vertex(glsl) : varyings.location.count("wbm_tview") && add_parallax(glsl)); // last: it takes over the texture coordinate wherever the others left it
+    if (!vertex && options.torch_shadows) add_torch_fragment(glsl, varyings, options.torch_lighting); // after the rest, which look for the names it replaces
+    if (!vertex && options.materials) add_surface_maps(glsl, varyings, pbr_extra.find(k_xl_pbr_sampler) != std::string::npos); // after the parallax: it reads where that looks
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output || options.grade) && rewrite_final_pass(glsl, options);
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");

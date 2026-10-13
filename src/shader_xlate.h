@@ -123,6 +123,15 @@ struct XlOptions {
     // Wind: vertex shaders move what the backend marks as foliage, more the
     // higher up it is. Adds the wbm_wind uniform (see k_xl_wind_uniform).
     bool wind = false;
+    // Shadows from the engine's point lights: shaders that are lit by them look
+    // their surface up in a cube of depths per light, which the backend draws.
+    // Adds the sampler and uniforms described at k_xl_torch_sampler.
+    bool torch_shadows = false;
+    // On top of torch_shadows: in the engine's standard shaders, the point
+    // lights that are weighed at the vertices are weighed at each pixel
+    // instead, with the normal map where there is one, and each gets a
+    // highlight of the kind the sun's has.
+    bool torch_lighting = false;
     // For tuning: shaders with an environment reflection show their estimated
     // metalness in place of their colour, white for metal and black for none.
     bool debug_materials = false;
@@ -216,6 +225,20 @@ extern const char *const k_xl_dyn_sampler;
 extern const char *const k_xl_dyn_window_uniform;
 extern const char *const k_xl_dyn_near_uniform;
 extern const char *const k_xl_dyn_bias_uniform;
+
+// With torch_shadows, shaders lit by the engine's point lights get:
+//   wbm_torch_map    an array of cube maps of depth, one cube per light, to be
+//                    sampled with a comparison (less or equal passes). Seen from
+//                    the light, a face holds y + z / (distance along its axis),
+//                    y and z being those of wbm_torch;
+//   wbm_torch_light  four vec4, one per light as the engine numbers them. xyz:
+//                    the light's place in the world; w: 1 + the number of its
+//                    cube, 0 when it has none;
+//   wbm_torch        x: strength of the shadows, 0 while there are no maps;
+//                    y, z: see above; w: 2 / a face's width in texels.
+extern const char *const k_xl_torch_sampler;
+extern const char *const k_xl_torch_uniform;
+extern const char *const k_xl_torch_light_uniform;
 enum { k_xl_dyn_size = 4096 };
 enum { k_xl_sky_face_size = 128 };
 
