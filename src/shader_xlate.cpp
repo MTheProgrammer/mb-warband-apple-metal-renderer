@@ -803,7 +803,35 @@ vec4 wbm_people_hair(vec3 normal_, vec3 tangent_, vec3 view, vec3 to_sun, vec3 c
 // The last two need the depth the engine's own fade is worked out from, which
 // is a share of the far plane's distance: 1250 m in a battle, where 0.0008 is a metre.
 // The shallows fade over about a metre of water, the foam lies where it is under 20 cm.
-bool add_water(std::string &fs)
+// The sky as the renderer has captured it (see k_xl_sky_sampler), for water to reflect.
+const char k_water_sky_function[] = R"(
+uniform sampler2D wbm_sky;
+vec3 wbm_water_sky(vec3 d)
+{
+    vec3 a = abs(d), forward, up;
+    float face;
+    if (a.x >= a.y && a.x >= a.z) {
+        forward = vec3(sign(d.x), 0.0, 0.0), up = vec3(0.0, 0.0, 1.0), face = d.x > 0.0 ? 0.0 : 1.0;
+    } else if (a.y >= a.z) {
+        forward = vec3(0.0, sign(d.y), 0.0), up = vec3(0.0, 0.0, 1.0), face = d.y > 0.0 ? 2.0 : 3.0;
+    } else {
+        forward = vec3(0.0, 0.0, sign(d.z)), up = vec3(0.0, 1.0, 0.0), face = d.z > 0.0 ? 4.0 : 5.0;
+    }
+    vec2 uv = vec2(dot(d, cross(forward, up)), dot(d, up)) / dot(d, forward) * 0.5 + 0.5;
+    uv = clamp(uv, vec2(1.0 / FACE_SIZE), vec2(1.0 - 1.0 / FACE_SIZE));
+    return pow(max(textureLod(wbm_sky, vec2((uv.x + face) / 6.0, uv.y), 1.0).xyz, vec3(0.0)), vec3(2.2));
+}
+)";
+
+// sky: the captured sky is at hand (XlOptions::pbr_sky), and the water reflects
+// it; without it the engine's own picture of the surroundings stays.
+// The surface is put together afresh:
+//   two layers of ripples, so that the pattern does not repeat so plainly;
+//   the water's own colour, a dark blue-green lit by the sun, a little paler in the shallows;
+//   over it the sky, by how steeply the water is seen (little straight down, all of it along the surface);
+//   how much of the bed shows through: all of it at the edge, less with every metre of water over it;
+//   foam at the shore and round whatever stands in the water, and the sun's glitter.
+bool add_water(std::string &fs, bool sky)
 {
     static const std::regex sun(R"((\w+) = \(\(0\.01 \* clamp \(\s*dot \((normal_\d+), LightDir_Alpha\.xyz\)\s*, 0\.0, 1\.0\)\) \* LightDif\);)");
     static const std::regex deep(R"((\w+)\.w = \(\1\.w \+ clamp \(\(\s*\((tmpvar_\d+)\.x - Depth\)\s*\* 32\.0\), 0\.0, 1\.0\)\);)");
@@ -813,23 +841,33 @@ bool add_water(std::string &fs)
         !std::regex_search(fs, m, sun) || !std::regex_search(fs, encode))
         return false;
     const std::string out = m[1], normal = m[2];
-    if (std::regex_search(fs, m, deep) && std::string(m[1]) == out) {
-        fs = std::regex_replace(fs, deep,
-                                "$&\n    float wbm_deep = max($2.x - Depth, 0.0);\n"
-                                "    " + out + ".xyz += vec3(0.014, 0.04, 0.032) * LightDif.xyz * exp(-wbm_deep * 1200.0);\n"
-                                "    float wbm_ragged = 0.6 * texture2D(normal_texture, Tex0 * 9.0).y + 0.4 * texture2D(normal_texture, Tex0 * 23.0 + 0.37).w;\n"
-                                // A narrow line right at the edge, and beyond it patches that thin out over some 20 cm of depth.
-                                "    float wbm_foam = step(1e-7, wbm_deep) * max(0.7 * smoothstep(0.00005, 0.00001, wbm_deep), smoothstep(0.00018, 0.00004, wbm_deep) * smoothstep(0.42, 0.62, wbm_ragged));\n"
-                                "    " + out + ".xyz = mix(" + out + ".xyz, LightDif.xyz * 0.55 + vec3(0.12), wbm_foam);\n"
-                                "    " + out + ".w = max(" + out + ".w, wbm_foam * 0.7);",
-                                std::regex_constants::format_first_only);
-    }
+    size_t body = fs.find("void main ()");
+    if (body != std::string::npos) body = fs.find('{', body);
+    if (body == std::string::npos) return false;
+    // The depth of water over the bed, in the units of the engine's depth picture (0.0008 is a metre in a battle); below 0 when not known.
+    if (std::regex_search(fs, m, deep) && std::string(m[1]) == out) fs = std::regex_replace(fs, deep, "$&\n    wbm_deep = max($2.x - Depth, 0.0);", std::regex_constants::format_first_only);
     fs = std::regex_replace(fs, encode,
-                            "{\n    vec3 wbm_h = normalize(normalize(LightDir_Alpha.xyz) + normalize(CameraDir));\n"
-                            "    float wbm_glint = pow(clamp(dot(normalize(" + normal + "), wbm_h), 0.0, 1.0), 700.0);\n"
-                            "    " + out + ".xyz += LightDif.xyz * (1.1 * wbm_glint * step(0.0, LightDir_Alpha.z));\n"
-                            "    " + out + ".w = max(" + out + ".w, clamp(wbm_glint * 0.6, 0.0, 1.0) * LightDir_Alpha.w);\n  }\n  $&",
+                            "{\n    vec3 wbm_n = normalize(" + normal + " + vec3((2.0 * texture2D(normal_texture, Tex0.yx * 2.7 + 0.31).wy - 1.0) * 0.6, 0.0));\n"
+                            "    vec3 wbm_v = normalize(CameraDir), wbm_l = normalize(LightDir_Alpha.xyz);\n"
+                            "    float wbm_fresnel = 0.02 + 0.98 * pow(1.0 - clamp(dot(wbm_n, wbm_v), 0.0, 1.0), 5.0);\n"
+                            "    vec3 wbm_r = reflect(-wbm_v, wbm_n);\n"
+                            "    float wbm_shallow = wbm_deep >= 0.0 ? exp(-wbm_deep * 1200.0) : 0.0;\n"
+                            "    vec3 wbm_body = (vec3(0.010, 0.045, 0.05) + vec3(0.014, 0.04, 0.032) * wbm_shallow) * (LightDif.xyz * (0.35 + 0.65 * clamp(wbm_l.z, 0.0, 1.0)) + 0.15);\n" +
+                            (sky ? "    vec3 wbm_above = wbm_water_sky(normalize(vec3(wbm_r.xy, max(wbm_r.z, 0.03))));\n"
+                                   "    " + out + ".xyz = mix(wbm_body, wbm_above, wbm_fresnel);\n"
+                                 : "    " + out + ".xyz += wbm_body * (1.0 - wbm_fresnel);\n") +
+                            "    float wbm_thick = wbm_deep >= 0.0 ? 1.0 - exp(-wbm_deep * 900.0) : 0.85;\n" // over a metre of water little of the bed is left
+                            "    float wbm_alpha = max(wbm_fresnel, wbm_thick) * LightDir_Alpha.w;\n"
+                            "    float wbm_ragged = 0.6 * texture2D(normal_texture, Tex0 * 9.0).y + 0.4 * texture2D(normal_texture, Tex0 * 23.0 + 0.37).w;\n"
+                            // Foam: a narrow line right at the edge, and beyond it patches that thin out over some 20 cm of depth.
+                            "    float wbm_foam = wbm_deep > 1e-7 ? max(0.7 * smoothstep(0.00005, 0.00001, wbm_deep), smoothstep(0.00018, 0.00004, wbm_deep) * smoothstep(0.42, 0.62, wbm_ragged)) : 0.0;\n"
+                            "    " + out + ".xyz = mix(" + out + ".xyz, LightDif.xyz * 0.55 + vec3(0.12), wbm_foam);\n"
+                            "    wbm_alpha = max(wbm_alpha, wbm_foam * 0.7);\n"
+                            "    float wbm_glint = pow(clamp(dot(wbm_n, normalize(wbm_l + wbm_v)), 0.0, 1.0), 700.0) * step(0.0, wbm_l.z);\n"
+                            "    " + out + ".xyz += LightDif.xyz * (1.1 * wbm_glint);\n"
+                            "    " + out + ".w = max(wbm_alpha, clamp(wbm_glint * 0.6, 0.0, 1.0) * LightDir_Alpha.w);\n  }\n  $&",
                             std::regex_constants::format_first_only);
+    fs.insert(body + 1, "\n  float wbm_deep = -1.0;");
     return true;
 }
 
@@ -1758,7 +1796,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool wind = vertex && options.wind && add_wind(glsl);
     bool shell_push = vertex && options.fur && add_shell_push(glsl);
     bool hair_strands = options.hair_strands && add_hair_strands(glsl, vertex);
-    if (!vertex && options.water) add_water(glsl);
+    bool water = !vertex && options.water && add_water(glsl, options.pbr_sky);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
     // The fragment's half only where the vertex shader of this program has supplied the eye's direction.
     bool parallax = options.parallax && (vertex ? add_parallax_vertex(glsl) : varyings.location.count("wbm_tview") && add_parallax(glsl)); // last: it takes over the texture coordinate wherever the others left it
@@ -1783,6 +1821,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (!vertex && (fur || hair_strands)) out << k_strand_function;
     if (fur) out << k_fur_function;
     if (parallax && !vertex) out << "uniform vec4 wbm_parallax;\n";
+    if (water && options.pbr_sky) out << std::regex_replace(k_water_sky_function, std::regex("FACE_SIZE"), std::to_string((int)k_xl_sky_face_size) + ".0");
     if (hair_strands && !vertex) out << k_people_hair_function;
     if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\nuniform vec4 wbm_drift;\n" : "");
     if (leaf) out << k_leaf_function;
