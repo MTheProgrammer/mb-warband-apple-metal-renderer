@@ -793,12 +793,13 @@ static float sample_channel(const Image &m, int channel, float u, float v)
 // game uses. Alpha with values in between (blending, or already soft) is left alone. Returns whether it acted.
 static bool soften_cutout(Image &m, int step)
 {
-    size_t n = (size_t)m.w * (size_t)m.h, hard = 0;
+    size_t n = (size_t)m.w * (size_t)m.h, clear = 0, solid = 0;
     for (size_t i = 0; i < n; i++) {
         uint8_t a = m.px[i * 4 + 3];
-        hard += a < 8 || a > 247;
+        clear += a < 8, solid += a > 247;
     }
-    if (step < 1 || hard < n - n / 100) return false;
+    // Something cut out, and nothing in between: an alpha that is solid all over has no edges to soften.
+    if (step < 1 || clear + solid < n - n / 100 || clear < n / 200 || solid < n / 200) return false;
     std::vector<float> a(n), b(n);
     for (size_t i = 0; i < n; i++) a[i] = m.px[i * 4 + 3] > 127 ? 1.0f : 0.0f;
     auto pass = [&](const std::vector<float> &from, std::vector<float> &to, bool across) {
