@@ -51,7 +51,8 @@
 //       right elsewhere; they are brought back. --dds: the pack is written as
 //       .dds files in the game's own compression, with their smaller sizes,
 //       not as PNG: a quarter to an eighth of the video memory, and no
-//       unpacking when a scene loads, for a little blockiness.
+//       unpacking when a scene loads, for a little blockiness. Alpha that is
+//       all or nothing gets soft edges (see soften_cutout); --hard-alpha: not.
 //
 // The game's folder is taken from WBM_GAME, or from where Steam puts it.
 
@@ -784,6 +785,42 @@ static float sample_channel(const Image &m, int channel, float u, float v)
     return (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) + (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy;
 }
 
+// A cut-out's alpha that is all or nothing (leaves, twigs, fences) has edges in steps of whole texels, and in
+// an enlarged picture in steps of the texels it was enlarged from. Cut at the shader's threshold, those steps
+// are what is seen, however the renderer smooths its pixels. Softened with a tent `step` pixels to each side
+// (bilinear filtering of the picture it came from, put back), the threshold instead runs straight across the
+// steps. Features one source texel wide keep three quarters of their alpha, so stay above any threshold the
+// game uses. Alpha with values in between (blending, or already soft) is left alone. Returns whether it acted.
+static bool soften_cutout(Image &m, int step)
+{
+    size_t n = (size_t)m.w * (size_t)m.h, hard = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t a = m.px[i * 4 + 3];
+        hard += a < 8 || a > 247;
+    }
+    if (step < 1 || hard < n - n / 100) return false;
+    std::vector<float> a(n), b(n);
+    for (size_t i = 0; i < n; i++) a[i] = m.px[i * 4 + 3] > 127 ? 1.0f : 0.0f;
+    auto pass = [&](const std::vector<float> &from, std::vector<float> &to, bool across) {
+        int len = across ? m.w : m.h, other = across ? m.h : m.w;
+        for (int o = 0; o < other; o++)
+            for (int i = 0; i < len; i++) {
+                float sum = 0, weight = 0;
+                for (int d = -step + 1; d < step; d++) {
+                    int j = std::min(std::max(i + d, 0), len - 1);
+                    float w = (float)(step - abs(d));
+                    sum += w * from[across ? (size_t)o * (size_t)m.w + (size_t)j : (size_t)j * (size_t)m.w + (size_t)o];
+                    weight += w;
+                }
+                to[across ? (size_t)o * (size_t)m.w + (size_t)i : (size_t)i * (size_t)m.w + (size_t)o] = sum / weight;
+            }
+    };
+    pass(a, b, true);
+    pass(b, a, false);
+    for (size_t i = 0; i < n; i++) m.px[i * 4 + 3] = (uint8_t)lroundf(a[i] * 255.0f);
+    return true;
+}
+
 // How far a channel's values spread, in steps of 255: next to nothing for one that holds nothing.
 static float spread(const Image &m, int channel)
 {
@@ -799,7 +836,7 @@ static float spread(const Image &m, int channel)
 }
 
 // See the top of the file.
-static int import_pictures(const std::string &in, const std::string &out, float gain, bool normals_up, bool dds)
+static int import_pictures(const std::string &in, const std::string &out, float gain, bool normals_up, bool dds, bool hard_alpha)
 {
     std::map<std::string, std::string> game = game_textures();
     if (game.empty()) {
@@ -882,7 +919,7 @@ static int import_pictures(const std::string &in, const std::string &out, float 
     };
     std::map<std::string, Maps> maps; // by the texture they belong to
     std::map<std::string, std::string> heights; // by the texture they belong to
-    int textures = 0, normal_maps = 0, pbr_maps = 0, depth_maps = 0, skipped = 0, unread = 0, into_alpha = 0;
+    int textures = 0, normal_maps = 0, pbr_maps = 0, depth_maps = 0, skipped = 0, unread = 0, into_alpha = 0, softened = 0;
     // One picture may stand in for several of the game's files: a normal map shared out under more than one name.
     std::vector<std::pair<std::string, std::string>> work; // name of the game's, path
     std::set<std::string> named_normals;
@@ -999,6 +1036,10 @@ static int import_pictures(const std::string &in, const std::string &out, float 
                         img.px[((size_t)y * (size_t)img.w + (size_t)x) * 4 + 3] = (uint8_t)lroundf(sample_channel(was, 3, ((float)x + 0.5f) / (float)img.w, ((float)y + 0.5f) / (float)img.h));
                 fprintf(stderr, "%s: the picture has no alpha where the game's texture has; the game's is put back\n", name.c_str());
             }
+            // The enlargement's step: how many of this picture's pixels one of the game's texels became (2 at least:
+            // even an alpha drawn at this size has edges a pixel at a time).
+            int step = have_original && was.w > 0 ? std::max(2, (int)lroundf((float)img.w / (float)was.w)) : 2;
+            if (!hard_alpha && soften_cutout(img, step)) softened++;
             textures++;
         }
         if (!write_texture(out + "/" + name, img, dds, !normal)) {
@@ -1061,6 +1102,7 @@ static int import_pictures(const std::string &in, const std::string &out, float 
     printf("%d textures, %d normal maps, %d maps of metalness, roughness and occlusion and %d of heights written to %s; %d pictures left out", textures, normal_maps, pbr_maps, depth_maps, out.c_str(), skipped);
     if (unread) printf(", %d normal maps for textures whose materials read none", unread);
     if (into_alpha) printf("; %d normal maps written the way the game keeps them, x in alpha", into_alpha);
+    if (softened) printf("; %d cut-outs given soft edges (--hard-alpha: not)", softened);
     printf("\n");
     return 0;
 }
@@ -1069,19 +1111,20 @@ int main(int argc, char **argv)
 {
     if (argc >= 4 && !strcmp(argv[1], "import")) {
         float gain = 1.0f;
-        bool normals_up = true, dds = false;
+        bool normals_up = true, dds = false, hard_alpha = false;
         for (int i = 4; i < argc; i++) {
             if (!strcmp(argv[i], "--gain") && i + 1 < argc) gain = std::max(0.01f, (float)atof(argv[++i]));
             else if (!strcmp(argv[i], "--normals") && i + 1 < argc) normals_up = strcmp(argv[++i], "directx") != 0;
             else if (!strcmp(argv[i], "--dds")) dds = true;
+            else if (!strcmp(argv[i], "--hard-alpha")) hard_alpha = true;
         }
-        return import_pictures(argv[2], argv[3], gain, normals_up, dds);
+        return import_pictures(argv[2], argv[3], gain, normals_up, dds, hard_alpha);
     }
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "hair")) return hair_map(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
     if (argc < 3 || (strcmp(argv[1], "export") && strcmp(argv[1], "pbr"))) {
         fprintf(stderr, "usage: texture_tool export <out-folder> [name...]\n       texture_tool pbr <out-folder> [name...]\n"
                         "       texture_tool hair <picture of the hair alone> <name> <out-folder> [picture of the saddle and straps alone]\n"
-                        "       texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx] [--dds]\n");
+                        "       texture_tool import <folder of pictures> <pack-folder> [--gain g] [--normals directx] [--dds] [--hard-alpha]\n");
         return 2;
     }
     bool pbr = !strcmp(argv[1], "pbr");
