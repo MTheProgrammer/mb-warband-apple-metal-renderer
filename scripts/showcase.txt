@@ -1,0 +1,25 @@
+# The material showcase (scripts/showcase.sh): one ball for each kind of material the renderer
+# treats differently, and real models for what a ball cannot show. A line is
+#   mesh  material  right  up  ahead  turn[,tilt-x[,tilt-y]]  [action [pose]]
+# in metres from the stage's camera (ahead and right kept level) and degrees; "-" keeps the mesh's
+# own material, and material[left,top,right,bottom] wraps only that part of its texture round a ball (fractions
+# of the picture from its top left); @sphere is a ball 0.7 m across. The tilts turn the model in its own space
+# first (a head's mesh lies on its side). scripts/replay.sh --gallery reads it.
+
+# Front row: balls on the floor, left to right
+@sphere   full_plate[0.50,0.08,0.85,0.28]      -2.45 -1.15 2.7  0   # metal: polished plate
+@sphere   full_plate[0.25,0.78,0.60,0.97]      -1.75 -1.15 2.7  0   # metal: mail
+@sphere   arena_tunicr[0.05,0.12,0.90,0.36]    -1.05 -1.15 2.7  0   # cloth
+@sphere   leather_boots_a[0.02,0.02,0.65,0.58] -0.35 -1.15 2.7  0   # leather
+@sphere   manface_7[0.32,0.08,0.68,0.28]        0.35 -1.15 2.7  0   # skin: light scattered under it
+@sphere   planks                                1.05 -1.15 2.7  0   # wood
+@sphere   stone_wall_2                          1.75 -1.15 2.7  0   # stone
+@sphere   horse_a[0.75,0.33,0.93,0.50]          2.45 -1.15 2.7  0   # a horse's coat
+
+# Back row: models, standing on the floor or held up where they would be worn
+full_plate_armor  -             -2.70 -0.62 4.3  90      # plate armour, in its rest pose
+male_head         manface_7     -1.20 -0.15 3.4  -90,90  # a face: skin scattering, eyes
+flattop_helmet    -             -0.30 -0.30 3.3  90,-20  # a helmet
+shield_round_a    -              0.55 -0.50 3.7  90,90   # wood and iron
+bush_a01          -              1.55 -1.05 3.9  0       # leaves, lit through
+hunting_horse     -              3.20 -0.70 5.2  0       stand

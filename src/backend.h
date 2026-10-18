@@ -48,6 +48,7 @@ bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *dista
 // gallop, rear, jump or turn; or "animation:from:to:seconds" for any animation
 // of the game's files; empty for the rest pose. held: a fixed moment of it, 0
 // to 1, or below 0 to let it run. False if there is no such action.
+bool mtl_preview_gallery(const char *path, bool keep_scene); // several models at once, placed as a file says (see preview_load_gallery)
 bool mtl_preview_action(const char *action, double held);
 const char *mtl_preview_next_action(const char *action); // the horse's actions in turn, ending with "" for the rest pose
 void mtl_preview_material(const char *name); // before mtl_preview_model: a material to use in place of the mesh's own; empty for the mesh's own

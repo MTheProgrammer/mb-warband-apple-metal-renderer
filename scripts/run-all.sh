@@ -36,6 +36,7 @@ export WBM_WATER=${WBM_WATER:-1}                # sun glitter, paler shallows an
 export WBM_EYES=${WBM_EYES:-1}                  # a highlight and a reflection in the eyes of faces
 export WBM_SSS=${WBM_SSS:-1}                    # light scattering in the skin of faces
 # For speed, not looks, so not set here: WBM_UPSCALE=0.67 draws the scene smaller and lets MetalFX enlarge it;
+# with WBM_UPSCALE_MODE=temporal it builds the picture from several frames, which looks nearer the full one;
 # WBM_SHARPEN=0.3 sharpens the picture. Set either before calling this script.
 export WBM_TONEMAP=${WBM_TONEMAP:-1}  # filmic tone map
 export WBM_HDR=${WBM_HDR:-1}          # extended-range output on HDR displays

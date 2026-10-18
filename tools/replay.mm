@@ -74,11 +74,12 @@ static View s_view;
 int main(int argc, char **argv)
 {
     const char *path = nullptr, *png = nullptr, *list = nullptr;
-    static std::string model;
+    static std::string model, gallery;
     static int lod = 0;
     static bool keep_scene = false;
     static std::string action;
     static double held = -1;
+    static double turn = 0;
     bool pivot_given = false;
     int frames = 8;
     const double degrees = M_PI / 180.0;
@@ -86,10 +87,12 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--png") && i + 1 < argc) png = argv[++i];
         else if (!strcmp(argv[i], "--yaw") && i + 1 < argc) s_view.yaw = atof(argv[++i]) * degrees;
         else if (!strcmp(argv[i], "--pitch") && i + 1 < argc) s_view.pitch = atof(argv[++i]) * degrees;
+        else if (!strcmp(argv[i], "--turn") && i + 1 < argc) turn = atof(argv[++i]) * degrees; // each frame: a camera in motion, for what works across frames
         else if (!strcmp(argv[i], "--pan") && i + 2 < argc) s_view.pan_x = atof(argv[i + 1]), s_view.pan_y = atof(argv[i + 2]), i += 2;
         else if (!strcmp(argv[i], "--forward") && i + 1 < argc) s_view.forward = atof(argv[++i]);
         else if (!strcmp(argv[i], "--pivot") && i + 1 < argc) s_view.pivot = atof(argv[++i]), pivot_given = true;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--gallery") && i + 1 < argc) gallery = argv[++i], s_view.interface = false;
         else if (!strcmp(argv[i], "--lod") && i + 1 < argc) lod = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--material") && i + 1 < argc) mtl_preview_material(argv[++i]);
         else if (!strcmp(argv[i], "--anim") && i + 1 < argc) action = argv[++i];
@@ -122,8 +125,9 @@ int main(int argc, char **argv)
     int width = 0, height = 0;
     if (!path || !mtl_replay_open(path, &width, &height)) {
         fprintf(stderr, "usage: replay capture.wbcap [--png out.png] [--frames n] [--quiet] [--stats]\n"
-                        "              [--yaw deg] [--pitch deg] [--pan x y] [--forward m] [--pivot m] [--no-ui]\n"
-                        "              [--model mesh [--material name] [--lod n] [--keep-scene] [--anim action [--pose 0..1]]]\n       replay --list word\n%s\n",
+                        "              [--yaw deg] [--pitch deg] [--turn deg-per-frame] [--pan x y] [--forward m] [--pivot m] [--no-ui]\n"
+                        "              [--model mesh [--material name] [--lod n] [--keep-scene] [--anim action [--pose 0..1]]]\n"
+                        "              [--gallery file [--keep-scene]]\n       replay --list word\n%s\n",
                 path ? "that file is not a frame capture" : "");
         return 2;
     }
@@ -197,6 +201,10 @@ int main(int argc, char **argv)
                 return true;
             };
             if (!model.empty() && !show() && png) exit(1);
+            if (!gallery.empty()) {
+                if (!mtl_preview_gallery(gallery.c_str(), keep_scene) && png) exit(1);
+                if (!pivot_given) s_view.pivot = 3;
+            }
             if (!action.empty() && !mtl_preview_action(action.c_str(), held)) fprintf(stderr, "no action or animation named %s\n", action.c_str());
             // Some of what a frame shows comes from the frame before it (the sky's
             // colours, grass in the shadow map), so a still needs a few runs.
@@ -216,6 +224,7 @@ int main(int argc, char **argv)
                     }
                     show();
                 }
+                if (turn != 0) s_view.yaw = s_view.yaw + turn;
                 mtl_replay_orbit(s_view.yaw, s_view.pitch, s_view.pan_x, s_view.pan_y, s_view.forward, s_view.pivot);
                 mtl_replay_show_interface(s_view.interface);
                 mtl_replay_frame(png && n == (uint32_t)frames, n);

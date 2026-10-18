@@ -55,6 +55,9 @@ struct XlOptions {
     // Turn alpha tests (discard below a threshold) into partial coverage of a
     // multisampled pixel, so cut-out edges are smoothed like geometry edges.
     bool smooth_alpha_test = false;
+    // In its place, with one sample a pixel: the alpha test against noise, for the
+    // temporal scaler to average (adds the wbm_hash_frame uniform). See smooth_alpha_tests.
+    bool alpha_hash = false;
     // Map depth so that far is 0 and near is 1. With a floating-point depth
     // buffer this spreads precision evenly instead of crowding it at the near
     // plane. The backend must then reverse its depth comparisons and clear to 0.
@@ -123,6 +126,11 @@ struct XlOptions {
     // Wind: vertex shaders move what the backend marks as foliage, more the
     // higher up it is. Adds the wbm_wind uniform (see k_xl_wind_uniform).
     bool wind = false;
+    // With wind: the shaders that sway also write, into a second colour target,
+    // how far each of their pixels moved across the screen since the last frame
+    // (xy, in clip space), and its distance (z). Adds the vertex uniforms
+    // wbm_reproject and wbm_wind_before. For temporal upscaling.
+    bool motion_vectors = false;
     // Shadows from the engine's point lights: shaders that are lit by them look
     // their surface up in a cube of depths per light, which the backend draws.
     // Adds the sampler and uniforms described at k_xl_torch_sampler.
@@ -150,6 +158,12 @@ struct XlOptions {
 // The vertex stage gets an extra uniform, wbm_yflip, that multiplies clip-space
 // Y: 1 when drawing to the screen, -1 when drawing to a texture.
 extern const char *const k_xl_yflip_uniform;
+
+// And wbm_jitter, added to clip-space x and y (times w) after the flip: zero
+// but while the scene is drawn for temporal upscaling, when it shifts the whole
+// picture by a different fraction of a pixel each frame (see apply_temporal_upscale
+// in metal_backend.mm).
+extern const char *const k_xl_jitter_uniform;
 
 // With smooth_alpha_test, fragment shaders that test alpha get a uniform,
 // wbm_samples, that must hold the sample count of the target being drawn to.

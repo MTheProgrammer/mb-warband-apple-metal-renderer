@@ -23,20 +23,35 @@ struct PreviewPart {
     float alpha_test = 0.5f;
 };
 
-struct Preview {
-    bool active = false, keep_scene = false, library_read = false;
-    BrfLibrary library;
-    std::string root, name;
+// One model shown: a mesh with its parts, what it plays, and (in a gallery) where it stands.
+struct PreviewModel {
+    std::string name;
     // An action to play on a skinned model: frames `from` to `to` of an animation, taking `seconds`, over and over.
     const BrfAnimation *animation = nullptr;
     const BrfSkeleton *skeleton = nullptr;
     std::string action;
     double from = 0, to = 0, seconds = 1, held = -1; // held: a fixed place in the action, 0 to 1, or below 0 to let it run
-    GLuint prepass_texture = 0; // the target of the engine's depth pre-pass in the frame being played
     int most_bones = 0;   // one more than the highest bone any vertex of the model hangs on
     std::string material; // when set, used in place of the one the mesh names (heads name none: the game picks a face's by its own rules)
     std::vector<PreviewPart> parts;
     float centre[3] = {0, 0, 0}, radius = 1;
+    // In a gallery: metres to the right of the stage's camera, up, and ahead of it (level, whichever way it tilts),
+    // and a turn about the upright, degrees.
+    double at[3] = {0, 0, 0}, turn = 0;
+    double tilt[2] = {0, 0}; // first, in the model's own space: degrees about its x axis, then about its y (a head's mesh lies on its side)
+    // For a ball: the part of its texture wrapped round it (left, top, right, bottom, as fractions of the picture
+    // measured from its top left), so that a ball can show one material of a texture that holds many.
+    float window[4] = {0, 0, 1, 1};
+    bool windowed = false;
+};
+
+struct Preview {
+    bool active = false, keep_scene = false, library_read = false;
+    BrfLibrary library;
+    std::string root;
+    PreviewModel m;                     // the model shown, or the one being loaded into a gallery
+    std::vector<PreviewModel> gallery;  // several at once (mtl_preview_gallery); empty for one
+    GLuint prepass_texture = 0; // the target of the engine's depth pre-pass in the frame being played
     GLuint next_id = 0x40000000; // far from anything a capture numbers
     std::map<std::string, GLuint> programs, textures;
 };
@@ -62,8 +77,9 @@ void preview_read_library()
     pv.library_read = true;
     pv.root = game_folder();
     pv.library.scan(pv.root + "/CommonRes");
-    std::string module;
-    if (const char *home = getenv("HOME")) {
+    // The module asked for (WBM_MODULE, as scripts/run.sh takes it), or else the one the game last played.
+    std::string module = getenv("WBM_MODULE") ? getenv("WBM_MODULE") : "";
+    if (const char *home = getenv("HOME"); home && module.empty()) {
         if (FILE *f = fopen((std::string(home) + "/Library/Application Support/MBWarband/last_module_warband").c_str(), "r")) {
             char text[512];
             size_t n = fread(text, 1, sizeof text - 1, f);
@@ -189,14 +205,55 @@ GLuint preview_texture(const std::string &texture_name)
     return it->second;
 }
 
+// A ball 0.7 m across, for showing a material on (mesh name @sphere): smooth, with its texture wrapped
+// twice round and once from pole to pole, and the tangents that normal maps need.
+// With a window, its texture is only that part of the picture, and it runs to and fro round the ball so that no
+// seam shows.
+void preview_sphere(BrfMesh *mesh, const float *window)
+{
+    const int around = 96, down = 48;
+    const float radius = 0.35f;
+    mesh->skinned = false;
+    mesh->vertices.clear(), mesh->indices.clear();
+    for (int j = 0; j <= down; j++) {
+        float v = (float)j / down, theta = v * (float)M_PI;
+        for (int i = 0; i <= around; i++) {
+            float u = (float)i / around, phi = u * 2.0f * (float)M_PI;
+            BrfVertex x = {};
+            float n[3] = {sinf(theta) * cosf(phi), sinf(theta) * sinf(phi), cosf(theta)};
+            for (int k = 0; k < 3; k++) x.normal[k] = n[k], x.position[k] = n[k] * radius;
+            x.tangent[0] = -sinf(phi), x.tangent[1] = cosf(phi), x.tangent[2] = 0;
+            x.handedness = 1;
+            x.uv[0] = u * 2.0f, x.uv[1] = v;
+            if (window) { // the meshes' texture coordinates count upwards from the bottom of the picture
+                float across = 1.0f - fabsf(2.0f * u - 1.0f);
+                x.uv[0] = window[0] + (window[2] - window[0]) * across;
+                x.uv[1] = 1.0f - (window[1] + (window[3] - window[1]) * v);
+            }
+            for (int k = 0; k < 4; k++) x.colour[k] = 255;
+            mesh->vertices.push_back(x);
+        }
+    }
+    for (int j = 0; j < down; j++)
+        for (int i = 0; i < around; i++) {
+            uint32_t a = (uint32_t)(j * (around + 1) + i), b = a + 1, c = a + (uint32_t)around + 1, d = c + 1;
+            mesh->indices.insert(mesh->indices.end(), {a, c, b, b, c, d});
+        }
+}
+
 bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
 {
     Preview &pv = s_preview;
     BrfMesh mesh;
-    if (!pv.library.load_mesh(mesh_name, &mesh) || mesh.vertices.empty() || mesh.indices.empty()) return false;
+    if (mesh_name == "@sphere") {
+        if (pv.m.material.empty()) return complain("preview: a sphere has no material of its own: name one"), false;
+        preview_sphere(&mesh, pv.m.windowed ? pv.m.window : nullptr);
+    } else if (!pv.library.load_mesh(mesh_name, &mesh) || mesh.vertices.empty() || mesh.indices.empty()) {
+        return false;
+    }
     PreviewPart part;
     part.skinned = mesh.skinned;
-    if (!pv.material.empty()) mesh.material = pv.material;
+    if (!pv.m.material.empty()) mesh.material = pv.m.material;
     auto material = pv.library.materials.find(lower_case(mesh.material));
     if (material != pv.library.materials.end()) part.material = material->second;
     else complain("preview: mesh %s names a material, %s, that no resource file has", mesh_name.c_str(), mesh.material.c_str());
@@ -235,7 +292,7 @@ bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
         o.binormal[2] = (n[0] * t[1] - n[1] * t[0]) * v.handedness;
         memcpy(o.weight, v.weight, 16), memcpy(o.bone, v.bone, 16);
         for (int k = 0; k < 4; k++)
-            if (v.weight[k] > 0) pv.most_bones = std::max(pv.most_bones, (int)v.bone[k] + 1);
+            if (v.weight[k] > 0) pv.m.most_bones = std::max(pv.m.most_bones, (int)v.bone[k] + 1);
         if (!mesh.skinned) o.weight[0] = 1;
         for (int k = 0; k < 3; k++) lo[k] = std::min(lo[k], v.position[k]), hi[k] = std::max(hi[k], v.position[k]);
     }
@@ -276,7 +333,7 @@ bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
     part.program[1] = preview_program(std::string("earlyz_") + (mesh.skinned ? "skinned_" : "normal_") + (cut_out && !mesh.skinned ? "alphatested" : "solid") + "_shader");
     wb_note("preview: %s, %zu vertices, %zu triangles, material %s, shader %s, technique %s%s", mesh_name.c_str(), mesh.vertices.size(), mesh.indices.size() / 3,
             mesh.material.c_str(), part.material.shader.c_str(), technique.c_str(), mesh.skinned ? ", skinned (shown in its rest pose)" : "");
-    pv.parts.push_back(part);
+    pv.m.parts.push_back(part);
     return true;
 }
 
@@ -287,21 +344,79 @@ bool preview_load(const std::string &mesh_name, int lod)
     @autoreleasepool {
         Preview &pv = s_preview;
         preview_read_library();
-        for (PreviewPart &part : pv.parts) s_buffers.erase(part.vertices), s_buffers.erase(part.indices);
-        pv.parts.clear();
+        for (PreviewPart &part : pv.m.parts) s_buffers.erase(part.vertices), s_buffers.erase(part.indices);
+        pv.m.parts.clear();
         pv.active = false;
-        pv.most_bones = 0;
+        pv.m.most_bones = 0;
         std::string base = lower_case(mesh_name), suffix = lod > 0 ? ".lod" + std::to_string(lod) : std::string();
         float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
-        if (!preview_add_part(base + suffix, lo, hi)) return false;
-        for (int n = 1; n < 10; n++) preview_add_part(base + "." + std::to_string(n) + suffix, lo, hi);
+        // The model and its further parts (name.1 ... and name.lod1.1 ...; some models are parts only).
+        bool any = false;
+        if (base == "@sphere") any = preview_add_part(base, lo, hi);
+        else
+            for (const std::string &part : pv.library.parts_of(base, lod)) any = preview_add_part(part, lo, hi) || any;
+        if (!any) return false;
         float extent = 0;
-        for (int k = 0; k < 3; k++) pv.centre[k] = (lo[k] + hi[k]) * 0.5f, extent += (hi[k] - lo[k]) * (hi[k] - lo[k]);
-        pv.radius = std::max(0.05f, sqrtf(extent) * 0.5f);
-        pv.name = base;
+        for (int k = 0; k < 3; k++) pv.m.centre[k] = (lo[k] + hi[k]) * 0.5f, extent += (hi[k] - lo[k]) * (hi[k] - lo[k]);
+        pv.m.radius = std::max(0.05f, sqrtf(extent) * 0.5f);
+        pv.m.name = base;
         pv.active = true;
         return true;
     }
+}
+
+bool preview_set_action(const std::string &action);
+
+// Reads a gallery: one model a line, "mesh material right up ahead turn [action [pose]]", a material of "-" for the
+// mesh's own, "#" for a remark. Call between frames.
+bool preview_load_gallery(const std::string &path, std::string *problem)
+{
+    Preview &pv = s_preview;
+    for (PreviewModel &old : pv.gallery)
+        for (PreviewPart &part : old.parts) s_buffers.erase(part.vertices), s_buffers.erase(part.indices);
+    pv.gallery.clear();
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f) return *problem = "cannot read " + path, false;
+    char line[1024];
+    int number = 0;
+    while (fgets(line, sizeof line, f)) {
+        number++;
+        char mesh[256], material[256], action[256] = "", turning[256] = "0";
+        double at[3], turn = 0, held = -1, tilt[2] = {0, 0};
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        int got = sscanf(line, "%255s %255s %lf %lf %lf %255s %255s %lf", mesh, material, &at[0], &at[1], &at[2], turning, action, &held);
+        sscanf(turning, "%lf,%lf,%lf", &turn, &tilt[0], &tilt[1]); // turn about the upright[,tilt about the model's x[,about its y]]
+        if (got <= 0) continue;
+        if (got < 5) {
+            fclose(f);
+            return *problem = path + ":" + std::to_string(number) + ": wants a mesh, a material and three distances", false;
+        }
+        pv.m = PreviewModel();
+        // A material may name the part of its texture a ball shows: name[left,top,right,bottom].
+        if (char *open = strchr(material, '[')) {
+            pv.m.windowed = sscanf(open, "[%f,%f,%f,%f]", &pv.m.window[0], &pv.m.window[1], &pv.m.window[2], &pv.m.window[3]) == 4;
+            *open = 0;
+        }
+        if (strcmp(material, "-")) pv.m.material = material;
+        bool loaded = preview_load(mesh, 0);
+        if (loaded && got >= 7) {
+            pv.m.held = held;
+            if (!preview_set_action(action)) wb_note("preview: %s:%d: no action or animation named %s", path.c_str(), number, action);
+        }
+        if (!loaded) {
+            wb_note("preview: %s:%d: %s could not be shown; left out", path.c_str(), number, mesh);
+            continue;
+        }
+        for (int k = 0; k < 3; k++) pv.m.at[k] = at[k];
+        pv.m.turn = turn, pv.m.tilt[0] = tilt[0], pv.m.tilt[1] = tilt[1];
+        pv.gallery.push_back(std::move(pv.m));
+    }
+    fclose(f);
+    pv.m = PreviewModel();
+    pv.active = !pv.gallery.empty();
+    if (!pv.active) *problem = "nothing in " + path + " could be shown";
+    return pv.active;
 }
 
 // The actions of a horse, which all lie in one animation (Native's actions.txt).
@@ -317,26 +432,26 @@ bool preview_set_action(const std::string &action)
 {
     Preview &pv = s_preview;
     preview_read_library();
-    pv.animation = nullptr, pv.skeleton = nullptr, pv.action = action;
+    pv.m.animation = nullptr, pv.m.skeleton = nullptr, pv.m.action = action;
     // How fast a horse doing this would be going, for its mane and tail to stream by.
     s_pretend_speed = action == "walk" ? 1.7f : action == "trot" ? 4.0f : action == "canter" ? 7.0f : action == "gallop" ? 11.0f : action == "jump" ? 6.0f : 0.0f;
     if (action.empty() || action == "none") return true;
     std::string animation = "anim_horse";
     bool found = false;
     for (auto &a : k_horse_actions)
-        if (action == a.name) pv.from = a.from, pv.to = a.to, pv.seconds = a.seconds, found = true;
+        if (action == a.name) pv.m.from = a.from, pv.m.to = a.to, pv.m.seconds = a.seconds, found = true;
     if (!found) {
         char name[200];
         double from, to, seconds;
         if (sscanf(action.c_str(), "%199[^:]:%lf:%lf:%lf", name, &from, &to, &seconds) != 4 || seconds <= 0) return false;
-        animation = lower_case(name), pv.from = from, pv.to = to, pv.seconds = seconds;
+        animation = lower_case(name), pv.m.from = from, pv.m.to = to, pv.m.seconds = seconds;
     }
     auto it = pv.library.animations.find(animation);
     if (it == pv.library.animations.end()) return false;
     for (auto &sk : pv.library.skeletons) // the skeleton it was made for has as many bones
-        if (sk.second.bones.size() == it->second.bones.size()) pv.skeleton = &sk.second;
-    if (!pv.skeleton) return false;
-    pv.animation = &it->second;
+        if (sk.second.bones.size() == it->second.bones.size()) pv.m.skeleton = &sk.second;
+    if (!pv.m.skeleton) return false;
+    pv.m.animation = &it->second;
     return true;
 }
 
@@ -346,11 +461,11 @@ bool preview_set_action(const std::string &action)
 bool preview_pose(double time, std::vector<double> *out)
 {
     Preview &pv = s_preview;
-    if (!pv.animation || !pv.skeleton || pv.most_bones > (int)pv.skeleton->bones.size()) return false;
-    const BrfSkeleton &sk = *pv.skeleton;
-    const BrfAnimation &an = *pv.animation;
-    double phase = pv.held >= 0 ? pv.held : fmod(time / pv.seconds, 1.0);
-    double frame = pv.from + (pv.to - pv.from) * phase;
+    if (!pv.m.animation || !pv.m.skeleton || pv.m.most_bones > (int)pv.m.skeleton->bones.size()) return false;
+    const BrfSkeleton &sk = *pv.m.skeleton;
+    const BrfAnimation &an = *pv.m.animation;
+    double phase = pv.m.held >= 0 ? pv.m.held : fmod(time / pv.m.seconds, 1.0);
+    double frame = pv.m.from + (pv.m.to - pv.m.from) * phase;
     size_t n = sk.bones.size();
     std::vector<double> rest(n * 16), posed(n * 16);
     for (size_t b = 0; b < n; b++) {
@@ -418,25 +533,44 @@ void preview_vector(GLuint program, const char *name, float x, float y, float z,
 }
 
 // How far ahead of the stage's camera the model is put.
-double preview_distance() { return std::max(0.5, (double)s_preview.radius * 1.7); }
+double preview_distance() { return std::max(0.5, (double)s_preview.m.radius * 1.7); }
 
-// Draws the model into the pass that is current: the scene, or the depth pre-pass.
-void preview_draw(bool prepass)
+// Draws pv.m into the pass that is current: the scene, or the depth pre-pass.
+void preview_draw_one(bool prepass)
 {
     Preview &pv = s_preview;
     Replay &rp = s_replay;
-    if (!pv.active || !rp.camera_known) return;
-    if (prepass)
-        if (Framebuffer *fb = find(s_framebuffers, s_fbo)) pv.prepass_texture = fb->color_texture;
 
     // The model's own space is laid over the world's with its middle put a
     // little way ahead of the camera the frame was captured with.
     double inverse_view[16], seen[16], world[16], projection[16] = {}, world_view[16], world_view_projection[16], view_projection[16], inverse_seen[16];
     if (!mat_inverse(rp.view, inverse_view)) return;
-    double ahead = preview_distance() / rp.C; // w = C * z
+    double ahead = (pv.gallery.empty() ? preview_distance() : 0.0) / rp.C; // w = C * z
     double target[3];
     for (int r = 0; r < 3; r++) target[r] = inverse_view[8 + r] * ahead + inverse_view[12 + r];
-    translation(target[0] - pv.centre[0], target[1] - pv.centre[1], target[2] - pv.centre[2], world);
+    translation(target[0] - pv.m.centre[0], target[1] - pv.m.centre[1], target[2] - pv.m.centre[2], world);
+    if (!pv.gallery.empty()) {
+        // A gallery's model stands where it was told: right, up and ahead of the camera, ahead and right kept level
+        // (the world's up is z), turned about the upright through its middle.
+        double forward[3] = {inverse_view[8] / rp.C, inverse_view[9] / rp.C, 0}, flat = hypot(forward[0], forward[1]);
+        if (flat > 1e-9) forward[0] /= flat, forward[1] /= flat;
+        const double right[3] = {forward[1], -forward[0], 0};
+        double place[3];
+        for (int k = 0; k < 3; k++) place[k] = target[k] + right[k] * pv.m.at[0] + forward[k] * pv.m.at[2] + (k == 2 ? pv.m.at[1] : 0.0);
+        double facing = atan2(forward[1], forward[0]) + pv.m.turn * M_PI / 180.0, c = cos(facing), sn = sin(facing);
+        const double spin[16] = {c, sn, 0, 0, -sn, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        double to_middle[16], moved[16], spun[16], tilted[16], about_x[16], about_y[16];
+        translation(-pv.m.centre[0], -pv.m.centre[1], -pv.m.centre[2], to_middle);
+        double ax = pv.m.tilt[0] * M_PI / 180.0, ay = pv.m.tilt[1] * M_PI / 180.0;
+        const double rx[16] = {1, 0, 0, 0, 0, cos(ax), sin(ax), 0, 0, -sin(ax), cos(ax), 0, 0, 0, 0, 1};
+        const double ry[16] = {cos(ay), 0, -sin(ay), 0, 0, 1, 0, 0, sin(ay), 0, cos(ay), 0, 0, 0, 0, 1};
+        mat_mul(rx, to_middle, about_x);
+        mat_mul(ry, about_x, about_y);
+        memcpy(tilted, about_y, sizeof tilted);
+        mat_mul(spin, tilted, spun);
+        translation(place[0], place[1], place[2], moved);
+        mat_mul(moved, spun, world);
+    }
     // Two aids for trying things out. WBM_PREVIEW_MOVE="x y z" puts the model that
     // many metres from where it would be (to sink a sheet of water into the ground
     // of a scene, say). WBM_PREVIEW_SWING=n swings it to and fro about its own
@@ -478,7 +612,7 @@ void preview_draw(bool prepass)
     std::vector<double> pose;
     bool posed = preview_pose(s_wind_time, &pose);
     s_depth_test = true, s_depth_mask = true, s_depth_func = GL_LEQUAL, s_cull = false, s_blend = false;
-    for (PreviewPart &part : pv.parts) {
+    for (PreviewPart &part : pv.m.parts) {
         if (prepass && part.material.shader.find("water") != std::string::npos) continue; // water is not in the engine's pre-pass: it asks it how deep the bed lies
         // The engine blends water in and does not let it hide what is drawn later; so here, when asked (WBM_PREVIEW_BLEND=1).
         bool blended = getenv("WBM_PREVIEW_BLEND") && part.material.shader.find("water") != std::string::npos;
@@ -574,12 +708,27 @@ void preview_draw(bool prepass)
         }
         mtl_glDrawElements(GL_TRIANGLES, part.count, GL_UNSIGNED_INT, nullptr);
     }
-    if (!prepass) s_preview_in_scene = true;
     memcpy(s_attribs, attribs, sizeof attribs);
     memcpy(s_bound_texture, bound, sizeof bound);
     s_array_buffer = array_buffer, s_element_buffer = element_buffer, s_program = program, s_unit = unit;
     s_depth_test = depth_test, s_depth_mask = depth_mask, s_cull = cull, s_blend = blend, s_depth_func = depth_func;
     s_last_key_program = 0;
+}
+
+// Draws the model, or every model of the gallery, into the pass that is current: the scene, or the depth pre-pass.
+void preview_draw(bool prepass)
+{
+    Preview &pv = s_preview;
+    if (!pv.active || !s_replay.camera_known) return;
+    if (prepass)
+        if (Framebuffer *fb = find(s_framebuffers, s_fbo)) pv.prepass_texture = fb->color_texture;
+    if (pv.gallery.empty()) preview_draw_one(prepass);
+    for (PreviewModel &shown : pv.gallery) {
+        std::swap(pv.m, shown);
+        preview_draw_one(prepass);
+        std::swap(pv.m, shown);
+    }
+    if (!prepass) s_preview_in_scene = true;
 }
 
 bool preview_wanted(bool *keep_scene)

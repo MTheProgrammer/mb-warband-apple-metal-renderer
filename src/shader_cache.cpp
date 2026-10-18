@@ -16,7 +16,7 @@ namespace {
 
 // Bump when the translation changes (the rewriter, its options, or the
 // versions of glslang and SPIRV-Cross), so that stale entries are ignored.
-const char k_version[] = "wbx-122 glslang-15.1.0 spirv-cross-1.4.304.0";
+const char k_version[] = "wbx-131 glslang-15.1.0 spirv-cross-1.4.304.0";
 const uint32_t k_magic = 0x31584257; // "WBX1"
 
 uint64_t fnv(const std::string &s, uint64_t h)
@@ -166,6 +166,7 @@ XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_
     key += std::string("\0pcss_shadows=", 14) + (options.pcss_shadows ? "1" : "0");
     key += std::string("\0dynamic_shadows=", 17) + (options.dynamic_shadows ? "1" : "0");
     key += std::string("\0smooth_alpha_test=", 19) + (options.smooth_alpha_test ? "1" : "0");
+    key += std::string("\0alpha_hash=", 12) + (options.alpha_hash ? "1" : "0");
     key += std::string("\0reverse_depth=", 15) + (options.reverse_depth ? "1" : "0");
     key += std::string("\0srgb_textures=", 15) + (options.srgb_textures ? "1" : "0");
     key += std::string("\0pbr_specular=", 14) + (options.pbr_specular ? "1" : "0");
@@ -176,6 +177,7 @@ XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_
     key += std::string("\0skin=", 6) + (options.skin_scattering ? "1" : "0");
     key += std::string("\0foliage=", 9) + (options.foliage_backlight ? "1" : "0");
     key += std::string("\0wind=", 6) + (options.wind ? "1" : "0");
+    key += std::string("\0motion=", 8) + (options.motion_vectors ? "1" : "0");
     key += std::string("\0eyes=", 6) + (options.eyes ? "1" : "0");
     key += std::string("\0fur=", 5) + (options.fur ? "1" : "0");
     key += std::string("\0hairs=", 7) + (options.hair_strands ? "1" : "0");

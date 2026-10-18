@@ -20,6 +20,8 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <cmath>
 #include <csignal>
 #include <cstdarg>
@@ -109,7 +111,8 @@ struct PipelineKey {
     uint16_t blend_src, blend_dst, blend_eq;
     uint8_t blend;
     uint8_t samples;
-    uint8_t pad[2];
+    uint8_t motion; // 0: the pass has no movement target; 1: it has, and this program leaves it alone; 2: and writes it
+    uint8_t pad[1];
     bool operator==(const PipelineKey &o) const { return !memcmp(this, &o, sizeof *this); }
 };
 struct PipelineKeyHash {
@@ -161,6 +164,9 @@ struct Program {
     std::vector<UniformLocation> locations;
     std::unordered_map<std::string, GLint> location_by_name;
     int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
+    int jitter_offset = -1;  // vertex stage, see k_xl_jitter_uniform
+    int hash_frame_offset = -1; // fragment stage: wbm_hash_frame (XlOptions::alpha_hash)
+    int reproject_offset = -1, wind_before_offset = -1; // vertex stage: wbm_reproject and wbm_wind_before, of the shaders that write their own movement (XlOptions::motion_vectors)
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
     int grade_offset = -1;    // fragment stage, wbm_grade
@@ -235,6 +241,22 @@ int s_scale = 1;
 // s_render_scale times the game's size, not s_scale times.
 double s_render_scale = 1;
 bool s_upscale;
+// WBM_UPSCALE_MODE=temporal: MetalFX's temporal scaler in place of the spatial
+// one. It builds each picture from several frames, so it is told what the
+// spatial one is not: how far along each frame the picture was shifted
+// (s_jitter, in pixels of the scene, a different fraction each frame), how far
+// off every pixel is, and where on screen it was a frame ago. See
+// apply_temporal_upscale. It smooths edges itself, so FXAA is left out.
+bool s_temporal;
+float s_jitter[2];
+int s_jitter_sign = 1; // WBM_DEBUG_JITTER_SIGN
+// The second colour target of the scene under temporal upscaling: what sways
+// in the wind writes its own movement there (see k_motion_vertex_uniforms in
+// shader_xlate.cpp). x, y: the step across the screen since the last frame, in
+// clip space; z: the distance, below 0 where nothing wrote.
+id<MTLTexture> s_scene_motion;
+uint64_t s_scene_motion_frame = ~0ull; // the frame it was last cleared in
+bool s_pass_motion;                    // the pass under way has it attached
 float s_sharpen; // WBM_SHARPEN, 0 to 1: see apply_sharpen
 int s_screen_w, s_screen_h; // the size the game believes the screen has
 
@@ -399,6 +421,7 @@ float s_sun_dir[4], s_sun_color[4];
 // their own surface up in it (see render_torch_shadows, and add_torch_fragment in shader_xlate.cpp).
 // WBM_TORCH_MAP: the width of a cube's face, texels.
 float s_torch_shadows;
+float s_torch_self = 0.5f; // WBM_TORCH_SELF: scenery with a corner within this many metres of a light casts no shadow from it (its own bracket); 0: all of it casts
 int s_torch_size = 1024;
 struct TorchPlace {
     float at[3];
@@ -413,6 +436,7 @@ id<MTLSamplerState> s_torch_sampler;
 bool casting() { return s_dyn_shadows || s_torch_shadows > 0; } // whether what the pre-pass draws is recorded, to cast shadows
 bool s_sun_valid;
 void apply_ambient_occlusion();
+bool s_bounce_half;   // WBM_BOUNCE_HALF: bounce light worked out at half resolution, not a quarter (finer, and more than twice the cost)
 float s_bounce_light; // WBM_BOUNCE_LIGHT: light thrown by lit surfaces on those near them, a strength (1 is plenty); 0 for none
 
 // Ambient light from the captured sky (WBM_SKY_AMBIENT=1), see k_xl_ambient_uniform.
@@ -479,6 +503,7 @@ uint64_t s_eye_frame;
 float s_foliage_backlight; // WBM_FOLIAGE: how much sunlight comes through leaves, 0 for none
 float s_wind_strength;     // WBM_WIND, 0 for none
 double s_wind_time;        // the same for every draw of a frame
+double s_wind_time_before; // and the frame before's
 // Shells of fur (WBM_FUR_SHELLS): how many layers a coat near the camera is drawn in, 0 for none.
 int s_fur_shells;
 float s_texture_per_metre = 0.3f; // of the mesh being drawn: how much of its texture a metre of its surface covers
@@ -680,6 +705,7 @@ bool s_preview_in_scene; // the model has been drawn into the scene buffer this 
 bool s_fxaa;
 void apply_fxaa();
 id<MTLTexture> apply_upscale() API_AVAILABLE(macos(13.0));
+id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0));
 void apply_sharpen(id<MTLTexture> picture);
 // Frame-rate limits (WBM_MAX_FPS, and WBM_MENU_FPS for frames without a 3D scene); 0 for none.
 double s_max_fps, s_menu_fps;
@@ -858,9 +884,12 @@ void start_pass(const Target &t, GLbitfield clear_mask)
         if (s_interior) update_room_probe();
         else s_room_atlas = nil;
         if (s_motion_blur) apply_motion_blur();
-        if (s_fxaa) apply_fxaa(); // last: edges as they will be shown
+        if (s_fxaa && !s_temporal) apply_fxaa(); // last: edges as they will be shown (the temporal scaler smooths them itself)
         id<MTLTexture> shown = nil;
-        if (@available(macOS 13.0, *)) shown = s_upscale ? apply_upscale() : nil;
+        if (@available(macOS 13.0, *)) {
+            if (s_temporal) shown = apply_temporal_upscale();
+            if (!shown && s_upscale) shown = apply_upscale(); // s_temporal is off by now if its scaler could not be made
+        }
         if (s_sharpen > 0) apply_sharpen(shown ? shown : s_last.color);
     }
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -877,6 +906,21 @@ void start_pass(const Target &t, GLbitfield clear_mask)
         }
         d.colorAttachments[0].clearColor = s_debug_clear && t.screen ? MTLClearColorMake(0.10, 0.30, 0.60, 1.0) : s_clear_color;
     }
+    bool with_motion = s_temporal && s_shader_options.motion_vectors && t.scene && t.color && !t.ms_color;
+    if (with_motion) {
+        if (!s_scene_motion || s_scene_motion.width != t.color.width || s_scene_motion.height != t.color.height) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:t.color.width height:t.color.height mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            s_scene_motion = [s_device newTextureWithDescriptor:td];
+            s_scene_motion_frame = ~0ull;
+        }
+        d.colorAttachments[1].texture = s_scene_motion;
+        d.colorAttachments[1].loadAction = s_scene_motion_frame == s_frame_serial ? MTLLoadActionLoad : MTLLoadActionClear;
+        d.colorAttachments[1].storeAction = MTLStoreActionStore;
+        d.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, -1, 0);
+        s_scene_motion_frame = s_frame_serial;
+    }
     if (t.depth) {
         bool clear = (clear_mask & GL_DEPTH_BUFFER_BIT) && s_depth_mask;
         d.depthAttachment.texture = t.depth;
@@ -889,6 +933,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_color = t.color;
     s_pass_depth = t.depth;
     s_pass_screen = t.screen;
+    s_pass_motion = with_motion;
     s_pass_scale = t.scale;
     s_pass_samples = t.samples;
     if (t.scene) s_scene_frame = s_frame_serial;
@@ -904,11 +949,54 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_last.samples = t.samples;
 }
 
+// WBM_CALLSITES=1: where in the game's own code the work comes from. At chosen
+// moments (a pass begun on some kind of target, a draw, a matrix handed to a
+// shader, a buffer filled, the frame shown) the addresses the call came through
+// are noted, those inside the game's executable only, as the addresses that
+// file has on disk (what a disassembler shows), innermost first. The summary
+// lists each distinct path with how often it was taken. This is the way into a
+// binary that carries no names: whoever hands over matWorldArray draws what has
+// bones; whoever begins the pass on the shadow map draws the shadows. See
+// docs/engine-notes.md.
+bool s_callsites;
+struct CallSite {
+    uint64_t count = 0, first_frame = 0;
+};
+std::map<std::string, CallSite> s_callsite_counts;
+
+void note_callsite(const char *what, const char *detail = "")
+{
+    if (!s_callsites) return;
+    static const void *game = _dyld_get_image_header(0);
+    static const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    void *stack[24];
+    int depth = backtrace(stack, 24), kept = 0;
+    char line[512];
+    int at = snprintf(line, sizeof line, "%s%s%s:", what, *detail ? " " : "", detail);
+    for (int i = 1; i < depth && kept < 7 && at < (int)sizeof line - 20; i++) {
+        Dl_info info;
+        if (!dladdr(stack[i], &info) || info.dli_fbase != game) continue;
+        at += snprintf(line + at, sizeof line - (size_t)at, " %llx", (unsigned long long)((intptr_t)stack[i] - slide));
+        kept++;
+    }
+    if (!kept || s_callsite_counts.size() > 20000) return;
+    CallSite &c = s_callsite_counts[line];
+    if (!c.count++) c.first_frame = s_frame_serial;
+}
+
+const char *pass_kind()
+{
+    return s_pass_screen ? "the screen" : s_pass_scene ? "the scene" : s_pass_prepass ? "the depth pre-pass" : s_pass_shadow_map ? "the shadow map" : "another target";
+}
+
 bool ensure_pass()
 {
     Target t;
     if (!resolve_target(t)) return false;
-    if (!s_pass || s_pass_color != t.color || s_pass_depth != t.depth) start_pass(t, 0);
+    if (!s_pass || s_pass_color != t.color || s_pass_depth != t.depth) {
+        start_pass(t, 0);
+        if (s_callsites) note_callsite("pass begun on", pass_kind());
+    }
     return true;
 }
 
@@ -1116,7 +1204,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
+    p.yflip_offset = p.jitter_offset = p.hash_frame_offset = p.reproject_offset = p.wind_before_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -1181,6 +1269,7 @@ void link_program(GLuint program_id, Program &p)
         };
         for (const XlUniform &u : stages[s]->uniforms) {
             if (u.name == k_xl_yflip_uniform) p.yflip_offset = u.offset;
+            if (u.name == k_xl_jitter_uniform) p.jitter_offset = u.offset;
             else if (u.name == k_xl_samples_uniform) p.samples_offset = u.offset;
             else if (u.name == k_xl_headroom_uniform) p.headroom_offset = u.offset;
             else if (u.name == "wbm_grade" && s == 1) p.grade_offset = u.offset;
@@ -1197,6 +1286,9 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_pbr_uniform) p.pbr_offset = u.offset;
             else if (u.name == k_xl_skin_uniform) p.skin_offset[s] = u.offset;
             else if (u.name == k_xl_wind_uniform) p.wind_offset = u.offset;
+            else if (u.name == "wbm_reproject") p.reproject_offset = u.offset;
+            else if (u.name == "wbm_hash_frame") p.hash_frame_offset = u.offset;
+            else if (u.name == "wbm_wind_before") p.wind_before_offset = u.offset;
             else if (u.name == "wbm_leaf_sun") p.leaf_sun_offset = u.offset;
             else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
             else if (u.name == "wbm_fur") p.fur_offset = u.offset;
@@ -1446,6 +1538,10 @@ id<MTLRenderPipelineState> pipeline_for(Program &p, const PipelineKey &key)
         c.destinationRGBBlendFactor = c.destinationAlphaBlendFactor = blend_factor(key.blend_dst);
         c.rgbBlendOperation = c.alphaBlendOperation = blend_operation(key.blend_eq);
     }
+    if (key.motion) {
+        d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
+        d.colorAttachments[1].writeMask = key.motion == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)key.depth_format;
     d.rasterSampleCount = key.samples;
 
@@ -1514,7 +1610,7 @@ struct Params {
     float shadow_strength, shadow_length;
     float2 shaft_size; // of the light-shaft textures, in pixels
     float4 shaft;      // xy: the sun's position on screen (0..1), z: how visible it is, w: strength
-    float4 bounce;     // x: strength, y: radius in metres
+    float4 bounce;     // x: strength, y: radius in metres, z: how many texels of the half-resolution textures one of its own covers
 };
 
 #if WBM_MSAA
@@ -1734,14 +1830,15 @@ fragment float4 shaft_apply(VertexOut in [[stage_in]], texture2d<float> shafts [
 // of others within a metre or two is asked how bright they are and whether
 // they lie on the side its surface faces, the nearer the more.
 //
-// bounce_compute, half resolution: the light arriving, linear. bounce_blur:
+// bounce_compute, quarter resolution (the light is soft, and at half this cost
+// more than twice as much): the light arriving, linear. bounce_blur:
 // smoothed over 5x5 texels of like depth. bounce_apply: the scene's colour is
 // multiplied by one plus it, which takes the surface's own colour for what it
 // reflects.
 fragment float4 bounce_compute(VertexOut in [[stage_in]], texture2d<float> z [[texture(0)]], texture2d<float> scene [[texture(1)]], constant Params &p [[buffer(0)]])
 {
     constexpr sampler smooth(filter::linear, address::clamp_to_edge);
-    int2 c = int2(in.position.xy);
+    int2 c = int2(in.position.xy * p.bounce.z);
     float3 P = view_position(z, c, p);
     if (P.z > p.fade_start * 2.0) return float4(0.0);
     float3 right = view_position(z, c + int2(1, 0), p) - P, left = P - view_position(z, c - int2(1, 0), p);
@@ -1780,13 +1877,15 @@ fragment float4 bounce_compute(VertexOut in [[stage_in]], texture2d<float> z [[t
 fragment float4 bounce_blur(VertexOut in [[stage_in]], texture2d<float> light [[texture(0)]], texture2d<float> z [[texture(1)]], constant Params &p [[buffer(0)]])
 {
     int2 c = int2(in.position.xy);
-    float zc = load_z(z, c, p);
+    int2 size = int2(light.get_width(), light.get_height());
+    float zc = load_z(z, int2(in.position.xy * p.bounce.z), p);
     float3 total = float3(0.0);
     float weight = 0.0;
+    int stride = p.bounce.z > 1.5 ? 1 : 2; // the same reach on screen either way
     for (int j = -2; j <= 2; j++) {
         for (int i = -2; i <= 2; i++) {
-            int2 t = clamp(c + int2(i, j) * 2, int2(0), int2(p.ao_size) - 1);
-            float w = exp(-abs(load_z(z, t, p) - zc) / (0.03 * zc + 0.02));
+            int2 t = clamp(c + int2(i, j) * stride, int2(0), size - 1);
+            float w = exp(-abs(load_z(z, int2((float2(t) + 0.5) * p.bounce.z), p) - zc) / (0.03 * zc + 0.02));
             total += light.read(uint2(t)).rgb * w;
             weight += w;
         }
@@ -1949,7 +2048,8 @@ void apply_ambient_occlusion()
     }
     bool occlude = s_ao || params.shadow_strength > 0;
     bool bounce = s_bounce_light > 0 && s_bounce_compute_pipeline && s_bounce_blur_pipeline;
-    params.bounce[0] = s_bounce_light * 2.5f, params.bounce[1] = 1.6f * scale, params.bounce[2] = params.bounce[3] = 0;
+    NSUInteger bk = s_bounce_half ? 1 : 2, bw = (aw + bk - 1) / bk, bh = (ah + bk - 1) / bk;
+    params.bounce[0] = s_bounce_light * 2.5f, params.bounce[1] = 1.6f * scale, params.bounce[2] = (float)bk, params.bounce[3] = 0;
     if (!occlude && !shafts && !bounce) return;
     params.reversed = s_reverse_depth ? 1.0f : 0.0f;
     params.fade_start = 60.0f * scale; // beyond this the effect fades out, and is gone at twice it
@@ -2022,8 +2122,8 @@ void apply_ambient_occlusion()
             add = [s_device newRenderPipelineStateWithDescriptor:pd error:&error];
             if (!add) complain("bounce light apply pipeline failed: %s", error.localizedDescription.UTF8String);
         }
-        if (!s_bounce_texture || s_bounce_texture.width != aw || s_bounce_texture.height != ah) {
-            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:aw height:ah mipmapped:NO];
+        if (!s_bounce_texture || s_bounce_texture.width != bw || s_bounce_texture.height != bh) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:bw height:bh mipmapped:NO];
             td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             td.storageMode = MTLStorageModePrivate;
             s_bounce_texture = [s_device newTextureWithDescriptor:td];
@@ -2112,7 +2212,8 @@ bool vertex_matrix(Program &p, const char *name, double *out)
 void observe_camera(Program &p)
 {
     double wvp[16], wv[16], w[16], inv[16], m[16];
-    if (s_motion_blur && s_camera.view_proj_frame != s_frame_serial && vertex_matrix(p, "matWorldViewProj", wvp) &&
+    // (Played back with the camera moved, the sky's matrices are not the scene's: see prepare_draw.)
+    if ((s_motion_blur || s_temporal) && s_camera.view_proj_frame != s_frame_serial && (!s_replaying || s_depth_test) && vertex_matrix(p, "matWorldViewProj", wvp) &&
         vertex_matrix(p, "matWorld", w) && mat_inverse(w, inv)) {
         memcpy(s_camera.last_view_proj, s_camera.view_proj, sizeof s_camera.view_proj);
         s_camera.last_view_proj_frame = s_camera.view_proj_frame;
@@ -2174,6 +2275,8 @@ struct Params {
     float near_start, near_end; // distances between which the blur fades in
     float max_length;   // in screen heights
     float has_objects;  // 1 when the third texture holds this frame's moving objects (see render_object_velocities)
+    float has_swayed;   // 1 when the fourth holds what the swaying shaders wrote of their own movement (see s_scene_motion)
+    float spare0, spare1, spare2;
 };
 
 #if WBM_MSAA
@@ -2330,13 +2433,47 @@ fragment float4 blur_fragment(VertexOut in [[stage_in]], texture2d<float> scene 
     }
     return float4(sum / weight, centre.a);
 }
+
+// For temporal upscaling: where each pixel was a frame ago, as a step in
+// texture coordinates from where it is now. The camera's movement says it for
+// everything that stands still; things that moved by themselves have it in
+// `objects`, where one is seen at this pixel.
+fragment float4 motion_fragment(VertexOut in [[stage_in]], DepthTexture depth [[texture(1)]], texture2d<float> objects [[texture(2)]], texture2d<float> swayed [[texture(3)]],
+                                constant Params &p [[buffer(0)]])
+{
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    float4 n = clip_point(depth, in.position.xy, p);
+    float4 before = p.reproject * n;
+    float2 moved = before.w > 1.0e-6 ? n.xy - before.xy / before.w : float2(0.0);
+    float inverse = dot(p.inverse_w, n);
+    float distance = inverse > 1.0e-9 ? 1.0 / inverse : 1.0e9;
+    // What a swaying shader wrote holds only while that surface is still the one seen here.
+    if (p.has_swayed > 0.5) {
+        float4 o = swayed.read(uint2(in.position.xy));
+        if (o.z > 0.0 && abs(o.z - distance) < 0.06 * distance + 0.15) moved = o.xy;
+    }
+    if (p.has_objects > 0.5) {
+        float4 o = objects.sample(nearest, in.position.xy / p.size);
+        if (o.z > 0.0 && abs(o.z - distance) < 0.06 * distance + 0.15) moved = o.xy;
+    }
+    return float4(-0.5 * moved, 0.0, 0.0); // clip space is two wide
+}
+
+// WBM_DEBUG_MOTION: the movement texture as a picture. Grey where nothing moved; redder where a pixel came
+// from farther right, greener from farther down; full colour at a fiftieth of the picture's width a frame.
+fragment float4 motion_show(VertexOut in [[stage_in]], texture2d<float> motion [[texture(0)]], constant Params &p [[buffer(0)]])
+{
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    float2 m = motion.sample(nearest, in.position.xy / p.size).xy;
+    return float4(0.5 + m * 25.0, 0.5, 1.0);
+}
 )";
 
 struct BlurParams { // must match Params in k_blur_source
     float reproject[16];
     float inverse_w[4];
     float size[2];
-    float reversed, exposure, near_start, near_end, max_length, has_objects;
+    float reversed, exposure, near_start, near_end, max_length, has_objects, has_swayed, spare[3];
 };
 id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, NSUInteger h);
 
@@ -2345,6 +2482,19 @@ std::map<int, id<MTLRenderPipelineState>> s_blur_pipelines; // by colour format
 id<MTLTexture> s_blur_texture;
 double s_blur_time;
 uint64_t s_blur_frames;
+
+// The shaders of motion blur and of the movement texture, compiled when first wanted.
+bool blur_library()
+{
+    static bool failed;
+    if (s_blur_library || failed) return s_blur_library != nil;
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.preprocessorMacros = @{@"WBM_MSAA" : @(s_last.depth.sampleCount > 1 ? 1 : 0)};
+    NSError *error = nil;
+    s_blur_library = [s_device newLibraryWithSource:@(k_blur_source) options:options error:&error];
+    if (!s_blur_library) complain("motion shaders did not compile: %s", error.localizedDescription.UTF8String), failed = true;
+    return s_blur_library != nil;
+}
 
 // Called between render passes, once the engine has finished the scene, after
 // the other effects on it.
@@ -2371,16 +2521,9 @@ void apply_motion_blur()
     double jump = hypot((reproject[8] + reproject[12]) / qw, (reproject[9] + reproject[13]) / qw);
     if (jump > 0.5) return;
 
-    if (!s_blur_library) {
-        MTLCompileOptions *options = [MTLCompileOptions new];
-        options.preprocessorMacros = @{@"WBM_MSAA" : @(s_last.depth.sampleCount > 1 ? 1 : 0)};
-        NSError *error = nil;
-        s_blur_library = [s_device newLibraryWithSource:@(k_blur_source) options:options error:&error];
-        if (!s_blur_library) {
-            complain("motion blur shaders did not compile: %s", error.localizedDescription.UTF8String);
-            s_motion_blur = false;
-            return;
-        }
+    if (!blur_library()) {
+        s_motion_blur = false;
+        return;
     }
     id<MTLRenderPipelineState> __strong &pipeline = s_blur_pipelines[(int)s_last.color.pixelFormat];
     if (!pipeline) {
@@ -2639,6 +2782,148 @@ id<MTLTexture> apply_upscale()
     return s_upscaled;
 }
 
+// Temporal upscaling (WBM_UPSCALE_MODE=temporal). The scene was drawn smaller
+// and shifted by a fraction of a pixel that differs from frame to frame (see
+// s_jitter), so over a few frames every part of each screen pixel gets looked
+// at. MetalFX puts those frames together, which takes knowing where each pixel
+// was a frame ago: a texture of movements is made for it here, from the
+// camera's own movement and from the things that moved by themselves (the
+// motion blur's, see render_object_velocities). What has no such record (grass
+// in the wind, particles, water) is taken to stand still in the world.
+//
+// The history is dropped whenever this frame does not follow from the last:
+// no scene in the frame before, a cut to another view, another size.
+id<MTLFXTemporalScaler> s_temporal_scaler API_AVAILABLE(macos(13.0));
+id<MTLTexture> s_motion_texture;
+id<MTLRenderPipelineState> s_motion_pipeline;
+uint64_t s_temporal_frames, s_temporal_resets, s_temporal_last_frame = ~0ull;
+
+id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
+{
+    id<MTLTexture> scene = s_last.color, depth = s_last.depth;
+    if (!scene || !depth || depth.sampleCount > 1 || depth.width != scene.width || depth.height != scene.height) return nil;
+    NSUInteger w = (NSUInteger)(s_screen_w * s_scale), h = (NSUInteger)(s_screen_h * s_scale);
+    if (scene.width > w || scene.height > h) return nil;
+    if (!blur_library()) return nil;
+    bool reset = s_temporal_last_frame + 1 != s_frame_serial;
+    if (!s_temporal_scaler || s_temporal_scaler.inputWidth != scene.width || s_temporal_scaler.inputHeight != scene.height || s_temporal_scaler.outputWidth != w ||
+        s_temporal_scaler.outputHeight != h || s_temporal_scaler.colorTextureFormat != scene.pixelFormat || s_temporal_scaler.depthTextureFormat != depth.pixelFormat) {
+        MTLFXTemporalScalerDescriptor *d = [MTLFXTemporalScalerDescriptor new];
+        d.inputWidth = scene.width, d.inputHeight = scene.height, d.outputWidth = w, d.outputHeight = h;
+        d.colorTextureFormat = d.outputTextureFormat = scene.pixelFormat;
+        d.depthTextureFormat = depth.pixelFormat;
+        d.motionTextureFormat = MTLPixelFormatRG16Float;
+        d.autoExposureEnabled = YES; // the scene's colours are as shown, and nothing here knows the exposure the engine will choose
+        s_temporal_scaler = [d newTemporalScalerWithDevice:s_device];
+        if (!s_temporal_scaler) {
+            complain("WBM_UPSCALE_MODE=temporal: MetalFX would not make a scaler from %lux%lu to %lux%lu; the spatial one is used", (unsigned long)scene.width, (unsigned long)scene.height,
+                     (unsigned long)w, (unsigned long)h);
+            s_temporal = false;
+            return nil;
+        }
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:scene.pixelFormat width:w height:h mipmapped:NO];
+        td.usage = s_temporal_scaler.outputTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        s_upscaled = [s_device newTextureWithDescriptor:td];
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:scene.width height:scene.height mipmapped:NO];
+        td.usage = s_temporal_scaler.motionTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        s_motion_texture = [s_device newTextureWithDescriptor:td];
+        reset = true;
+    }
+    if (!s_motion_pipeline) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [s_blur_library newFunctionWithName:@"blur_vertex"];
+        d.fragmentFunction = [s_blur_library newFunctionWithName:@"motion_fragment"];
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatRG16Float;
+        NSError *error = nil;
+        s_motion_pipeline = [s_device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!s_motion_pipeline) {
+            complain("movement texture pipeline failed: %s; the spatial scaler is used", error.localizedDescription.UTF8String);
+            s_temporal = false;
+            return nil;
+        }
+    }
+
+    // This frame's clip space to the last one's, as for motion blur; where the two cameras
+    // have nothing to do with each other, nothing has moved and the history goes.
+    BlurParams params = {};
+    double inverse[16], reproject[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    bool known = s_camera.view_proj_frame == s_frame_serial && s_camera.last_view_proj_frame + 1 == s_frame_serial && mat_inverse(s_camera.view_proj, inverse);
+    if (known) {
+        mat_mul(s_camera.last_view_proj, inverse, reproject);
+        double qw = reproject[11] + reproject[15];
+        if (qw <= 1e-9 || hypot((reproject[8] + reproject[12]) / qw, (reproject[9] + reproject[13]) / qw) > 0.5) known = false; // a cut
+    }
+    if (!known) {
+        reset = true;
+        for (int i = 0; i < 16; i++) reproject[i] = i % 5 == 0 ? 1.0 : 0.0, inverse[i] = reproject[i];
+    }
+    for (int i = 0; i < 16; i++) params.reproject[i] = (float)reproject[i];
+    for (int c = 0; c < 4; c++) params.inverse_w[c] = (float)inverse[c * 4 + 3];
+    params.size[0] = (float)scene.width, params.size[1] = (float)scene.height;
+    params.reversed = s_reverse_depth ? 1.0f : 0.0f;
+    id<MTLTexture> objects = known ? render_object_velocities(reproject, scene.width, scene.height) : nil;
+    params.has_objects = objects ? 1.0f : 0.0f;
+    bool swayed = known && s_scene_motion && s_scene_motion_frame == s_frame_serial && s_scene_motion.width == scene.width && s_scene_motion.height == scene.height;
+    params.has_swayed = swayed ? 1.0f : 0.0f;
+
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_motion_texture;
+    d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:s_motion_pipeline];
+    [pass setFragmentTexture:depth atIndex:1];
+    [pass setFragmentTexture:objects ? objects : s_white atIndex:2];
+    [pass setFragmentTexture:swayed ? s_scene_motion : s_white atIndex:3];
+    [pass setFragmentBytes:&params length:sizeof params atIndex:0];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+
+    s_temporal_scaler.colorTexture = scene;
+    s_temporal_scaler.depthTexture = depth;
+    s_temporal_scaler.motionTexture = s_motion_texture;
+    s_temporal_scaler.outputTexture = s_upscaled;
+    s_temporal_scaler.motionVectorScaleX = (float)scene.width; // the texture holds steps in texture coordinates
+    s_temporal_scaler.motionVectorScaleY = (float)scene.height;
+    s_temporal_scaler.jitterOffsetX = (float)s_jitter_sign * s_jitter[0];
+    s_temporal_scaler.jitterOffsetY = (float)s_jitter_sign * s_jitter[1];
+    s_temporal_scaler.depthReversed = s_reverse_depth;
+    s_temporal_scaler.reset = reset;
+    [s_temporal_scaler encodeToCommandBuffer:command_buffer()];
+    static const bool show = getenv("WBM_DEBUG_MOTION") != nullptr;
+    if (show) {
+        static id<MTLRenderPipelineState> pipeline;
+        if (!pipeline) {
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [s_blur_library newFunctionWithName:@"blur_vertex"];
+            pd.fragmentFunction = [s_blur_library newFunctionWithName:@"motion_show"];
+            pd.colorAttachments[0].pixelFormat = s_upscaled.pixelFormat;
+            pipeline = [s_device newRenderPipelineStateWithDescriptor:pd error:nil];
+        }
+        if (pipeline) {
+            params.size[0] = (float)w, params.size[1] = (float)h;
+            MTLRenderPassDescriptor *sd = [MTLRenderPassDescriptor renderPassDescriptor];
+            sd.colorAttachments[0].texture = s_upscaled;
+            sd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            sd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> shown = [command_buffer() renderCommandEncoderWithDescriptor:sd];
+            [shown setRenderPipelineState:pipeline];
+            [shown setFragmentTexture:s_motion_texture atIndex:0];
+            [shown setFragmentBytes:&params length:sizeof params atIndex:0];
+            [shown drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [shown endEncoding];
+        }
+    }
+    for (auto &entry : s_textures)
+        if (entry.second.mtl == scene) entry.second.upscaled = s_upscaled, entry.second.upscaled_frame = s_frame_serial;
+    s_temporal_last_frame = s_frame_serial;
+    s_temporal_frames++;
+    if (reset) s_temporal_resets++;
+    return s_upscaled;
+}
+
 // Sharpening (WBM_SHARPEN, 0 to 1), after AMD's contrast-adaptive sharpening:
 // each pixel is pushed away from the average of its four neighbours, less
 // where they already differ much (so edges do not ring and noise is not
@@ -2815,6 +3100,7 @@ void eye_gaze(double time, float phase, float *out)
 void limit_frame_rate()
 {
     static const double start = CACurrentMediaTime();
+    s_wind_time_before = s_wind_time;
     s_wind_time = fmod(CACurrentMediaTime() - start, 3600.0); // for the frame about to begin
     static std::chrono::steady_clock::time_point next;
     double limit = s_scene_frame + 1 >= s_frame_serial ? s_max_fps : (s_menu_fps > 0 ? s_menu_fps : s_max_fps); // s_frame_serial was just advanced
@@ -3147,16 +3433,17 @@ fragment float4 caster_cutout(Out in [[stage_in]], texture2d<float> diffuse [[te
 // which, and the layer of the map to draw into follows from it.
 struct Torches {
     float4 light[4]; // xyz: where the light of each cube is
-    float4 depth;    // a face holds x + y / (distance along its axis)
+    float4 depth;    // a face holds x + y / (distance along its axis); z: scenery this near the light is the light's own holder
 };
 struct TorchOut {
     float4 position [[position]];
     float2 uv;
     float cutoff [[flat]];
+    float clip [[clip_distance]];
     uint layer [[render_target_array_index]];
 };
 
-static TorchOut torch_finish(float4 world, float2 uv, float4 params, constant Torches &t, uint instance)
+static TorchOut torch_finish(float4 world, float2 uv, float4 params, constant Torches &t, uint instance, bool scenery)
 {
     float3 r = world.xyz / world.w - t.light[instance / 6].xyz;
     float3 c; // across the face, down it, and along its axis, as a cube map's faces are laid out
@@ -3170,6 +3457,11 @@ static TorchOut torch_finish(float4 world, float2 uv, float4 params, constant To
     }
     TorchOut out;
     out.position = float4(c.x, -c.y, t.depth.x * c.z + t.depth.y, c.z);
+    // A torch's light sits in its own bracket, and a point there throws the bracket's shadow across the whole
+    // wall, where a flame, which is no point and burns above it, throws next to none. Scenery is cut away
+    // where its corners are this near the light: that takes the fine things at the light, and leaves the wall
+    // behind it, whose corners are far off, whole.
+    out.clip = scenery ? length(r) - t.depth.z : 1.0;
     out.uv = uv;
     out.cutoff = params.x;
     out.layer = instance;
@@ -3178,7 +3470,7 @@ static TorchOut torch_finish(float4 world, float2 uv, float4 params, constant To
 
 vertex TorchOut torch_static(StaticIn in [[stage_in]], constant Caster &c [[buffer(0)]], constant Torches &t [[buffer(1)]], uint instance [[instance_id]])
 {
-    return torch_finish(c.m * float4(in.position, 1.0), in.uv, c.params, t, instance);
+    return torch_finish(c.m * float4(in.position, 1.0), in.uv, c.params, t, instance, true);
 }
 
 vertex TorchOut torch_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster &c [[buffer(0)]], constant Torches &t [[buffer(1)]], uint instance [[instance_id]])
@@ -3186,7 +3478,7 @@ vertex TorchOut torch_skinned(SkinnedIn in [[stage_in]], constant SkinnedCaster 
     float4 p = float4(in.position, 1.0);
     float4 skinned = c.bones[int(in.indices.x)] * p * in.weights.x + c.bones[int(in.indices.y)] * p * in.weights.y +
                      c.bones[int(in.indices.z)] * p * in.weights.z + c.bones[int(in.indices.w)] * p * in.weights.w;
-    return torch_finish(c.m * skinned, in.uv, c.params, t, instance);
+    return torch_finish(c.m * skinned, in.uv, c.params, t, instance, false);
 }
 
 fragment void torch_cutout(TorchOut in [[stage_in]], texture2d<float> diffuse [[texture(0)]], sampler s [[sampler(0)]])
@@ -3272,7 +3564,7 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
     }
     if (!late && !c.alpha) s_prepass_solid.insert(mesh);
     c.mesh = mesh;
-    if (!late && s_motion_blur && s_velocity_draws.size() < 1500) { // kept apart: the shadow map takes its own away when it is drawn
+    if (!late && (s_motion_blur || s_temporal) && s_velocity_draws.size() < 1500) { // kept apart: the shadow map takes its own away when it is drawn
         VelocityDraw v{c, -1, {c.wvp[12], c.wvp[13], c.wvp[14], c.wvp[15]}};
         if (c.bones >= 0) {
             v.bones = (int)(s_velocity_bones.size() / (32 * 16));
@@ -3340,7 +3632,6 @@ id<MTLRenderPipelineState> velocity_pipeline(const PipelineKey &key, bool skinne
 id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, NSUInteger h)
 {
     if (!objects_recorded() || !s_blur_library) return nil;
-    for (PastObject &o : s_past_objects) o.taken = false;
     struct Pair {
         const VelocityDraw *now;
         const PastObject *before;
@@ -3354,15 +3645,17 @@ id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, N
         double expected[4]; // where it was, had only the camera moved
         for (int r = 0; r < 4; r++) expected[r] = reproject[12 + r] * at[3] + reproject[r] * at[0] + reproject[4 + r] * at[1] + reproject[8 + r] * at[2];
         if (expected[3] < 1e-3) continue;
+        // Not one past object to each: a mesh drawn twice in one place (in two parts, or once more for some effect)
+        // would send its second draw to the nearest other of its kind, across the room, and under temporal
+        // upscaling a wrong movement drags the picture with it. Nor from far off, for the same reason.
         PastObject *best = nullptr;
-        double nearest = 0.6;
+        double nearest = 0.25;
         for (PastObject &o : s_past_objects) {
-            if (o.taken || o.mesh != v.c.mesh || o.origin[3] < 1e-3f || (o.bones >= 0) != (v.bones >= 0)) continue;
+            if (o.mesh != v.c.mesh || o.origin[3] < 1e-3f || (o.bones >= 0) != (v.bones >= 0)) continue;
             double d = hypot(o.origin[0] / o.origin[3] - expected[0] / expected[3], o.origin[1] / o.origin[3] - expected[1] / expected[3]) + fabs(log(o.origin[3] / expected[3])) * 3.0;
             if (d < nearest) nearest = d, best = &o;
         }
         if (!best) continue;
-        best->taken = true;
         if (v.bones < 0) { // a thing without bones that has only gone where the camera's movement took it has no blur of its own
             double most = 0;
             for (int c = 0; c < 4; c++)
@@ -3919,6 +4212,7 @@ void render_torch_shadows(const std::vector<CasterDraw> &casters, const std::vec
     for (int k = 0; k < cubes; k++) memcpy(torches.light[k], s_torch_wanted[(size_t)k].at, 12);
     torches.depth[0] = (float)(far / (far - near));
     torches.depth[1] = (float)(-far * near / (far - near));
+    torches.depth[2] = s_torch_self;
 
     id<MTLTexture> map = torch_map(true);
     id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
@@ -4219,6 +4513,25 @@ void render_dynamic_shadows(Program &p)
     s_dyn_stats.late += casters.size() - from_prepass;
 }
 
+// This frame's clip space to the last one's (OpenGL's, column by column), once this
+// frame's camera has been seen; until then, and after a gap, as if nothing had moved.
+const float *frame_reproject()
+{
+    static float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    static uint64_t frame = ~0ull;
+    if (frame == s_frame_serial) return m;
+    static const float still[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    double inverse[16], r[16];
+    if (s_camera.view_proj_frame != s_frame_serial) return still; // not seen yet: ask again at the next draw
+    frame = s_frame_serial;
+    memcpy(m, still, sizeof m);
+    if (s_camera.last_view_proj_frame + 1 == s_frame_serial && mat_inverse(s_camera.view_proj, inverse)) {
+        mat_mul(s_camera.last_view_proj, inverse, r);
+        for (int i = 0; i < 16; i++) m[i] = (float)r[i];
+    }
+    return m;
+}
+
 // Binds everything a draw needs. Returns false when the draw has to be skipped.
 bool prepare_draw()
 {
@@ -4234,6 +4547,7 @@ bool prepare_draw()
     key.color_format = (uint16_t)(s_pass_color ? s_pass_color.pixelFormat : MTLPixelFormatInvalid);
     key.depth_format = (uint16_t)(s_pass_depth ? s_pass_depth.pixelFormat : MTLPixelFormatInvalid);
     key.samples = (uint8_t)s_pass_samples;
+    key.motion = (uint8_t)(!s_pass_motion ? 0 : p->reproject_offset >= 0 ? 2 : 1);
     if (s_blend) {
         key.blend = 1;
         key.blend_src = (uint16_t)s_blend_src;
@@ -4512,6 +4826,34 @@ bool prepare_draw()
         memcpy(p->uniform_data[0].data() + p->yflip_offset, &yflip, 4);
         p->uniform_dirty[0] = true;
     }
+    // The scene and its depth pre-pass, shifted alike by this frame's fraction of a pixel; nothing else.
+    float jitter[2] = {0, 0};
+    if (s_temporal && (s_pass_scene || s_pass_prepass) && s_pass_color) {
+        jitter[0] = 2.0f * s_jitter[0] / (float)s_pass_color.width;
+        jitter[1] = -2.0f * s_jitter[1] / (float)s_pass_color.height; // clip space counts upwards, the picture's rows down
+    }
+    if (p->jitter_offset >= 0 && memcmp(p->uniform_data[0].data() + p->jitter_offset, jitter, 8)) {
+        memcpy(p->uniform_data[0].data() + p->jitter_offset, jitter, 8);
+        p->uniform_dirty[0] = true;
+    }
+    if (p->reproject_offset >= 0) {
+        const float *reproject = frame_reproject();
+        if (memcmp(p->uniform_data[0].data() + p->reproject_offset, reproject, 64)) {
+            memcpy(p->uniform_data[0].data() + p->reproject_offset, reproject, 64);
+            p->uniform_dirty[0] = true;
+        }
+    }
+    // The noise of the alpha test moves on each frame only where frames are averaged; elsewhere it would crawl.
+    float hash_frame = s_temporal ? (float)(s_frame_serial % 64) : 0.0f;
+    if (p->hash_frame_offset >= 0 && memcmp(p->uniform_data[1].data() + p->hash_frame_offset, &hash_frame, 4)) {
+        memcpy(p->uniform_data[1].data() + p->hash_frame_offset, &hash_frame, 4);
+        p->uniform_dirty[1] = true;
+    }
+    float wind_before = (float)s_wind_time_before;
+    if (p->wind_before_offset >= 0 && memcmp(p->uniform_data[0].data() + p->wind_before_offset, &wind_before, 4)) {
+        memcpy(p->uniform_data[0].data() + p->wind_before_offset, &wind_before, 4);
+        p->uniform_dirty[0] = true;
+    }
     const XlStage *stages[2] = {&p->xl.vs, &p->xl.fs};
     for (int s = 0; s < 2; s++) {
         if (stages[s]->uniform_buffer_index < 0 || p->uniform_data[s].empty()) continue;
@@ -4587,8 +4929,13 @@ bool prepare_draw()
     if (casting() && s_pass_scene && s_dyn_frame != s_frame_serial && !s_casters.empty() && p->u_wvp && p->u_world && (!s_replaying || s_depth_test))
         render_dynamic_shadows(*p);
     if (s_pass_scene && (((s_ao || s_contact_shadows || s_light_shafts || s_foliage_backlight > 0) && s_camera.view_frame != s_frame_serial) ||
-                         (s_motion_blur && s_camera.view_proj_frame != s_frame_serial)))
+                         ((s_motion_blur || s_temporal) && s_camera.view_proj_frame != s_frame_serial)))
         observe_camera(*p);
+    if (s_callsites) {
+        char kind[96];
+        snprintf(kind, sizeof kind, "%s%s%s", pass_kind(), p->u_bones ? ", with bones" : "", s_blend ? ", blended" : "");
+        note_callsite("draw into", kind);
+    }
     return true;
 }
 
@@ -4659,6 +5006,7 @@ void capture_sky(MTLPrimitiveType primitive, NSUInteger count, MTLIndexType inde
         for (int i = 0; i < 16; i++) m32[i] = (float)m[i];
         memcpy(vs.data() + wvp->offset, m32, sizeof m32);
         if (p->yflip_offset >= 0) memcpy(vs.data() + p->yflip_offset, &yflip, 4);
+        if (p->jitter_offset >= 0) memset(vs.data() + p->jitter_offset, 0, 8);
         if (p->limit_offset >= 0) memcpy(fs.data() + p->limit_offset, &limit, 4);
 
         MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4981,6 +5329,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_hdr = s_shader_options.hdr_output = hdr_env && atoi(hdr_env) != 0;                  // off unless set
     s_shader_options.filmic_tonemap = tonemap_env && atoi(tonemap_env) != 0;              // off unless set
     if (const char *v = getenv("WBM_HDR_PEAK")) s_hdr_peak = std::max(1.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_BOUNCE_HALF")) s_bounce_half = atoi(v) != 0;
     if (const char *v = getenv("WBM_BOUNCE_LIGHT")) s_bounce_light = std::min(4.0f, std::max(0.0f, (float)atof(v)));
     if (const char *v = getenv("WBM_CONTRAST")) s_grade[0] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
     if (const char *v = getenv("WBM_SATURATION")) s_grade[1] = std::min(1.0f, std::max(-1.0f, (float)atof(v)));
@@ -5035,6 +5384,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.hair_strands = s_people_hair;
     if (const char *v = getenv("WBM_ROOM_PROBE")) s_room_probe = atoi(v) != 0;
     if (const char *v = getenv("WBM_TORCH_SHADOWS")) s_torch_shadows = std::min(1.0f, std::max(0.0f, (float)atof(v)));
+    s_callsites = getenv("WBM_CALLSITES") != nullptr && atoi(getenv("WBM_CALLSITES")) != 0;
+    if (const char *v = getenv("WBM_TORCH_SELF")) s_torch_self = std::min(10.0f, std::max(0.0f, (float)atof(v)));
     if (const char *v = getenv("WBM_TORCH_MAP")) s_torch_size = std::min(4096, std::max(128, atoi(v)));
     s_shader_options.torch_shadows = s_torch_shadows > 0;
     if (const char *v = getenv("WBM_TORCH_LIGHTING")) s_shader_options.torch_lighting = s_torch_shadows > 0 && atoi(v) != 0; // off unless set; rides on the shadows' rewrite
@@ -5080,6 +5431,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
         s_msaa = 1;
     }
     s_shader_options.smooth_alpha_test = s_msaa > 1;
+    s_shader_options.alpha_hash = s_msaa <= 1 && getenv("WBM_ALPHA_HASH") && atoi(getenv("WBM_ALPHA_HASH")) != 0; // off unless set; with multisampling the samples do it
     const float constant[4] = {0, 0, 0, 1}; // OpenGL's value for a disabled attribute array
     s_constant_attrib = [s_device newBufferWithBytes:constant length:sizeof constant options:MTLResourceStorageModeShared];
     if (!s_device.supportsBCTextureCompression) wb_note("  !! metal: this GPU does not support DXT textures");
@@ -5097,6 +5449,19 @@ void mtl_attach_window(void *nswindow, int width, int height)
                 if (can) s_upscale = true, s_render_scale = s_scale * share;
                 else complain("WBM_UPSCALE: MetalFX is not available on this machine");
             }
+            const char *mode = getenv("WBM_UPSCALE_MODE");
+            if (mode && !strcmp(mode, "temporal") && share >= 0.3 && share <= 1.0) { // at 1 it only smooths edges
+                bool can = false;
+                if (@available(macOS 13.0, *)) can = [MTLFXTemporalScalerDescriptor supportsDevice:s_device];
+                if (can && s_msaa > 1) complain("WBM_UPSCALE_MODE=temporal does not go with multisampling (WBM_MSAA); the spatial scaler is used"), can = false;
+                if (can) {
+                    s_upscale = s_temporal = true, s_render_scale = s_scale * std::min(share, 1.0);
+                    s_shader_options.motion_vectors = !getenv("WBM_UPSCALE_SWAY") || atoi(getenv("WBM_UPSCALE_SWAY")) != 0; // 0: what sways in the wind does not say how it moved (cheaper; leaves smear)
+                    // Textures are picked as for the full-size picture, or they come out soft.
+                    if (!getenv("WBM_LOD_BIAS") && share < 0.999) s_lod_bias = (float)log2(share);
+                } else if (s_msaa <= 1) complain("WBM_UPSCALE_MODE=temporal: MetalFX's temporal scaler is not available on this machine");
+            }
+            if (const char *sign = getenv("WBM_DEBUG_JITTER_SIGN")) s_jitter_sign = atoi(sign) < 0 ? -1 : 1;
         }
         if (const char *v = getenv("WBM_SHARPEN")) s_sharpen = std::min(1.0f, std::max(0.0f, (float)atof(v)));
         CAMetalLayer *layer = [CAMetalLayer layer];
@@ -5159,6 +5524,15 @@ void mtl_dump_stats(FILE *f)
                 (double)s_torch_casters / (double)s_torch_frames, s_torch_cubes, s_torch_size);
     if (s_room_updates) fprintf(f, "\nroom probe updated in %llu frames\n", (unsigned long long)s_room_updates);
     if (s_bounce_frames) fprintf(f, "\nbounce light applied in %llu frames\n", (unsigned long long)s_bounce_frames);
+    if (!s_callsite_counts.empty()) {
+        fprintf(f, "\n== call sites (WBM_CALLSITES): times taken, first frame, what, then addresses in the game's executable, innermost first ==\n");
+        std::vector<std::pair<std::string, CallSite>> sites(s_callsite_counts.begin(), s_callsite_counts.end());
+        std::sort(sites.begin(), sites.end(), [](const auto &a, const auto &b) { return a.second.count > b.second.count; });
+        for (const auto &site : sites) fprintf(f, "%10llu %8llu  %s\n", (unsigned long long)site.second.count, (unsigned long long)site.second.first_frame, site.first.c_str());
+    }
+    if (s_temporal_frames)
+        fprintf(f, "\nupscaled by MetalFX's temporal scaler in %llu frames, from %.0f%% of the screen's size each way; history dropped %llu times\n", (unsigned long long)s_temporal_frames,
+                100.0 * s_render_scale / s_scale, (unsigned long long)s_temporal_resets);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
     if (s_sharpen_frames) fprintf(f, "\nsharpened in %llu frames\n", (unsigned long long)s_sharpen_frames);
     if (s_fxaa_frames) fprintf(f, "\nanti-aliasing (FXAA) applied in %llu frames\n", (unsigned long long)s_fxaa_frames);
@@ -5198,6 +5572,7 @@ void mtl_set_vsync(bool on)
 
 void mtl_present(bool capture, uint32_t frame)
 {
+    if (s_callsites) note_callsite("frame shown");
     @autoreleasepool {
         end_pass();
         if (!s_cmd) return; // the game issued nothing this frame
@@ -5260,6 +5635,15 @@ void mtl_present(bool capture, uint32_t frame)
         s_cmd = nil;
         s_drawable = nil;
         s_frame_serial++;
+        if (s_temporal) { // the next frame's shift: a Halton sequence in bases 2 and 3, sixteen steps long
+            auto halton = [](unsigned i, unsigned base) {
+                float f = 1, r = 0;
+                for (; i; i /= base) f /= (float)base, r += f * (float)(i % base);
+                return r;
+            };
+            unsigned step = (unsigned)(s_frame_serial % 16) + 1;
+            s_jitter[0] = halton(step, 2) - 0.5f, s_jitter[1] = halton(step, 3) - 0.5f;
+        }
         if (!s_casters.empty()) { // recorded, but no main pass followed
             s_casters.clear();
             s_caster_bones.clear();
@@ -5352,9 +5736,18 @@ bool mtl_preview_model(const char *name, int lod, bool keep_scene, double *dista
     return ok;
 }
 
+bool mtl_preview_gallery(const char *path, bool keep_scene)
+{
+    s_preview.keep_scene = s_preview_keeps_scene = keep_scene;
+    std::string problem;
+    s_previewing = preview_load_gallery(path, &problem);
+    if (!s_previewing) fprintf(stderr, "%s\n", problem.c_str());
+    return s_previewing;
+}
+
 bool mtl_preview_action(const char *action, double held)
 {
-    s_preview.held = held;
+    s_preview.m.held = held;
     return preview_set_action(action ? action : "");
 }
 
@@ -5366,7 +5759,7 @@ const char *mtl_preview_next_action(const char *action)
     return k_horse_actions[0].name;
 }
 
-void mtl_preview_material(const char *name) { s_preview.material = name ? name : ""; }
+void mtl_preview_material(const char *name) { s_preview.m.material = name ? name : ""; }
 
 // The mesh a name stands for: itself if it is a mesh; the first mesh of a
 // resource file of that name otherwise; null if neither.
@@ -5378,6 +5771,7 @@ const char *mtl_preview_resolve(const char *name)
     if (want.size() > 4 && !want.compare(want.size() - 4, 4, ".brf")) want.resize(want.size() - 4);
     auto &meshes = s_preview.library.meshes;
     if (meshes.count(want)) return (result = want).c_str();
+    if (!s_preview.library.parts_of(want, 0).empty()) return (result = want).c_str(); // a model made of parts only (name.1, name.2 ...)
     for (size_t f = 0; f < s_preview.library.files.size(); f++) {
         const std::string &path = s_preview.library.files[f];
         std::string base = lower_case(path.substr(path.rfind('/') + 1));
@@ -5520,6 +5914,7 @@ void mtl_glBindBuffer(GLenum target, GLuint buffer)
 void mtl_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum)
 {
     REC(FN_glBufferData).i(target).i(size).blob(data, (size_t)std::max<GLsizeiptr>(size, 0));
+    if (s_callsites) note_callsite("buffer filled", target == GL_ARRAY_BUFFER ? "(vertices)" : "(indices)");
     GLuint id = target == GL_ARRAY_BUFFER ? s_array_buffer : s_element_buffer;
     if (!id || size <= 0) return;
     @autoreleasepool {
@@ -5907,12 +6302,13 @@ GLint mtl_glGetUniformLocation(GLuint program, const GLchar *name)
 void mtl_glUniform1f(GLint location, GLfloat v0) { REC(FN_glUniform1f).s(uniform_name(location)).f(v0); set_uniform(location, &v0, 1, 1, false); }
 void mtl_glUniform1i(GLint location, GLint v0) { REC(FN_glUniform1i).s(uniform_name(location)).i(v0); set_uniform(location, &v0, 1, 1, true); }
 void mtl_glUniform1iv(GLint location, GLsizei count, const GLint *value) { REC(FN_glUniform1iv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 4); set_uniform(location, value, count, 1, true); }
-void mtl_glUniform4fv(GLint location, GLsizei count, const GLfloat *value) { REC(FN_glUniform4fv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 16); set_uniform(location, value, count, 4, false); }
+void mtl_glUniform4fv(GLint location, GLsizei count, const GLfloat *value) { REC(FN_glUniform4fv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 16); if (s_callsites) note_callsite("uniform", std::string(uniform_name(location)).c_str()); set_uniform(location, value, count, 4, false); }
 
 void mtl_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
     REC(FN_glUniformMatrix4fv).s(uniform_name(location)).i(count).blob(value, (size_t)std::max(count, 0) * 64);
     if (transpose) complain("glUniformMatrix4fv with transpose is not supported");
+    if (s_callsites) note_callsite("uniform", std::string(uniform_name(location)).c_str());
     set_uniform(location, value, count, 16, false);
 }
 

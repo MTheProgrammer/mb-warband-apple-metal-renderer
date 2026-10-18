@@ -14,6 +14,7 @@
 #include <sstream>
 
 const char *const k_xl_yflip_uniform = "wbm_yflip";
+const char *const k_xl_jitter_uniform = "wbm_jitter";
 const char *const k_xl_samples_uniform = "wbm_samples";
 const char *const k_xl_headroom_uniform = "wbm_headroom";
 const char *const k_xl_limit_uniform = "wbm_limit";
@@ -285,7 +286,22 @@ bool rewrite_shadows(std::string &fs, int filter, bool dynamic)
 //
 // Only tests against a positive threshold are rewritten; "alpha < 0.0" tests
 // follow a subtraction the pattern does not see, and are left alone.
-bool smooth_alpha_tests(std::string &fs)
+//
+// hash (WBM_ALPHA_HASH): with one sample a pixel, the same covered fraction is
+// kept instead by dropping the pixel against a threshold of noise that differs
+// from pixel to pixel (and, under temporal upscaling, from frame to frame), so
+// that an edge comes out dithered and the temporal scaler, which averages
+// frames, turns the dither into a smooth edge. The engine's depth pre-pass
+// takes the same rewrite and the same noise, so the two agree pixel for pixel.
+const char k_alpha_hash_function[] = R"(
+uniform float wbm_hash_frame;
+float wbm_hash()
+{
+    return fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))) + wbm_hash_frame * 0.61803399);
+}
+)";
+
+bool smooth_alpha_tests(std::string &fs, bool hash)
 {
     static const std::regex tests[] = {
         std::regex(R"(if \(\(\(([\w.]+) - (alpha_test_val|\d+\.\d+)\) < 0\.0\)\) \{\s*discard;\s*\})"),
@@ -302,6 +318,12 @@ bool smooth_alpha_tests(std::string &fs)
             pos = (size_t)(it->position() + it->length());
             if (threshold != "alpha_test_val" && atof(threshold.c_str()) <= 0) {
                 out += it->str();
+                continue;
+            }
+            if (hash) {
+                out += "{ float wbm_c = clamp((" + alpha + " - " + threshold + ") / max(fwidth(" + alpha + "), 0.00001) + 0.5, 0.0, 1.0); if (" + threshold +
+                       " > 0.0 && wbm_c <= wbm_hash()) { discard; } }";
+                changed = true;
                 continue;
             }
             out += "{ float wbm_c = clamp((" + alpha + " - " + threshold + ") / max(fwidth(" + alpha +
@@ -463,8 +485,17 @@ vec3 wbm_environment_sky(vec3 view, vec3 reflection, vec3 ground)
 // Shaders that light per vertex have the world-space normal. The normal-mapped
 // ones work in tangent space and know only which way is up there, so they get
 // the tint by elevation alone.
+//
+// That bounce is sunlight, so it has to stop where the sun does: under a gate
+// or a roof the ground around is in shadow and throws nothing up. A fragment
+// shader that has the engine's shadow map (scenery only, so a figure's own
+// shaded side still counts as standing in the sun) asks it through
+// wbm_ground_sun: see k_ground_function. It is asked only where there is bounce
+// to scale: the lookup is not cheap, and the ground itself, which faces up and
+// fills most pictures, gets none. Elsewhere the answer is 1.
 const char k_ambient_functions[] = R"(
 uniform vec4 wbm_amb[6];
+float wbm_ground_sun();
 
 vec3 wbm_amb_horizon()
 {
@@ -490,7 +521,37 @@ vec4 wbm_ambient_up(vec4 sky, vec4 ambient, float up)
     up = clamp(up, -1.0, 1.0);
     vec3 horizon = wbm_amb_horizon();
     vec3 tint = mix(horizon, up > 0.0 ? wbm_amb[4].xyz : horizon, up * up);
-    return vec4(sky.xyz + (ambient.xyz + sky.xyz) * (mix(vec3(1.0), tint, k) - 1.0) + wbm_amb[5].xyz * (0.5 - 0.5 * up), sky.w);
+    float under = 0.5 - 0.5 * up;
+    if (under > 0.12 && dot(wbm_amb[5].xyz, vec3(1.0)) > 0.003) under *= mix(1.0, wbm_ground_sun(), smoothstep(0.12, 0.25, under));
+    return vec4(sky.xyz + (ambient.xyz + sky.xyz) * (mix(vec3(1.0), tint, k) - 1.0) + wbm_amb[5].xyz * under, sky.w);
+}
+)";
+
+// How much of the ground about a point is in the sun: eight points level with
+// it and a little above, 1.5 and 3.5 metres off, looked up in the engine's
+// shadow map. The sun's matrix says what a metre east, north and up comes to
+// in the map's coordinates and depth. Outside the map counts as lit. A little
+// is always left: light comes round corners.
+const char k_ground_function[] = R"(
+const vec2 wbm_ground_ring[8] = vec2[8](
+    vec2(1.5, 0.0), vec2(-1.5, 0.0), vec2(0.0, 1.5), vec2(0.0, -1.5),
+    vec2(2.5, 2.5), vec2(-2.5, 2.5), vec2(2.5, -2.5), vec2(-2.5, -2.5));
+
+float wbm_ground_lit(sampler2D map, vec3 coord, float size, mat4 sun)
+{
+    vec3 base = coord + sun[2].xyz * 0.7;
+    float metre = length(vec3(sun[0][2], sun[1][2], sun[2][2])); // of depth
+    float lit = 0.0;
+    for (int i = 0; i < 8; i++) {
+        vec3 q = base + sun[0].xyz * wbm_ground_ring[i].x + sun[1].xyz * wbm_ground_ring[i].y;
+        bool outside = any(lessThan(q.xy, vec2(0.0))) || any(greaterThan(q.xy, vec2(1.0)));
+        if (outside) { lit += 1.0; continue; }
+        // By degrees in depth and between the map's texels, or it shows in patches.
+        vec2 at = q.xy * size - 0.5, f = fract(at);
+        vec4 s = smoothstep(-1.5 * metre, -0.2 * metre, textureGather(map, (floor(at) + 1.0) / size, 0) - q.z);
+        lit += mix(mix(s.w, s.z, f.x), mix(s.x, s.y, f.x), f.y);
+    }
+    return mix(0.15, 1.0, lit / 8.0);
 }
 )";
 
@@ -620,10 +681,10 @@ uniform vec4 wbm_wind;
 // height: for batches, the vertex colour's alpha, which the backend has made
 // the height above the plant's foot in units of 25.5 m; below 0 when the
 // shader has no vertex colour, and then a batch is left still.
-vec4 wbm_sway(vec4 p, float height)
+vec4 wbm_sway_at(vec4 p, float height, float t)
 {
     if (wbm_wind.y <= 0.0) return p;
-    float t = wbm_wind.x, metres, phase;
+    float metres, phase;
     if (wbm_wind.z < 0.5) {
         metres = p.z;
         phase = wbm_wind.w + dot(p.xyz, vec3(0.31, 0.27, 0.19));
@@ -640,6 +701,11 @@ vec4 wbm_sway(vec4 p, float height)
     return p;
 }
 
+vec4 wbm_sway(vec4 p, float height)
+{
+    return wbm_sway_at(p, height, wbm_wind.x);
+}
+
 // The vertex colour as the shader should see it: with its alpha full where
 // that alpha has been taken over for heights.
 vec4 wbm_tint(vec4 colour)
@@ -648,7 +714,17 @@ vec4 wbm_tint(vec4 colour)
 }
 )";
 
-bool add_wind(std::string &vs)
+// For temporal upscaling every pixel's place a frame ago is wanted (see
+// apply_temporal_upscale in metal_backend.mm). Depth and the two cameras give
+// it for what stands still, but not for what the wind moves. The shaders that
+// sway therefore say it themselves: the vertex shader works the vertex out a
+// second time as it was a frame ago (wbm_wind_before is that frame's time for
+// the wind, wbm_reproject takes this frame's clip space to that one's), and the
+// fragment shader writes the step between the two into a second target, with
+// its distance, in the layout the moving objects' texture has.
+const char k_motion_vertex_uniforms[] = "uniform mat4 wbm_reproject;\nuniform float wbm_wind_before;\n";
+
+bool add_wind(std::string &vs, bool motion)
 {
     // Rigid geometry only: what is skinned moves by its bones.
     if (vs.find("matWorldArray") != std::string::npos || vs.find("uniform mat4 matWorldViewProj;") == std::string::npos) return false;
@@ -660,7 +736,16 @@ bool add_wind(std::string &vs)
         vs = std::regex_replace(vs, std::regex(R"(\binColor0\b)"), "wbm_tint(inColor0)");
         vs = std::regex_replace(vs, std::regex(R"(attribute vec4 wbm_tint\(inColor0\);)"), "attribute vec4 inColor0;");
     }
-    vs = std::regex_replace(vs, project, std::string("(matWorldViewProj * wbm_sway($1, ") + (coloured ? "inColor0.w" : "-1.0") + "))");
+    std::smatch m;
+    std::regex_search(vs, m, project);
+    const std::string point = m[1], height = coloured ? "inColor0.w" : "-1.0";
+    vs = std::regex_replace(vs, project, "(matWorldViewProj * wbm_sway($1, " + height + "))");
+    size_t end = vs.rfind('}');
+    if (motion && end != std::string::npos) {
+        vs.insert(end, "  wbm_mnow = (matWorldViewProj * wbm_sway(" + point + ", " + height + "));\n  wbm_mbefore = (wbm_reproject * (matWorldViewProj * wbm_sway_at(" + point + ", " + height +
+                           ", wbm_wind_before)));\n");
+        vs.insert(0, "varying vec4 wbm_mnow;\nvarying vec4 wbm_mbefore;\n");
+    }
     return true;
 }
 
@@ -1398,8 +1483,10 @@ vec3 wbm_horse_glint(vec2 uv, vec3 view, vec3 normal, vec3 to_sun, float shadow,
     vec3 n = normalize(normalize(normal) + vec3(d * 0.7, 0.0)); // the ball bulges
     vec3 v = normalize(view), h = normalize(v + normalize(to_sun));
     float glint = pow(max(dot(n, h), 0.0), 160.0) * 2.5 * shadow;
-    float grazing = min(0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0), 0.25);
-    return inside * wbm_horse_eye.w * (glint * sun + grazing * sky * 0.7);
+    // A wet eye reflects the sky the way water does: a few hundredths head-on, more only towards its rim.
+    // A flat sheet of sky over the whole ball reads as a cataract, the dark of the eye greyed out.
+    float grazing = min(0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0), 0.12);
+    return inside * wbm_horse_eye.w * (glint * sun + grazing * sky * 0.35);
 }
 )";
 
@@ -2158,7 +2245,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool soft_shadows = shadows && shadow_filter != 0;
     // The vertex shader has the sun's matrix; the fragment shader needs it too now.
     bool needs_sun_matrix = soft_shadows && options.pcss_shadows && glsl.find("uniform mat4 matSunViewProj;") == std::string::npos;
-    bool smooth_alpha = !vertex && options.smooth_alpha_test && smooth_alpha_tests(glsl);
+    bool smooth_alpha = !vertex && (options.smooth_alpha_test || options.alpha_hash) && smooth_alpha_tests(glsl, options.alpha_hash);
     bool pbr_specular = !vertex && (options.pbr_specular || options.pbr_environment || options.pbr_sky) && use_pbr_specular(glsl);
     std::string pbr_extra;
     bool pbr_environment = pbr_specular && (options.pbr_environment || options.pbr_sky) && add_pbr_environment(glsl, options.pbr_sky, options.materials, options.debug_materials, pbr_extra);
@@ -2168,16 +2255,40 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     bool eyes = !vertex && options.eyes && add_eye_glint(glsl);
     bool fur = !vertex && options.fur && add_fur(glsl);
     bool leaf = vertex && options.foliage_backlight && add_leaf_glow(glsl); // before the wind wraps the position
-    bool wind = vertex && options.wind && add_wind(glsl);
+    bool wind = vertex && options.wind && add_wind(glsl, options.motion_vectors);
     bool shell_push = vertex && options.fur && add_shell_push(glsl);
     bool hair_strands = options.hair_strands && add_hair_strands(glsl, vertex);
     bool water = !vertex && options.water && add_water(glsl, options.pbr_sky);
     bool sky_ambient = options.sky_ambient && add_sky_ambient(glsl, vertex);
+    // The bounce off the ground only where the ground about is in the sun. The function that asks is defined after
+    // the shader's own text, where the map and the sun's matrix are declared.
+    bool ground_sun = sky_ambient && !vertex && glsl.find("uniform sampler2D shadowmap_texture;") != std::string::npos &&
+                      glsl.find("varying vec4 ShadowTexCoord;") != std::string::npos && glsl.find("uniform float fShadowMapSize;") != std::string::npos;
+    if (ground_sun && glsl.find("uniform mat4 matSunViewProj;") == std::string::npos) needs_sun_matrix = true;
     // The fragment's half only where the vertex shader of this program has supplied the eye's direction.
     bool parallax = options.parallax && (vertex ? add_parallax_vertex(glsl) : varyings.location.count("wbm_tview") && add_parallax(glsl)); // last: it takes over the texture coordinate wherever the others left it
     if (!vertex && options.torch_shadows) add_torch_fragment(glsl, varyings, options.torch_lighting); // after the rest, which look for the names it replaces
     if (!vertex && options.materials) add_surface_maps(glsl, varyings, pbr_extra.find(k_xl_pbr_sampler) != std::string::npos); // after the parallax: it reads where that looks
     bool final_pass = !vertex && (options.filmic_tonemap || options.hdr_output || options.grade) && rewrite_final_pass(glsl, options);
+    // The movement of what its vertex shader sways (see k_motion_vertex_uniforms), written first thing: a pixel dropped later takes it along.
+    bool motion_out = false;
+    if (!vertex && options.motion_vectors && varyings.location.count("wbm_mnow")) {
+        size_t body = glsl.find("void main ()");
+        if (body != std::string::npos) body = glsl.find('{', body);
+        if (body != std::string::npos) {
+            glsl.insert(body + 1, "\n  wbm_Motion = vec4(wbm_mnow.xy / wbm_mnow.w - wbm_mbefore.xy / max(wbm_mbefore.w, 1.0e-4), wbm_mnow.w, 1.0);");
+            glsl.insert(0, "varying vec4 wbm_mnow;\nvarying vec4 wbm_mbefore;\n");
+            motion_out = true;
+        }
+    }
+    // Put before main, which has to stay the last function (the lines appended to it are found by its closing
+    // brace), and after the shader's own declarations, which the lookup needs.
+    if (sky_ambient) {
+        size_t body = glsl.find("void main ()");
+        const std::string ask = ground_sun ? "float wbm_ground_sun() { return wbm_ground_lit(shadowmap_texture, ShadowTexCoord.xyz, fShadowMapSize, matSunViewProj); }\n"
+                                           : "float wbm_ground_sun() { return 1.0; }\n";
+        glsl.insert(body == std::string::npos ? 0 : body, ask);
+    }
 
     static const std::regex decl(R"(^\s*(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
     std::set<int> used_attribs;
@@ -2185,8 +2296,9 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
 
     std::ostringstream out;
     out << "#version 450\n";
-    if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\n";
+    if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\nuniform vec2 " << k_xl_jitter_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
+    if (motion_out) out << "layout(location = 1) out vec4 wbm_Motion;\n";
     if (needs_sun_matrix) out << "uniform mat4 matSunViewProj;\n";
     if (soft_shadows) out << (options.pcss_shadows ? k_pcss_shadow_function : k_soft_shadow_function);
     if (shadows && options.dynamic_shadows)
@@ -2203,6 +2315,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (hair_strands) out << "uniform vec4 wbm_shell;\n" << (vertex ? "vec4 wbm_colour;\nvec2 wbm_uv;\nuniform vec4 wbm_drift;\n" : "");
     if (leaf) out << k_leaf_function;
     if (wind) out << k_wind_function;
+    if (wind && options.motion_vectors) out << k_motion_vertex_uniforms;
     if (shell_push) out << "uniform vec4 wbm_shell;\n";
     if (shell_push && glsl.find("wbm_colour = ") != std::string::npos) out << "vec4 wbm_colour;\nuniform vec4 wbm_drift;\n";
     if (skin && vertex) out << k_skin_vertex_function;
@@ -2217,10 +2330,12 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
         out << f;
     }
     if (sky_ambient) out << k_ambient_functions;
+    if (ground_sun) out << k_ground_function;
     if (final_pass) out << k_tonemap_functions;
     if (final_pass && options.hdr_output) out << "uniform float " << k_xl_headroom_uniform << ";\n";
     if (!vertex && !final_pass && options.hdr_output) out << "uniform float " << k_xl_limit_uniform << ";\n";
-    if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
+    if (smooth_alpha && options.alpha_hash) out << k_alpha_hash_function;
+    else if (smooth_alpha) out << "uniform float " << k_xl_samples_uniform << ";\nint wbm_cover = -1;\n";
 
     std::istringstream in(glsl);
     std::string line;
@@ -2261,12 +2376,14 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     s = replace_word(s, "texture2DProj", "textureProj");
     s = replace_word(s, "texture2D", "texture");
     if (vertex) {
-        // Appended to main, the last function the optimiser emits: the Y flip, and
-        // the change from OpenGL's clip-space depth (-w..w) to Metal's (0..w),
-        // reversed if asked. SPIRV-Cross's own depth fix-up is turned off.
+        // Appended to main, the last function the optimiser emits: the Y flip, the
+        // frame's shift of a fraction of a pixel (zero but for the scene under
+        // temporal upscaling, see k_xl_jitter_uniform), and the change from
+        // OpenGL's clip-space depth (-w..w) to Metal's (0..w), reversed if asked.
+        // SPIRV-Cross's own depth fix-up is turned off.
         size_t end = s.rfind('}');
         if (end != std::string::npos)
-            s.insert(end, std::string("  gl_Position.y *= ") + k_xl_yflip_uniform + ";\n  gl_Position.z = (" +
+            s.insert(end, std::string("  gl_Position.y *= ") + k_xl_yflip_uniform + ";\n  gl_Position.xy += " + k_xl_jitter_uniform + " * gl_Position.w;\n  gl_Position.z = (" +
                               (options.reverse_depth ? "gl_Position.w - gl_Position.z" : "gl_Position.z + gl_Position.w") +
                               ") * 0.5;\n");
     } else {
