@@ -167,7 +167,13 @@ id<MTLSamplerState> sampler_for(Texture &t)
         d.lodMaxClamp = top;
         d.maxAnisotropy = min_linear ? aniso : 1;
         if (s_lod_bias != 0) {
-            if (@available(macOS 26.0, *)) d.lodBias = s_lod_bias;
+            if (@available(macOS 26.0, *)) {
+#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_26_0
+                d.lodBias = s_lod_bias;
+#else
+                [d setValue:@(s_lod_bias) forKey:@"lodBias"]; // built with an older SDK (as CI's): the property is there at run time
+#endif
+            }
         }
         cached = [s_device newSamplerStateWithDescriptor:d];
     }
