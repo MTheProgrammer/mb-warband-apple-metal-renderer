@@ -1,0 +1,49 @@
+# clang-tidy for `make lint` (scripts/check.sh lint). Each check left out says why; the counts are
+# from the first run over master (2026-10-19), where they were all noise.
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  misc-*,
+  clang-analyzer-*,
+  readability-function-size,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -bugprone-unchecked-string-to-number-conversion,
+  -bugprone-narrowing-conversions,
+  -bugprone-suspicious-string-compare,
+  -bugprone-suspicious-memory-comparison,
+  -bugprone-throwing-static-initialization,
+  -bugprone-exception-escape,
+  -bugprone-switch-missing-default-case,
+  -performance-no-int-to-ptr,
+  -performance-enum-size,
+  -performance-inefficient-string-concatenation,
+  -misc-const-correctness,
+  -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
+  -misc-use-anonymous-namespace,
+  -misc-use-internal-linkage,
+  -misc-no-recursion,
+  -clang-analyzer-optin.osx.cocoa.localizability.NonLocalizedStringChecker
+# easily-swappable-parameters: graphics calls take runs of floats and ints by nature.
+# signed-bitwise (159): GL's enums and flags are signed ints.
+# unchecked-string-to-number-conversion (127): atoi/atof on WBM_ variables, where 0 for nonsense is meant.
+# narrowing-conversions (70): float and int conversions in pixel and vertex arithmetic, on purpose.
+# suspicious-string-compare (39): the `!strcmp(a, b)` idiom.
+# suspicious-memory-comparison (31): memcmp of float arrays to see whether a uniform changed; exact bits are what count.
+# throwing-static-initialization, exception-escape: the code uses no exceptions; running out of memory ends the game either way.
+# switch-missing-default-case: bugprone-unhandled-code-paths reports the same switches.
+# no-int-to-ptr (33): GL passes buffer offsets as pointers.
+# enum-size: a few bytes per enum do not matter here.
+# inefficient-string-concatenation (26): shader sources are built once and cached.
+# const-correctness (1132): style only.
+# non-private-member-variables-in-classes: the state is kept in plain structs on purpose.
+# include-cleaner: include-what-you-use does this job, once the backend is split into compiled files.
+# use-anonymous-namespace, use-internal-linkage: the exported GL and SDL functions must stay visible.
+# no-recursion: the JSON reader and the shader walker are recursive by design.
+# NonLocalizedStringChecker: the launcher is in English only.
+HeaderFilterRegex: '(src|tools|launcher)/'
+CheckOptions:
+  readability-function-size.LineThreshold: 150
+  readability-function-size.BranchThreshold: 60

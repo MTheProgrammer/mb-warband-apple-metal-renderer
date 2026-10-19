@@ -98,6 +98,15 @@ build/gltf_import: tools/gltf_import.cpp src/brf.cpp src/brf.h
 build:
 	mkdir -p build
 
+# Static analysis (scripts/check.sh; needs brew install llvm cppcheck, pipx install lizard):
+# analyze: the Clang Static Analyzer; lint: clang-tidy (.clang-tidy); cppcheck: the plain C++ files;
+# metrics: functions over 150 lines or 30 paths; compile_commands.json for clang-tidy and editors.
+analyze lint cppcheck metrics:
+	scripts/check.sh $@
+
+compile_commands.json:
+	scripts/check.sh compile-db
+
 clean:
 	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/gltf_export build/gltf_import build/launcher build/*.zip
 	rm -rf "$(APP)"
@@ -105,4 +114,4 @@ clean:
 distclean:
 	rm -rf build
 
-.PHONY: all app dist clean distclean
+.PHONY: all app dist clean distclean analyze lint cppcheck metrics compile_commands.json
