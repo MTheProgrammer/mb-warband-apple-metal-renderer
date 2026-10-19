@@ -385,8 +385,8 @@ float s_dyn_range = 60.0f;     // WBM_DYN_RANGE: half the width of the window, i
 float s_dyn_bias_m = 0.05f;    // WBM_DYN_BIAS: metres
 // WBM_DYN_FOLIAGE: metres from the camera beyond which cut-out things without bones (leaves, bushes, grass
 // tufts, fences) cast no shadow in the per-frame map. In a forest they are most of what it draws, two windows
-// over; past this the engine's own, coarser map shades them as it always did. 0: all of them, at any distance.
-float s_dyn_foliage_range = 30.0f;
+// over; past this the engine's own, coarser map shades them as it always did. 0 (the default): all of them, at any distance.
+float s_dyn_foliage_range = 0.0f;
 float s_dyn_near_range = 12.0f; // WBM_DYN_NEAR: half the width of the fine window around the camera, in metres; 0 for none
 float s_dyn_near[4];           // the fine window, as the shaders' wbm_dyn_near
 float s_sun_matrix[16];        // matSunViewProj as last set for the scene
