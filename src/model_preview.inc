@@ -80,7 +80,8 @@ void preview_read_library()
     pv.root = game_folder();
     pv.library.scan(pv.root + "/CommonRes");
     // The module asked for (WBM_MODULE, as scripts/run.sh takes it), or else the one the game last played.
-    std::string module = getenv("WBM_MODULE") ? getenv("WBM_MODULE") : "";
+    const char *module_env = getenv("WBM_MODULE");
+    std::string module = module_env ? module_env : "";
     if (const char *home = getenv("HOME"); home && module.empty()) {
         if (FILE *f = fopen((std::string(home) + "/Library/Application Support/MBWarband/last_module_warband").c_str(), "r")) {
             char text[512];
@@ -379,7 +380,7 @@ bool preview_load(const std::string &mesh_name, int lod)
         pv.m.parts.clear();
         pv.active = false;
         pv.m.most_bones = 0;
-        std::string base = lower_case(mesh_name), suffix = lod > 0 ? ".lod" + std::to_string(lod) : std::string();
+        std::string base = lower_case(mesh_name);
         float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
         // The model and its further parts (name.1 ... and name.lod1.1 ...; some models are parts only).
         bool any = false;

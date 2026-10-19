@@ -151,7 +151,10 @@ bool read_dds(const std::string &path, LoadedImage *img)
     std::vector<uint8_t> file;
     uint8_t buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) file.insert(file.end(), buf, buf + n);
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        file.insert(file.end(), buf, buf + n);
+        if (n < sizeof buf) break; // the end, or an error: either way there is no more
+    }
     fclose(f);
     if (file.size() < 128 || memcmp(file.data(), "DDS ", 4)) return false;
     uint32_t h, w, mips, pf_flags, fourcc, bits, rmask;
