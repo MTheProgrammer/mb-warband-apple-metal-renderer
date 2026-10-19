@@ -1129,6 +1129,10 @@ int mip_count(int w, int h)
 // format, recreating it when the game respecifies it differently.
 bool ensure_storage(Texture &t, const FormatInfo &f, int level, int w, int h)
 {
+    if (level < 0 || level > 15) { // GL_INVALID_VALUE; shifting by it would be undefined
+        complain("mip level %d is out of range", level);
+        return false;
+    }
     if (t.mtl && t.format == f.format && level < (int)t.mtl.mipmapLevelCount &&
         std::max(1, (int)t.mtl.width >> level) == w && std::max(1, (int)t.mtl.height >> level) == h)
         return true;
@@ -6306,7 +6310,7 @@ void mtl_glAttachShader(GLuint program, GLuint shader)
 void mtl_glBindAttribLocation(GLuint program, GLuint index, const GLchar *name)
 {
     REC(FN_glBindAttribLocation).i(program).i(index).s(name ? name : "");
-    if (Program *p = find(s_programs, program)) p->attribs[name] = (int)index;
+    if (Program *p = find(s_programs, program); p && name) p->attribs[name] = (int)index;
 }
 
 void mtl_glLinkProgram(GLuint program)

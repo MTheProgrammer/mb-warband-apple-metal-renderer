@@ -615,7 +615,7 @@ static uint16_t pack565(const float *c)
 
 static void unpack565(uint16_t v, float *c)
 {
-    c[0] = (float)((v >> 11) * 255 / 31), c[1] = (float)(((v >> 5) & 63) * 255 / 63), c[2] = (float)((v & 31) * 255 / 31);
+    c[0] = (float)((v >> 11) * 255.0 / 31.0), c[1] = (float)(((v >> 5) & 63) * 255.0 / 63.0), c[2] = (float)((v & 31) * 255.0 / 31.0); // not rounded down
 }
 
 // Which blend each pixel takes, and how far off the block is in all.

@@ -30,7 +30,8 @@ std::string cache_dir()
     static std::string dir = [] {
         const char *env = getenv("WBM_CACHE");
         if (env && !strcmp(env, "0")) return std::string();
-        std::string d = env && *env ? env : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/Library/Caches/warband-metal";
+        const char *home = getenv("HOME");
+        std::string d = env && *env ? env : std::string(home ? home : "/tmp") + "/Library/Caches/warband-metal";
         d += "/shaders";
         for (size_t i = 1; i <= d.size(); i++)
             if (i == d.size() || d[i] == '/') mkdir(d.substr(0, i).c_str(), 0755);
@@ -126,7 +127,10 @@ bool load(const std::string &path, XlProgram &p)
     if (!f) return false;
     std::string data;
     char buf[65536];
-    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) data.append(buf, n);
+    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) {
+        data.append(buf, n);
+        if (n < sizeof buf) break; // the end, or an error: either way there is no more
+    }
     fclose(f);
     Reader r{data};
     if (r.u32() != k_magic || r.str() != k_version) return false;
