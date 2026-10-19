@@ -1,3 +1,6 @@
+// OpenGL calls: draws.
+// Included by metal_backend.mm, after its anonymous namespace.
+
 // ---- draws -----------------------------------------------------------------------------------------------------------
 
 void mtl_glDrawArrays(GLenum mode, GLint first, GLsizei count)

@@ -1,3 +1,6 @@
+// Motion blur, and the movement of the scene for it and for temporal upscaling.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- motion blur ------------------------------------------------------------------------
 //
 // Blur from the camera's own movement. A pixel's depth gives its place in the

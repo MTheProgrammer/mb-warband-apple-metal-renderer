@@ -1,3 +1,6 @@
+// Drawing the shadow maps: the per-frame map and the torches'.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 id<MTLRenderPipelineState> caster_pipeline(const PipelineKey &key, bool skinned, bool cutout, bool hair = false, int strand = 0)
 {
     auto &cache = s_caster_pipelines[strand ? 4 + strand : hair ? 4 : skinned * 2 + cutout];

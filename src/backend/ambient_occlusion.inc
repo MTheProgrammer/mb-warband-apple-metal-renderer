@@ -1,3 +1,6 @@
+// Ambient occlusion, contact shadows, light shafts and bounce light.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- ambient occlusion ---------------------------------------------------------------
 
 // Three full-screen passes written directly in Metal's shading language.

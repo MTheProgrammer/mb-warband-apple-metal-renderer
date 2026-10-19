@@ -1,3 +1,6 @@
+// OpenGL calls: framebuffers, shaders and programs.
+// Included by metal_backend.mm, after its anonymous namespace.
+
 // ---- framebuffers ---------------------------------------------------------------------------------------------
 
 void mtl_glGenFramebuffers(GLsizei n, GLuint *framebuffers) { gen_ids(s_next_framebuffer, n, framebuffers); REC(FN_glGenFramebuffers).i(n).i(n > 0 ? framebuffers[0] : 0); }

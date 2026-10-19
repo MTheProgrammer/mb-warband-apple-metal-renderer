@@ -162,7 +162,7 @@ extern const char *const k_xl_yflip_uniform;
 // And wbm_jitter, added to clip-space x and y (times w) after the flip: zero
 // but while the scene is drawn for temporal upscaling, when it shifts the whole
 // picture by a different fraction of a pixel each frame (see apply_temporal_upscale
-// in metal_backend.mm).
+// in src/backend/upscale.inc).
 extern const char *const k_xl_jitter_uniform;
 
 // With smooth_alpha_test, fragment shaders that test alpha get a uniform,

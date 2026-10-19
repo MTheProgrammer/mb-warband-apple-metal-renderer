@@ -1,3 +1,6 @@
+// Foliage weights for wind, the eyes' gaze and the frame-rate limit.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // Foliage that the engine hands over in batches, many plants in one buffer and
 // already placed in the world, carries nothing that says how high above its
 // own foot a vertex is, which is what the wind needs. It is worked out here,

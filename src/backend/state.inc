@@ -1,3 +1,6 @@
+// The library's objects (textures, buffers, programs, pipelines) and the device and frame state.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 enum {
     MAX_ATTRIBS = 16,
     MAX_UNITS = 32,

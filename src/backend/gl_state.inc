@@ -1,3 +1,6 @@
+// The OpenGL state the game sets, and the index of the game's textures by content.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- OpenGL state ----------------------------------------------------------------
 
 std::unordered_map<GLuint, Buffer> s_buffers;

@@ -715,7 +715,7 @@ vec4 wbm_tint(vec4 colour)
 )";
 
 // For temporal upscaling every pixel's place a frame ago is wanted (see
-// apply_temporal_upscale in metal_backend.mm). Depth and the two cameras give
+// apply_temporal_upscale in src/backend/upscale.inc). Depth and the two cameras give
 // it for what stands still, but not for what the wind moves. The shaders that
 // sway therefore say it themselves: the vertex shader works the vertex out a
 // second time as it was a frame ago (wbm_wind_before is that frame's time for

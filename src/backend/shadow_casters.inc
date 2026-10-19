@@ -1,3 +1,6 @@
+// The per-frame shadow map: what casts, and the casters' and torches' shaders.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- the per-frame shadow map -------------------------------------------------------------
 //
 // Before its main pass the engine draws every visible object once into a depth

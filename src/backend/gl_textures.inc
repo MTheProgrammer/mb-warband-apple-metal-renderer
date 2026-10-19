@@ -1,3 +1,6 @@
+// OpenGL calls: textures.
+// Included by metal_backend.mm, after its anonymous namespace.
+
 // ---- textures ------------------------------------------------------------------------------------------------
 
 void mtl_glGenTextures(GLsizei n, GLuint *textures) { gen_ids(s_next_texture, n, textures); REC(FN_glGenTextures).i(n).i(n > 0 ? textures[0] : 0); }

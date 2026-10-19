@@ -1,3 +1,6 @@
+// OpenGL calls: clears, viewport, fixed-function state, queries, buffers and vertex arrays.
+// Included by metal_backend.mm, after its anonymous namespace.
+
 // ---- clears, viewport, fixed-function state ------------------------------------------------------
 
 // A clear starts a new render pass whose load actions do the clearing; the

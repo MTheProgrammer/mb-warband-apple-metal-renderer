@@ -1,3 +1,6 @@
+// FXAA, MetalFX upscaling (spatial and temporal) and sharpening.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- anti-aliasing after the fact ---------------------------------------------------------
 //
 // FXAA (Lottes): where neighbouring pixels differ enough in brightness to be

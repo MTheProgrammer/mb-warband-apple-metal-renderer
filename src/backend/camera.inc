@@ -1,3 +1,6 @@
+// The scene camera, worked out from the draws' matrices.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- the scene camera ------------------------------------------------------------------
 
 // Column-major 4x4 matrices, as OpenGL passes them: element (row r, column c) is m[c * 4 + r].

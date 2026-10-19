@@ -1,3 +1,6 @@
+// The sky atlas, the room probe and the sky's ambient light.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- the sky atlas ------------------------------------------------------------------------
 
 // Redraws the draw that was just issued, the engine's sky dome, six more times:

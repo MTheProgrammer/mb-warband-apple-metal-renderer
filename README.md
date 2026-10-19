@@ -170,7 +170,7 @@ The game's models can be taken out, worked on and put back. Nothing here touches
 - 22 are imported from OpenGL.framework and replaced through a dyld interpose table, as are 7 SDL window and context functions.
 - 40 are called through pointer variables exported by the game's bundled GLEW. The shim interposes `glewInit` and swaps those pointers after GLEW has filled them in.
 
-In Metal mode the window is created without an OpenGL surface and gets a `CAMetalLayer`; the game receives a placeholder context, and the 62 functions are routed to `src/metal_backend.mm`.
+In Metal mode the window is created without an OpenGL surface and gets a `CAMetalLayer`; the game receives a placeholder context, and the 62 functions are routed to `src/metal_backend.mm`, whose parts are in `src/backend/` by area (passes, textures, pipelines, ambient occlusion, motion blur, upscaling, shadows, strands, draws, the OpenGL calls).
 
 Shaders are translated when a program is linked (`src/shader_xlate.cpp`), and the result is cached on disk (`src/shader_cache.cpp`), so later launches skip the translation. Metal then compiles the translated source in the background; a program waits for that only if it draws before its shaders are ready. The translation itself: the engine's GLSL 1.20 is rewritten to GLSL 4.50, compiled to SPIR-V by glslang and turned into Metal Shading Language by SPIRV-Cross. `make build/xlate_test && build/xlate_test traces/latest` runs that translation over every program a trace recorded and compiles the results with Metal.
 

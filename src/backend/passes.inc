@@ -1,3 +1,6 @@
+// Command buffers, render targets and passes; uniform storage.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 // ---- command buffer and passes -----------------------------------------------------
 
 // The time the GPU spends on each command buffer, added up (for the summary: how heavy a frame is for the

@@ -1,3 +1,6 @@
+// Frame capture and playback, and the previewer's calls.
+// Included by metal_backend.mm, after its anonymous namespace.
+
 // ---- frame capture and playback (see frame_capture.inc) -------------------------------------------
 
 void mtl_request_capture() { s_capture_requested = 1; }

@@ -1,3 +1,6 @@
+// The movement of objects that move by themselves.
+// Included by metal_backend.mm, inside its anonymous namespace.
+
 id<MTLRenderPipelineState> velocity_pipeline(const PipelineKey &key, bool skinned)
 {
     auto &cache = s_velocity_pipelines[skinned];
