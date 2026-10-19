@@ -1225,6 +1225,11 @@ uniform sampler2D wbm_fur_map;  // blue: how much of the surface is coat (a text
 uniform sampler2D wbm_hair_map; // a texture's _hair map: red and green the way the hair is combed, in the picture; blue 1 long hair, about 0.5 coat, 0 none
 uniform vec4 wbm_fur;       // x: strength of the coat, 0 without a map; y: metres per unit of shadow-map depth, or 0; z: light through thin parts; w: how much of the texture a metre of the surface covers, negated without a hair map
 uniform vec4 wbm_hair_colour; // the long hair's own colour; w 0 when it is not known
+// The coat lit as glTF's KHR_materials_anisotropy and KHR_materials_sheen have it, where the texture pack
+// gives a horse a hair map made from an anisotropy map, a sheen map and a _pbr map (texture_tool import).
+// x: 1 when it has all three; y: the anisotropy strength (times the hair map's blue); z: the sheen's strength.
+uniform vec4 wbm_sheen;
+uniform sampler2D wbm_sheen_map; // colour (sRGB) and, in alpha, the sheen's roughness
 float wbm_hair_cover = 1.0; // of the pixel, by this layer's hair (wbm_shell_cover)
 vec3 wbm_hair_shine = vec3(0.0); // what long hair reflects and lets through, per unit of sunlight; added to the finished colour
 uniform vec4 wbm_horse_eye; // xy: the eye's place in the texture; z: its size there; w: strength, 0 for none
@@ -1259,12 +1264,60 @@ vec3 wbm_combed(vec2 uv)
     return vec3(d.x, -d.y, 0.0); // the picture's rows run downwards
 }
 
+// The glTF way (wbm_sheen.x): what the surface sends back of the sun over and above its diffuse light, per
+// unit of sunlight, untinted by the base colour. A microfacet highlight (GGX, height-correlated Smith), its
+// roughness from the _pbr map, stretched along the hair as KHR_materials_anisotropy stretches it
+// (alpha along = mix(alpha, 1, strength^2)), Fresnel from the metalness; and KHR_materials_sheen's
+// sheen: the "Charlie" distribution and Neubelt's visibility, in the sheen map's colour and roughness.
+// Everything here is in the space the shader lights in, with x along the texture and y up it.
+vec3 wbm_gltf_shine(vec3 view, vec3 normal, vec3 to_sun, vec2 uv)
+{
+    vec3 n = normalize(normal), v = normalize(view), l = normalize(to_sun), h = normalize(v + l);
+    float nl = clamp(dot(n, l), 0.0, 1.0), nv = clamp(dot(n, v), 1e-3, 1.0), nh = clamp(dot(n, h), 0.0, 1.0);
+    if (nl <= 0.0) return vec3(0.0);
+    vec4 maps = texture2D(wbm_fur_map, uv);
+    float metal = maps.x, rough = max(maps.y, 0.08), alpha = rough * rough;
+    vec4 flow = texture2D(wbm_hair_map, uv);
+    vec2 d = flow.xy * 2.0 - 1.0;
+    vec3 t = vec3(d.x, -d.y, 0.0); // the picture's rows run downwards
+    t -= n * dot(n, t);
+    float strength = dot(t, t) > 1e-4 ? flow.z * wbm_sheen.y : 0.0;
+    t = strength > 0.0 ? normalize(t) : normalize(abs(n.x) < 0.9 ? cross(n, vec3(1.0, 0.0, 0.0)) : cross(n, vec3(0.0, 1.0, 0.0)));
+    vec3 b = cross(n, t);
+    float at = mix(alpha, 1.0, strength * strength), ab = alpha;
+    float th = dot(t, h), bh = dot(b, h), tv = dot(t, v), bv = dot(b, v), tl = dot(t, l), bl = dot(b, l);
+    float f = th * th / (at * at) + bh * bh / (ab * ab) + nh * nh;
+    float D = 1.0 / (3.14159265 * at * ab * f * f);
+    float V = 0.5 / (nl * length(vec3(at * tv, ab * bv, nv)) + nv * length(vec3(at * tl, ab * bl, nl)));
+    vec3 f0 = mix(vec3(0.04), vec3(0.6), metal);
+    vec3 F = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(v, h), 0.0, 1.0), 5.0);
+    vec3 shine = D * V * F * nl;
+    // The sheen.
+    vec4 s = texture2D(wbm_sheen_map, uv);
+    vec3 colour = pow(max(s.xyz, vec3(0.0)), vec3(2.2)) * wbm_sheen.z;
+    if (max(colour.x, max(colour.y, colour.z)) > 0.0) {
+        float r = max(s.w * s.w, 0.07), sin_h = sqrt(max(1.0 - nh * nh, 0.0));
+        float charlie = (2.0 + 1.0 / r) * pow(sin_h, 1.0 / r) / (2.0 * 3.14159265);
+        float neubelt = 1.0 / (4.0 * (nl + nv - nl * nv));
+        shine += colour * charlie * neubelt * nl;
+    }
+    return shine;
+}
+
 // facing: the cosine of the sun's angle to the surface; highlight: the engine's
 // own; depth: how far behind the sunward surface this point is
 // (wbm_dyn_thickness), below 0 when unknown.
 vec4 wbm_fur_lit(float facing, vec4 highlight, vec3 view, vec3 normal, vec3 to_sun, vec2 uv, float depth)
 {
     vec4 plain = vec4(clamp(facing, 0.0, 1.0)) + highlight;
+    if (wbm_sheen.x > 0.5 && wbm_shell.x >= 0.0 && wbm_shell.y <= 0.0) {
+        // The glTF way, on the surface itself (layers of fur and strands keep the hair's own way, below): the
+        // diffuse light alone goes through the base colour; the highlight and the sheen are added to the
+        // finished colour (wbm_hair_shine), as light reflected off the hair, not through it. The engine's own
+        // highlight and the fur's stand-ins for these (rim, strands) are left out.
+        wbm_hair_shine = wbm_gltf_shine(view, normal, to_sun, uv);
+        return vec4(clamp(facing, 0.0, 1.0), clamp(facing, 0.0, 1.0), clamp(facing, 0.0, 1.0), plain.w);
+    }
     vec2 grows = wbm_grows(uv);
     float fur = grows.x * wbm_fur.x;
     if (fur <= 0.0) return plain;

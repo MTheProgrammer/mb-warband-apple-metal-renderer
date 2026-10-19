@@ -188,6 +188,9 @@ GLuint preview_texture(const std::string &texture_name)
                 if (map != s_pack_files.end() && load_replacement(pbr, map->second, true)) t.pbr = pbr.mtl;
                 map = s_pack_files.find(name + "_depth");
                 if (map != s_pack_files.end() && load_replacement(depth, map->second, true)) t.depth = depth.mtl;
+                Texture sheen;
+                map = s_pack_files.find(name + "_sheen");
+                if (map != s_pack_files.end() && load_replacement(sheen, map->second, true)) t.sheen = sheen.mtl;
                 map = s_pack_files.find(name + "_hair");
                 if (map != s_pack_files.end() && load_replacement(hair, map->second, true)) {
                     t.hair = hair.mtl;

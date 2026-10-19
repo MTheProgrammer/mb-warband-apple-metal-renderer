@@ -320,6 +320,7 @@ void attach_pbr_map(Texture &t, const KnownTexture &known)
     t.pbr = nil;
     t.depth = nil;
     t.hair = nil;
+    t.sheen = nil;
     t.hair_colour[3] = 0;
     if (s_pack_files.empty()) return;
     std::string name = s_texture_names[known.name];
@@ -333,6 +334,12 @@ void attach_pbr_map(Texture &t, const KnownTexture &known)
             t.hair = map.mtl;
             read_hair_colour(hair->second, t.hair_colour);
         }
+        else s_pack_stats.failed++;
+    }
+    auto sheen = s_pack_files.find(name + "_sheen"); // glTF's sheen: colour, roughness in alpha
+    if (sheen != s_pack_files.end()) {
+        Texture map;
+        if (load_replacement(map, sheen->second, known.flipped)) t.sheen = map.mtl;
         else s_pack_stats.failed++;
     }
     auto depth = s_pack_files.find(name + "_depth"); // the surface's heights, white the highest: for parallax
