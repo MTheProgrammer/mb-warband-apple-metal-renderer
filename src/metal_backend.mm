@@ -7,6 +7,8 @@
 #include "brf.h"
 #include "material_names.h"
 #include "shader_xlate.h"
+#include "backend/shared.h"
+#include "backend/upscale.h"
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
@@ -35,7 +37,9 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
+// The backend's own names; hidden from the game, like everything the library
+// does not export (-fvisibility=hidden). The parts in src/backend/*.mm share it.
+namespace wbm __attribute__((visibility("hidden"))) {
 
 #include "backend/state.inc"
 
@@ -53,7 +57,11 @@ namespace {
 
 #include "backend/motion_blur.inc"
 
-#include "backend/upscale.inc"
+void note_upscaled(id<MTLTexture> scene, id<MTLTexture> upscaled)
+{
+    for (auto &entry : s_textures)
+        if (entry.second.mtl == scene) entry.second.upscaled = upscaled, entry.second.upscaled_frame = s_frame_serial;
+}
 
 #include "backend/scene_extras.inc"
 
@@ -146,7 +154,9 @@ void save_capture(id<MTLTexture> copy, uint32_t frame, const char *name = "frame
 #include "frame_capture.inc"
 #include "model_preview.inc"
 
-} // namespace
+} // namespace wbm
+
+using namespace wbm;
 
 // ---- window and frame ------------------------------------------------------------------------
 

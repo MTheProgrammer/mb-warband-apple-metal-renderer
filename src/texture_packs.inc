@@ -1,5 +1,5 @@
-// Replacement textures. Included by metal_backend.mm, inside its anonymous
-// namespace.
+// Replacement textures. Included by metal_backend.mm, inside namespace
+// wbm.
 //
 // A texture pack is a folder of image files named after the game's own texture
 // files: helmets_new_a.png, or .dds, stands in for the game's

@@ -1,5 +1,5 @@
 // OpenGL calls: framebuffers, shaders and programs.
-// Included by metal_backend.mm, after its anonymous namespace.
+// Included by metal_backend.mm, after namespace wbm.
 
 // ---- framebuffers ---------------------------------------------------------------------------------------------
 

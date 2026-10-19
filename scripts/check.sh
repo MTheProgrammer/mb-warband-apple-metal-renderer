@@ -17,7 +17,7 @@ LIB="-arch x86_64 -std=c++17 -O0 -Wall -Wextra -Wno-deprecated-declarations -mma
 flags_for()
 {
     case $1 in
-        src/*.mm) echo "$LIB -fobjc-arc" ;;
+        src/*.mm|src/backend/*.mm) echo "$LIB -fobjc-arc" ;;
         src/*.cpp) echo "$LIB" ;;
         tools/replay.mm|tools/xlate_test.mm) echo "$LIB -fobjc-arc -Isrc" ;;
         tools/*.mm) echo "-std=c++17 -mmacosx-version-min=11.0 -fobjc-arc" ;;
@@ -26,7 +26,7 @@ flags_for()
     esac
 }
 compiler_for() { case $1 in *.m) echo clang ;; *) echo clang++ ;; esac; }
-all_files() { ls src/*.cpp src/*.mm tools/*.cpp tools/*.mm launcher/*.m; }
+all_files() { ls src/*.cpp src/*.mm src/backend/*.mm tools/*.cpp tools/*.mm launcher/*.m; }
 files=${*:-$(all_files)}
 
 case $what in

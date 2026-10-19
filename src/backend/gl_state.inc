@@ -1,5 +1,5 @@
 // The OpenGL state the game sets, and the index of the game's textures by content.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- OpenGL state ----------------------------------------------------------------
 
@@ -49,15 +49,7 @@ struct {
     uint64_t made, skipped, uniform_copies, uniform_reuses;
 } s_call_stats;
 
-// The pass most recently rendered into, remembered after it has ended so that
-// work can be appended to its target (see apply_ambient_occlusion).
-struct LastPass {
-    id<MTLTexture> color, ms_color, depth;
-    bool scene = false;
-    int samples = 1, draws = 0;
-    uint64_t occluded_in_frame = 0;
-};
-LastPass s_last;
+LastPass s_last; // the pass most recently rendered into (see shared.h)
 
 // Extended-range output (WBM_HDR=1). The drawable is 16-bit float in extended
 // sRGB, so the game's gamma-encoded colours mean what they did, and values
@@ -88,19 +80,7 @@ float s_lod_bias; // WBM_LOD_BIAS: negative values pick sharper mip levels (macO
 bool s_ao;
 float s_ao_radius = 0.6f, s_ao_strength = 0.5f; // metres; WBM_AO_RADIUS, WBM_AO_STRENGTH
 bool s_ao_full; // WBM_AO_FULL: compute at the depth buffer's full resolution instead of half
-// The scene camera, worked out afresh each frame from the matrices of a draw
-// into the scene buffer (see observe_camera). clip z = a * w + b; p00 and p11
-// are the projection's x and y scales; view holds the camera's axes in world
-// space, the third being the direction of increasing w.
-struct Camera {
-    double a = 0, b = 0, p00 = 1, p11 = 1, view[3][3] = {};
-    double forward_sign = 1; // +1 when the shaders' view space has its third axis pointing forwards, -1 when back
-    uint64_t projection_frame = 0, view_frame = 0;
-    // World space to clip space, for this frame and the one before (motion blur).
-    double view_proj[16] = {}, last_view_proj[16] = {};
-    uint64_t view_proj_frame = 0, last_view_proj_frame = 0;
-};
-Camera s_camera;
+Camera s_camera; // the scene camera (see shared.h)
 bool s_pass_scene, s_pass_prepass, s_pass_shadow_map;
 uint64_t s_prepass_frame = ~0ull; // the frame in which the engine last drew its depth pre-pass: what follows it in the scene's buffer is a scene, however few its draws (a small room)
 
@@ -434,10 +414,6 @@ bool s_previewing; // the frame player is showing a model (model_preview.inc)
 bool s_preview_keeps_scene;
 bool s_preview_in_scene; // the model has been drawn into the scene buffer this frame: what follows may be post-processed
 bool s_fxaa;
-void apply_fxaa();
-id<MTLTexture> apply_upscale() API_AVAILABLE(macos(13.0));
-id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0));
-void apply_sharpen(id<MTLTexture> picture);
 // Frame-rate limits (WBM_MAX_FPS, and WBM_MENU_FPS for frames without a 3D scene); 0 for none.
 double s_max_fps, s_menu_fps;
 

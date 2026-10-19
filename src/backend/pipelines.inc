@@ -1,5 +1,5 @@
 // Programs (linking, uniforms) and pipeline and depth states.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- programs -----------------------------------------------------------------------------
 

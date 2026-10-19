@@ -1,5 +1,5 @@
 // The sky atlas, the room probe and the sky's ambient light.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- the sky atlas ------------------------------------------------------------------------
 

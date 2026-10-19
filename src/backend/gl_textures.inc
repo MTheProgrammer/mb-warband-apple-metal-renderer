@@ -1,5 +1,5 @@
 // OpenGL calls: textures.
-// Included by metal_backend.mm, after its anonymous namespace.
+// Included by metal_backend.mm, after namespace wbm.
 
 // ---- textures ------------------------------------------------------------------------------------------------
 

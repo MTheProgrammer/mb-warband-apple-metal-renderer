@@ -11,12 +11,14 @@ CXXFLAGS := -arch x86_64 -std=c++17 -O2 -g -Wall -Wextra -Wno-deprecated-declara
 FRAMEWORKS := -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
               -framework Metal -framework QuartzCore -framework AppKit -weak_framework MetalFX
 
-HDRS := $(wildcard src/*.h) $(wildcard src/*.inc) $(wildcard src/backend/*.inc) src/gl_api.def
+HDRS := $(wildcard src/*.h) $(wildcard src/*.inc) $(wildcard src/backend/*.h) $(wildcard src/backend/*.inc) src/gl_api.def
 DEPS := build/deps/libdeps.a
 INCLUDES := -Ithird_party/glew-2.1.0/include/GL -Ithird_party/SDL/include \
             -Ithird_party/glslang -Ithird_party/SPIRV-Cross -Ibuild/deps/include
+# The backend's separately compiled parts (see src/backend/shared.h).
+BACKEND_OBJS := $(patsubst src/backend/%.mm,build/backend/%.o,$(wildcard src/backend/*.mm))
 OBJS := $(patsubst src/%.cpp,build/%.o,$(wildcard src/*.cpp)) \
-        $(patsubst src/%.mm,build/%.o,$(wildcard src/*.mm))
+        $(patsubst src/%.mm,build/%.o,$(wildcard src/*.mm)) $(BACKEND_OBJS)
 LIB  := build/libwbmetal.dylib
 
 all: $(LIB)
@@ -32,6 +34,11 @@ $(LIB): $(OBJS) $(DEPS) stubs/GLEW.tbd stubs/SDL2.tbd
 	    -Wl,-weak_library,stubs/GLEW.tbd -Wl,-weak_library,stubs/SDL2.tbd $(FRAMEWORKS) \
 	    -Wl,-rpath,@executable_path/../Resources -install_name @rpath/libwbmetal.dylib
 	mv $@.tmp $@
+
+# Before the general rules below, which would also match these.
+build/backend/%.o: src/backend/%.mm $(HDRS) Makefile | build $(DEPS)
+	@mkdir -p build/backend
+	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -c $< -o $@
 
 build/%.o: src/%.cpp $(HDRS) Makefile | build $(DEPS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -74,7 +81,7 @@ build/xlate_test: tools/xlate_test.mm src/shader_xlate.cpp src/shader_xlate.h $(
 
 # Plays back a frame captured with scripts/capture.sh, without the game:
 #   build/replay traces/latest/capture_000123.wbcap [--png out.png]
-REPLAY_OBJS := build/metal_backend.o build/shader_xlate.o build/shader_cache.o build/gl_enums.o build/capture.o build/brf.o
+REPLAY_OBJS := build/metal_backend.o build/shader_xlate.o build/shader_cache.o build/gl_enums.o build/capture.o build/brf.o $(BACKEND_OBJS)
 build/replay: tools/replay.mm $(REPLAY_OBJS) $(DEPS)
 	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -Isrc tools/replay.mm $(REPLAY_OBJS) $(DEPS) $(FRAMEWORKS) -o $@
 
@@ -108,7 +115,7 @@ compile_commands.json:
 	scripts/check.sh compile-db
 
 clean:
-	rm -f build/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/gltf_export build/gltf_import build/launcher build/*.zip
+	rm -f build/*.o build/backend/*.o build/*.dylib build/xlate_test build/replay build/texture_tool build/gltf_export build/gltf_import build/launcher build/*.zip
 	rm -rf "$(APP)"
 
 distclean:

@@ -1,5 +1,5 @@
 // The movement of objects that move by themselves.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 id<MTLRenderPipelineState> velocity_pipeline(const PipelineKey &key, bool skinned)
 {

@@ -1,5 +1,5 @@
 // The scene camera, worked out from the draws' matrices.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- the scene camera ------------------------------------------------------------------
 

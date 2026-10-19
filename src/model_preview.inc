@@ -1,5 +1,5 @@
 // Showing one of the game's models in a played-back frame. Included by
-// metal_backend.mm, inside its anonymous namespace, after frame_capture.inc.
+// metal_backend.mm, inside namespace wbm, after frame_capture.inc.
 //
 // The captured frame is the stage: its sky, sun, fog, shadow settings and
 // post-processing stay, what the game drew into the scene is left out, and a
