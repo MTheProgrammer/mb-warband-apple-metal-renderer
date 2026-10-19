@@ -58,6 +58,8 @@ This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2
 
 Releases are built by GitHub Actions (`.github/workflows/build.yml`): pushing a tag that starts with `v` publishes the zip on the Releases page. The steps are in `docs/releasing.md`.
 
+Static analysis (needs `brew install llvm cppcheck` and `pipx install lizard`): `make analyze` runs the Clang Static Analyzer, `make lint` clang-tidy with the checks in `.clang-tidy`, `make cppcheck` cppcheck over the plain C++ files, and `make metrics` lists functions longer than 150 lines or with more than 30 paths through them. `scripts/check.sh <what> <file...>` checks only those files; `make compile_commands.json` writes `build/compile_commands.json` for clang-tidy and editors.
+
 ## Run
 
     scripts/run.sh
