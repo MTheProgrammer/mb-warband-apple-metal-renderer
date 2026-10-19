@@ -110,12 +110,27 @@ static bool read_picture(const std::string &path, Image *img)
             }
             if (data) CFRelease(data);
         }
+        // Anything else (16 bits a channel, another order) is drawn into eight bits. A picture with an alpha of its
+        // own is drawn keeping it, which Core Graphics does only with the colours multiplied by it, and they are
+        // divided back after: drawn without, the alpha was lost and the colours were left multiplied by it (a
+        // glTF sheen map's colour came out wrong; a cut-out's colour, where alpha is 0, came out black).
+        bool has_alpha = alpha != kCGImageAlphaNone && alpha != kCGImageAlphaNoneSkipLast && alpha != kCGImageAlphaNoneSkipFirst;
         CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-        CGContextRef ctx = CGBitmapContextCreate(img->px.data(), w, h, 8, w * 4, space, (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Big);
+        CGContextRef ctx = CGBitmapContextCreate(img->px.data(), w, h, 8, w * 4, space,
+                                                 (uint32_t)(has_alpha ? kCGImageAlphaPremultipliedLast : kCGImageAlphaNoneSkipLast) | (uint32_t)kCGBitmapByteOrder32Big);
         CGColorSpaceRelease(space);
         if (ctx) {
+            CGContextSetBlendMode(ctx, kCGBlendModeCopy);
             CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);
             CGContextRelease(ctx);
+            if (has_alpha)
+                for (size_t i = 0; i < w * h; i++) {
+                    uint8_t *px = &img->px[i * 4];
+                    if (px[3] > 0 && px[3] < 255)
+                        for (int k = 0; k < 3; k++) px[k] = (uint8_t)std::min(255, (int)lroundf((float)px[k] * 255.0f / (float)px[3]));
+                }
+            else
+                for (size_t i = 3; i < img->px.size(); i += 4) img->px[i] = 255;
         }
         CGImageRelease(image);
         return ctx != nullptr;
