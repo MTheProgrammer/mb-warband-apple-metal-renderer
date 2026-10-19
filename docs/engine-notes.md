@@ -53,3 +53,37 @@ By the names of the shaders' uniforms, which the file holds as plain strings:
 
 Neither has been read through. Which functions set those uniforms each frame,
 and so draw, is what the first run with call sites will show.
+
+### Flora: how generated scenes are planted (read 2026-10-19)
+
+- `1009e1750` loads `Data/flora_kinds.txt`, first from the module's folder
+  (`DAT_103839490` holds `Modules/<module>/`), then from the game's own `Data`.
+  Kinds go into a table of 0xb8-byte records at `DAT_102826718`, their number at
+  `DAT_102826720`; the flags with the density in their upper 32 bits sit at +0x98.
+  The table is allocated to the number of kinds: no fixed limit.
+- `10097a608` decides, from the scene's region (bits 28-31 of a terrain word:
+  2 steppe, 3 plain, 4 snow, 5 desert, 10 steppe forest, 11 plain forest, 12 snow
+  forest, 13 desert forest), how many groups of each category to plant:
+
+  | region | trees | other plants | grass |
+  |---|---|---|---|
+  | plain, steppe, snow (default) | 3-6 | 4-5 | 4 |
+  | desert (5) | 0 | 2 | 0 |
+  | steppe forest (10) | 2-5 | 2-3 | 2 |
+  | plain forest (11) | 2-5 | 2-3 | 4 |
+  | snow forest (12) | 2 | 2-3 | 0 |
+  | desert forest (13) | 3-4 | 2 | 0 |
+
+  Grass groups only when a setting allows (`DAT_101464ca8`, or `DAT_101465178` above 9).
+- `10097e5ae` fills the groups of one category. `10097eb76` says whether a kind
+  belongs to the category (0 trees: 0x400000; 1 others: neither tree nor grass
+  0x80000; 2 grass; 3: 0x2000000) and may grow in the region (the region bits of the
+  flags), and gives every such kind the same weight, 1: the density takes no part in
+  the choice. Kinds marked 0x1000000 (guarantee) are chosen first, for the first group.
+  Each group then gets one kind and an amount:
+  `density / 1000 x (1 + r) x (0.4 + 0.05 r) x 15 x 3 / (groups + 2)` (r random in 0..1;
+  the constants are at `100b46af0`, `100b4b590`, `100b440cc`, `100b4a034`, `100b47664`),
+  and a radius of 50-100 and noise seeds. How the amount turns into plants on the ground
+  (`10097a7ec`) has not been read.
+- So adding kinds changes which plants are seen, not how many; raising density raises
+  the amount. `scripts/forest_flora.py` and `scripts/flora_preview.py` follow this.
