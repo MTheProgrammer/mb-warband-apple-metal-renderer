@@ -55,9 +55,8 @@ static const Option k_options[] = {
     {"People", "WBM_EYES", "Eyes", "A highlight and a reflection in the eyes, which also move a little.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"People", "WBM_PEOPLE_HAIR", "Hair strands", "Loose strands over the hair and beards of people nearby.", kToggle, "1", "0", "0", NULL, 0, 0, 0},
 
-    {"Horses", "WBM_FUR", "Coat", "A soft, velvety coat. Needs a texture pack with coat maps.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
-    {"Horses", "WBM_FUR_SHELLS", "Fur layers", "Layers of short fur on horses nearby; more is finer and slower. 0 for none.", kSlider, "12", "6", "0", NULL, 0, 24, 1},
-    {"Horses", "WBM_HAIR_STRANDS", "Mane and tail as strands", "Strands that hang, swing and stream behind. Needs a texture pack with hair maps.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    // Horses' coat, fur layers and mane and tail strands (WBM_FUR, WBM_FUR_SHELLS, WBM_HAIR_STRANDS) need a texture pack's
+    // coat and hair maps, which the release does not bring: they are left out of the window.
 
     {"Materials and colour", "WBM_PARALLAX", "Depth in stone", "Stones stand out from their joints on walls and buildings nearby, by this many metres. 0 for none.", kSlider, "0.05", "0", "0", NULL, 0, 0.12, 0.01},
     {"Materials and colour", "WBM_WATER", "Water", "Glitter from the sun, paler shallows and foam at the shore.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
@@ -68,6 +67,7 @@ static const Option k_options[] = {
 
     {"Picture", "WBM_MSAA", "Multisampling", "Smooths edges as they are drawn. The costliest setting.", kChoice, "1", "1", "4", "1=Off|2=2x|4=4x", 0, 0, 0},
     {"Picture", "WBM_FXAA", "Edge smoothing", "Smooths edges after the scene is drawn. Cheap.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    {"Picture", "WBM_ALPHA_HASH", "Soft edges on leaves and hair", "Cut-out edges are smoothed over several frames. Only with temporal enlarging (Speed).", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Picture", "WBM_MOTION_BLUR", "Motion blur", "Blur from the camera's movement, and of things that move: swords, legs, horses.", kToggle, "0", "0", "0", NULL, 0, 0, 0},
     {"Picture", "WBM_SHARPEN", "Sharpening", "0 for none. About 0.3 is plenty together with upscaling.", kSlider, "0", "0.3", "0", NULL, 0, 1, 0.05},
 
@@ -77,6 +77,8 @@ static const Option k_options[] = {
 
     {"Speed", "WBM_UPSCALE", "Draw smaller and enlarge", "The scene is drawn smaller and enlarged by MetalFX; the interface stays sharp.", kChoice, "", "0.67", "",
      "=Off|0.8=80% of the size|0.67=67% of the size|0.5=Half the size", 0, 0, 0},
+    {"Speed", "WBM_UPSCALE_MODE", "Enlarge with", "Temporal builds the picture from several frames: nearer the full-size picture, and smooths edges itself, for a few milliseconds more.", kChoice, "", "", "",
+     "=Spatial|temporal=Temporal", 0, 0, 0},
     {"Speed", "WBM_MAX_FPS", "Frame rate limit", "Fewer frames means a cooler, quieter machine.", kChoice, "", "", "", "=The game's own|120=120|90=90|60=60|30=30", 0, 0, 0},
     {"Speed", "WBM_MENU_FPS", "Limit in menus", "The same for menus and loading screens.", kChoice, "", "60", "", "=The game's own|60=60|30=30", 0, 0, 0},
 
@@ -96,7 +98,7 @@ static NSString *module_file(void) { return [NSHomeDirectory() stringByAppending
 static NSString *binary_in(NSString *game) { return [game stringByAppendingPathComponent:@"Mount and Blade.app/Contents/MacOS/Mount and Blade"]; }
 static BOOL is_game(NSString *game) { return game.length && [[NSFileManager defaultManager] isExecutableFileAtPath:binary_in(game)]; }
 
-// "Everything but hair" is "Everything on" without the fur layers and the strands, which cost the most of all.
+// "Everything but hair" is "Everything on" without people's hair strands, which cost the most of all.
 static BOOL is_game_setting(const Option *o) { return o->env[0] == '_'; }
 static NSString *game_config(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/MBWarband/rgl_config.txt"]; }
 
@@ -131,7 +133,7 @@ static void set_config_value(NSString *key, NSString *value)
 static NSString *preset_value(const Option *o, int preset)
 {
     if (preset == 1) {
-        if (!strcmp(o->env, "WBM_FUR_SHELLS") || !strcmp(o->env, "WBM_HAIR_STRANDS") || !strcmp(o->env, "WBM_PEOPLE_HAIR")) return @"0";
+        if (!strcmp(o->env, "WBM_PEOPLE_HAIR")) return @"0";
         return S(o->everything);
     }
     return S(preset == 0 ? o->everything : preset == 2 ? o->fast : o->plain);

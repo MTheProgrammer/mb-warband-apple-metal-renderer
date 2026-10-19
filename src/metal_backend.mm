@@ -288,7 +288,6 @@ void mtl_attach_window(void *nswindow, int width, int height)
         s_msaa = 1;
     }
     s_shader_options.smooth_alpha_test = s_msaa > 1;
-    s_shader_options.alpha_hash = s_msaa <= 1 && getenv("WBM_ALPHA_HASH") && atoi(getenv("WBM_ALPHA_HASH")) != 0; // off unless set; with multisampling the samples do it
     const float constant[4] = {0, 0, 0, 1}; // OpenGL's value for a disabled attribute array
     s_constant_attrib = [s_device newBufferWithBytes:constant length:sizeof constant options:MTLResourceStorageModeShared];
     if (!s_device.supportsBCTextureCompression) wb_note("  !! metal: this GPU does not support DXT textures");
@@ -327,6 +326,10 @@ void mtl_attach_window(void *nswindow, int width, int height)
             if (const char *sign = getenv("WBM_DEBUG_JITTER_SIGN")) s_jitter_sign = atoi(sign) < 0 ? -1 : 1;
         }
         if (const char *v = getenv("WBM_SHARPEN")) s_sharpen = std::min(1.0f, std::max(0.0f, (float)atof(v)));
+        // Dithered cut-out edges only where the temporal scaler averages the dither away: anywhere else it
+        // stands still and only trades stair steps for dots. Off unless set; with multisampling the samples do it.
+        const char *hash = getenv("WBM_ALPHA_HASH");
+        s_shader_options.alpha_hash = s_temporal && s_msaa <= 1 && hash && atoi(hash) != 0;
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = s_device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;

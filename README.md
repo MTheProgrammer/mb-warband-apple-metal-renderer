@@ -32,7 +32,7 @@ You do not need to compile anything. A ready-made app is on the Releases page.
 
 You can keep the app anywhere, for example in Applications.
 
-Each option in the window is one of the `WBM_*` variables listed below, and a variable set in the environment the app is started from wins over the window. The choices are kept in `~/Library/Application Support/warband-metal/settings.plist`.
+Each option in the window is one of the `WBM_*` variables listed below, and a variable set in the environment the app is started from wins over the window. The window offers what works with the game as it is: the app changes none of the game's files and needs no changed ones. What needs texture packs or models made with the tools below (horses' coat, fur layers, mane and tail strands, glTF materials) is left out of it, and so are trials; they can still be switched on with their variables. The tools themselves (`texture_tool`, `gltf_export`, `gltf_import`, the frame player and model previewer) are not in the download; they are built from source. The choices are kept in `~/Library/Application Support/warband-metal/settings.plist`.
 
 The game's own graphics options are still set in the game's own launcher, the window Steam's Play button opens: the game reads them when it starts, whichever way it is started.
 
@@ -57,6 +57,8 @@ The first build downloads its dependencies at pinned versions into `third_party/
 This produces `build/libwbmetal.dylib` for x86_64 (the game runs under Rosetta 2). `make app` builds `build/Warband Metal.app` and `make dist` zips it.
 
 Releases are built by GitHub Actions (`.github/workflows/build.yml`): pushing a tag that starts with `v` publishes the zip on the Releases page. The steps are in `docs/releasing.md`.
+
+Every feature is behind a `WBM_*` variable and off unless it is set, so work goes into `master` as soon as it builds, is off by default and leaves the picture as it was with its variable unset (compare replays of a captured frame, `scripts/replay.sh`, with the build before). A release is the launcher's list of options (`launcher/launcher.m`), which is what makes a feature visible to players, and a tag.
 
 Static analysis (needs `brew install llvm cppcheck` and `pipx install lizard`): `make analyze` runs the Clang Static Analyzer, `make lint` clang-tidy with the checks in `.clang-tidy`, `make cppcheck` cppcheck over the plain C++ files, and `make metrics` lists functions longer than 150 lines or with more than 30 paths through them. `scripts/check.sh <what> <file...>` checks only those files; `make compile_commands.json` writes `build/compile_commands.json` for clang-tidy and editors.
 
