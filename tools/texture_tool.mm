@@ -914,7 +914,8 @@ static int import_pictures(const std::string &in, const std::string &out, float 
         for (auto &p : pictures) {
             std::string name = p.first;
             for (const char *suffix : {"_basecolor", "_base_color", "_albedo", "_diffuse", "_normal", "_metallicroughness", "_metallic", "_metalness", "_metal",
-                                       "_roughness", "_rough", "_orm", "_ao", "_ambientocclusion", "_height", "_displacement", "_opacity", "_alpha"}) {
+                                       "_roughness", "_rough", "_orm", "_ao", "_ambientocclusion", "_height", "_displacement", "_opacity", "_alpha",
+                                       "_anisotropy", "_sheen"}) {
                 if (!ends_with(name, suffix)) continue;
                 std::string owner = name.substr(0, name.size() - strlen(suffix));
                 if (game.count(owner) || game.count(name)) break;
@@ -935,6 +936,8 @@ static int import_pictures(const std::string &in, const std::string &out, float 
     };
     std::map<std::string, Maps> maps; // by the texture they belong to
     std::map<std::string, std::string> heights; // by the texture they belong to
+    std::map<std::string, std::string> flows, sheens; // glTF's anisotropy and sheen pictures, by the texture they belong to
+    int hair_maps = 0, sheen_maps = 0;
     int textures = 0, normal_maps = 0, pbr_maps = 0, depth_maps = 0, skipped = 0, unread = 0, into_alpha = 0, softened = 0;
     // One picture may stand in for several of the game's files: a normal map shared out under more than one name.
     std::vector<std::pair<std::string, std::string>> work; // name of the game's, path
@@ -956,6 +959,12 @@ static int import_pictures(const std::string &in, const std::string &out, float 
         for (const char *suffix : {"_opacity", "_alpha"}) { // goes into its texture's alpha, below
             std::string owner = ends_with(name, suffix) ? name.substr(0, name.size() - strlen(suffix)) : "";
             if (!owner.empty() && game.count(owner) && !game.count(name)) taken = true;
+        }
+        for (const char *suffix : {"_anisotropy", "_sheen"}) {
+            std::string owner = ends_with(name, suffix) ? name.substr(0, name.size() - strlen(suffix)) : "";
+            if (owner.empty() || !game.count(owner) || game.count(name)) continue;
+            (suffix[1] == 'a' ? flows : sheens)[owner] = p.second;
+            taken = true;
         }
         if (taken) continue;
         // A picture named for what it is, not for the game's file: the texture's own name is under it.
@@ -1115,7 +1124,66 @@ static int import_pictures(const std::string &in, const std::string &out, float 
         }
         depth_maps++;
     }
+    // glTF's KHR_materials_anisotropy picture: red and green the direction along the surface (right and up the
+    // picture, each 0.5 + 0.5 x), blue the strength. It becomes the renderer's hair map (see k_fur_function):
+    // the same direction with green turned to point down the picture, and blue as it is, which a horse's set
+    // gives as the hair map's classes (1 long hair, 0.5 coat, 0 neither). Kept as PNG: a compressed block would
+    // bend the directions. Beside it, as texture_tool hair does, the long hair's colour, from the base colour.
+    for (auto &f : flows) {
+        const std::string &name = f.first;
+        Image flow, base;
+        if (!read_picture(f.second, &flow)) {
+            fprintf(stderr, "%s: cannot be read; left out\n", f.second.c_str());
+            skipped++;
+            continue;
+        }
+        bool has_base = false;
+        for (const char *suffix : {"_basecolor", "_base_color", "_albedo", "_diffuse", ""})
+            if (!has_base && pictures.count(name + suffix)) has_base = read_picture(pictures[name + suffix], &base);
+        Image hair;
+        hair.w = flow.w, hair.h = flow.h;
+        hair.px.assign((size_t)flow.w * (size_t)flow.h * 4, 255);
+        std::vector<uint8_t> channel[3];
+        for (size_t i = 0; i < (size_t)flow.w * (size_t)flow.h; i++) {
+            uint8_t strength = flow.px[i * 4 + 2];
+            hair.px[i * 4 + 0] = strength ? flow.px[i * 4 + 0] : 128;
+            hair.px[i * 4 + 1] = strength ? (uint8_t)(255 - flow.px[i * 4 + 1]) : 128;
+            hair.px[i * 4 + 2] = strength;
+            if (has_base && strength > 191 && (i % 7) == 0) {
+                float u = ((float)(i % (size_t)flow.w) + 0.5f) / (float)flow.w, v = ((float)(i / (size_t)flow.w) + 0.5f) / (float)flow.h;
+                for (int k = 0; k < 3; k++) channel[k].push_back((uint8_t)lroundf(sample_channel(base, k, u, v)));
+            }
+        }
+        if (!write_png(out + "/" + name + "_hair.png", hair)) {
+            fprintf(stderr, "cannot write %s/%s_hair.png\n", out.c_str(), name.c_str());
+            return 1;
+        }
+        unlink((out + "/" + name + "_hair.txt").c_str());
+        if (FILE *t = channel[0].empty() ? nullptr : fopen((out + "/" + name + "_hair.txt").c_str(), "w")) {
+            int middle[3];
+            for (int k = 0; k < 3; k++) {
+                std::nth_element(channel[k].begin(), channel[k].begin() + (long)channel[k].size() / 2, channel[k].end());
+                middle[k] = channel[k][channel[k].size() / 2];
+            }
+            fprintf(t, "%d %d %d\n", middle[0], middle[1], middle[2]);
+            fclose(t);
+        }
+        hair_maps++;
+    }
+    // glTF's KHR_materials_sheen picture: the sheen's colour in red, green and blue, its roughness in alpha.
+    // Taken as it is (k_fur_function reads it), as PNG, so that the roughness keeps its precision.
+    for (auto &f : sheens) {
+        Image img;
+        if (!read_picture(f.second, &img) || !write_png(out + "/" + f.first + "_sheen.png", img)) {
+            fprintf(stderr, "%s: cannot be read or written; left out\n", f.second.c_str());
+            skipped++;
+            continue;
+        }
+        unlink((out + "/" + f.first + "_sheen.dds").c_str());
+        sheen_maps++;
+    }
     printf("%d textures, %d normal maps, %d maps of metalness, roughness and occlusion and %d of heights written to %s; %d pictures left out", textures, normal_maps, pbr_maps, depth_maps, out.c_str(), skipped);
+    if (hair_maps || sheen_maps) printf("; %d hair maps from anisotropy and %d sheen maps", hair_maps, sheen_maps);
     if (unread) printf(", %d normal maps for textures whose materials read none", unread);
     if (into_alpha) printf("; %d normal maps written the way the game keeps them, x in alpha", into_alpha);
     if (softened) printf("; %d cut-outs given soft edges (--hard-alpha: not)", softened);
