@@ -314,6 +314,12 @@ void mtl_attach_window(void *nswindow, int width, int height)
                 if (can) {
                     s_upscale = s_temporal = true, s_render_scale = s_scale * std::min(share, 1.0);
                     s_shader_options.motion_vectors = !getenv("WBM_UPSCALE_SWAY") || atoi(getenv("WBM_UPSCALE_SWAY")) != 0; // 0: what sways in the wind does not say how it moved (cheaper; leaves smear)
+                    // The reactive mask, for what has no movement the scaler could follow (see upscale.h); it needs the movement target.
+                    const char *reactive = getenv("WBM_REACTIVE");
+                    if (reactive) s_reactive_cap = std::min(1.0f, std::max(0.0f, (float)atof(reactive)));
+                    if (@available(macOS 14.4, *)) s_reactive = s_shader_options.motion_vectors && s_reactive_cap > 0;
+                    s_shader_options.reactive_mask = s_reactive;
+                    if (const char *v = getenv("WBM_REACTIVE_WATER")) s_shader_options.reactive_water = std::min(1.0f, std::max(0.0f, (float)atof(v)));
                     // Textures are picked as for the full-size picture, or they come out soft.
                     if (!getenv("WBM_LOD_BIAS") && share < 0.999) s_lod_bias = (float)log2(share);
                 } else if (s_msaa <= 1) complain("WBM_UPSCALE_MODE=temporal: MetalFX's temporal scaler is not available on this machine");
@@ -392,6 +398,7 @@ void mtl_dump_stats(FILE *f)
     if (s_temporal_frames)
         fprintf(f, "\nupscaled by MetalFX's temporal scaler in %llu frames, from %.0f%% of the screen's size each way; history dropped %llu times\n", (unsigned long long)s_temporal_frames,
                 100.0 * s_render_scale / s_scale, (unsigned long long)s_temporal_resets);
+    if (s_reactive_frames) fprintf(f, "the reactive mask drawn in %llu of them (WBM_REACTIVE)\n", (unsigned long long)s_reactive_frames);
     if (s_upscale_frames) fprintf(f, "\nupscaled by MetalFX in %llu frames, from %.0f%% of the screen's size each way\n", (unsigned long long)s_upscale_frames, 100.0 * s_render_scale / s_scale);
     if (s_sharpen_frames) fprintf(f, "\nsharpened in %llu frames\n", (unsigned long long)s_sharpen_frames);
     if (s_fxaa_frames) fprintf(f, "\nanti-aliasing (FXAA) applied in %llu frames\n", (unsigned long long)s_fxaa_frames);

@@ -17,6 +17,7 @@ struct Buffer {
     void *scale_of = nullptr; // the MTLBuffer texture_per_metre was worked out for
     float texture_per_metre = 0;
     void *wind_weights = nullptr; // the MTLBuffer whose vertices have been given heights for the wind (see weigh_foliage)
+    uint64_t filled_frame = 0;    // the frame of its last glBufferData: particles are filled afresh each frame, scenery once
 };
 
 struct Texture {
@@ -77,7 +78,7 @@ struct PipelineKey {
     uint8_t blend;
     uint8_t samples;
     uint8_t motion; // 0: the pass has no movement target; 1: it has, and this program leaves it alone; 2: and writes it
-    uint8_t pad[1];
+    uint8_t reactive; // the same for the reactive mask (see upscale.h): 2 when this draw marks it
     bool operator==(const PipelineKey &o) const { return !memcmp(this, &o, sizeof *this); }
 };
 struct PipelineKeyHash {
@@ -132,6 +133,7 @@ struct Program {
     int yflip_offset = -1;   // vertex stage, see k_xl_yflip_uniform
     int jitter_offset = -1;  // vertex stage, see k_xl_jitter_uniform
     int hash_frame_offset = -1; // fragment stage: wbm_hash_frame (XlOptions::alpha_hash)
+    int reactive_offset = -1;   // fragment stage: wbm_reactive (XlOptions::reactive_mask)
     int reproject_offset = -1, wind_before_offset = -1; // vertex stage: wbm_reproject and wbm_wind_before, of the shaders that write their own movement (XlOptions::motion_vectors)
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform
@@ -224,6 +226,7 @@ int s_jitter_sign = 1; // WBM_DEBUG_JITTER_SIGN
 id<MTLTexture> s_scene_motion;
 uint64_t s_scene_motion_frame = ~0ull; // the frame it was last cleared in
 bool s_pass_motion;                    // the pass under way has it attached
+bool s_pass_reactive;                  // and the reactive mask (see upscale.h)
 float s_sharpen; // WBM_SHARPEN, 0 to 1: see apply_sharpen
 int s_screen_w, s_screen_h; // the size the game believes the screen has
 

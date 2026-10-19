@@ -42,6 +42,14 @@ bool prepare_draw()
         key.blend_dst = (uint16_t)s_blend_dst;
         key.blend_eq = (uint16_t)s_blend_eq;
     }
+    // Smoke, sparks, fire and glows have no movement of their own that the scaler could follow, and
+    // nor has the surface of water: those it takes from this frame. They are told apart from blended
+    // scenery that stands still (carpets, decals, banners) by their vertices, filled afresh each frame.
+    if (s_pass_reactive) {
+        Buffer *vertices = s_attribs[0].enabled ? find(s_buffers, s_attribs[0].buffer) : nullptr;
+        bool effect = s_blend && !(s_depth_test && s_depth_mask) && vertices && vertices->filled_frame + 1 >= s_frame_serial;
+        key.reactive = (uint8_t)(effect || p->water_offset >= 0 ? 2 : 1);
+    }
     id<MTLRenderPipelineState> pipeline;
     if (s_state_cache && s_last_key_program == s_program && s_last_key == key) {
         pipeline = s_last_pipeline;
@@ -344,6 +352,13 @@ bool prepare_draw()
     if (p->hash_frame_offset >= 0 && memcmp(p->uniform_data[1].data() + p->hash_frame_offset, &hash_frame, 4)) {
         memcpy(p->uniform_data[1].data() + p->hash_frame_offset, &hash_frame, 4);
         p->uniform_dirty[1] = true;
+    }
+    if (p->reactive_offset >= 0) {
+        const float reactive[4] = {s_blend && s_blend_dst == GL_ONE ? 1.0f : 0.0f, s_reactive_cap, 0, 0};
+        if (memcmp(p->uniform_data[1].data() + p->reactive_offset, reactive, 16)) {
+            memcpy(p->uniform_data[1].data() + p->reactive_offset, reactive, 16);
+            p->uniform_dirty[1] = true;
+        }
     }
     float wind_before = (float)s_wind_time_before;
     if (p->wind_before_offset >= 0 && memcmp(p->uniform_data[0].data() + p->wind_before_offset, &wind_before, 4)) {

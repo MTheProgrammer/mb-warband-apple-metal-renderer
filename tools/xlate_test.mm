@@ -5,6 +5,7 @@
 //   -S  with distance-dependent (PCSS) shadows instead
 //   -D  with the backend's own per-frame shadow map sampled too; reports programs that sample it
 //   -a  translate with smoothed alpha tests; likewise
+//   -R  with temporal upscaling's movement and reactive mask outputs
 //   -p  translate with microfacet specular highlights; reports programs changed
 //   -e  also with estimated metalness and environment reflection; likewise
 //   -k  with the captured sky as the environment; reports programs that sample it
@@ -46,6 +47,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-K")) options.skin_scattering = true;
         if (!strcmp(argv[i], "-W")) options.wind = options.foliage_backlight = options.eyes = options.fur = options.hair_strands = options.water = options.parallax = true;
         if (!strcmp(argv[i], "-a")) options.smooth_alpha_test = true;
+        if (!strcmp(argv[i], "-R")) options.motion_vectors = options.reactive_mask = true; // temporal upscaling: movement and the reactive mask
         if (!strcmp(argv[i], "-z")) options.reverse_depth = true;
         if (!strcmp(argv[i], "-p")) options.pbr_specular = true;
         if (!strcmp(argv[i], "-e")) options.pbr_environment = true;

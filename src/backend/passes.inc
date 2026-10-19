@@ -177,6 +177,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
         d.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, -1, 0);
         s_scene_motion_frame = s_frame_serial;
     }
+    bool with_reactive = with_motion && s_reactive && attach_reactive_mask(d, t.color); // colour attachment 2
     if (t.depth) {
         bool clear = (clear_mask & GL_DEPTH_BUFFER_BIT) && s_depth_mask;
         d.depthAttachment.texture = t.depth;
@@ -190,6 +191,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_depth = t.depth;
     s_pass_screen = t.screen;
     s_pass_motion = with_motion;
+    s_pass_reactive = with_reactive;
     s_pass_scale = t.scale;
     s_pass_samples = t.samples;
     if (t.scene) s_scene_frame = s_frame_serial;

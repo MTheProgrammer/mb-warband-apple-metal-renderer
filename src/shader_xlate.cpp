@@ -2352,6 +2352,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     if (vertex) out << "uniform float " << k_xl_yflip_uniform << ";\nuniform vec2 " << k_xl_jitter_uniform << ";\n";
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
     if (motion_out) out << "layout(location = 1) out vec4 wbm_Motion;\n";
+    if (!vertex && options.reactive_mask) out << "layout(location = 2) out vec4 wbm_Reactive;\nuniform vec4 wbm_reactive;\n";
     if (needs_sun_matrix) out << "uniform mat4 matSunViewProj;\n";
     if (soft_shadows) out << (options.pcss_shadows ? k_pcss_shadow_function : k_soft_shadow_function);
     if (shadows && options.dynamic_shadows)
@@ -2455,6 +2456,16 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
             std::string top = final_pass ? "max(gl_FragColor.xyz, vec3(0.0))"
                                          : std::string("clamp(gl_FragColor.xyz, vec3(0.0), vec3(") + k_xl_limit_uniform + "))";
             if (end != std::string::npos) s.insert(end, "  gl_FragColor = vec4(" + top + ", clamp(gl_FragColor.w, 0.0, 1.0));\n");
+        }
+        if (options.reactive_mask) { // last, after the clamp above: the alpha as it is blended
+            size_t end = s.rfind('}');
+            char water_share[32];
+            snprintf(water_share, sizeof water_share, "%.3f", std::min(1.0f, std::max(0.0f, options.reactive_water)));
+            // Blended over, a pixel counts by its alpha; added (wbm_reactive.x), by how bright it is as well,
+            // since glows are added with alpha 1 all over their quad. At most wbm_reactive.y.
+            const char *share = "min(clamp(gl_FragColor.w, 0.0, 1.0) * (wbm_reactive.x > 0.5 ? "
+                                "clamp(max(gl_FragColor.x, max(gl_FragColor.y, gl_FragColor.z)), 0.0, 1.0) : 1.0), wbm_reactive.y)";
+            if (end != std::string::npos) s.insert(end, std::string("  wbm_Reactive = vec4(") + (water ? water_share : share) + ");\n");
         }
         s = replace_word(s, "gl_FragColor", "wbm_FragColor");
     }

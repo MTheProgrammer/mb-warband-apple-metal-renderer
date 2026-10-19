@@ -9,7 +9,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.jitter_offset = p.hash_frame_offset = p.reproject_offset = p.wind_before_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
+    p.yflip_offset = p.jitter_offset = p.hash_frame_offset = p.reactive_offset = p.reproject_offset = p.wind_before_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.sheen_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -94,6 +94,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == k_xl_wind_uniform) p.wind_offset = u.offset;
             else if (u.name == "wbm_reproject") p.reproject_offset = u.offset;
             else if (u.name == "wbm_hash_frame") p.hash_frame_offset = u.offset;
+            else if (u.name == "wbm_reactive") p.reactive_offset = u.offset;
             else if (u.name == "wbm_wind_before") p.wind_before_offset = u.offset;
             else if (u.name == "wbm_leaf_sun") p.leaf_sun_offset = u.offset;
             else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
@@ -348,6 +349,14 @@ id<MTLRenderPipelineState> pipeline_for(Program &p, const PipelineKey &key)
     if (key.motion) {
         d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
         d.colorAttachments[1].writeMask = key.motion == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    }
+    if (key.reactive) { // the largest share any draw asks for wins
+        MTLRenderPipelineColorAttachmentDescriptor *r = d.colorAttachments[2];
+        r.pixelFormat = MTLPixelFormatR8Unorm;
+        r.writeMask = key.reactive == 2 ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
+        r.blendingEnabled = key.reactive == 2;
+        r.rgbBlendOperation = r.alphaBlendOperation = MTLBlendOperationMax;
+        r.sourceRGBBlendFactor = r.sourceAlphaBlendFactor = r.destinationRGBBlendFactor = r.destinationAlphaBlendFactor = MTLBlendFactorOne;
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)key.depth_format;
     d.rasterSampleCount = key.samples;
