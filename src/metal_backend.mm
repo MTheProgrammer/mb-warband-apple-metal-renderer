@@ -383,6 +383,10 @@ uint64_t s_prepass_frame = ~0ull; // the frame in which the engine last drew its
 bool s_dyn_shadows;
 float s_dyn_range = 60.0f;     // WBM_DYN_RANGE: half the width of the window, in metres
 float s_dyn_bias_m = 0.05f;    // WBM_DYN_BIAS: metres
+// WBM_DYN_FOLIAGE: metres from the camera beyond which cut-out things without bones (leaves, bushes, grass
+// tufts, fences) cast no shadow in the per-frame map. In a forest they are most of what it draws, two windows
+// over; past this the engine's own, coarser map shades them as it always did. 0: all of them, at any distance.
+float s_dyn_foliage_range = 30.0f;
 float s_dyn_near_range = 12.0f; // WBM_DYN_NEAR: half the width of the fine window around the camera, in metres; 0 for none
 float s_dyn_near[4];           // the fine window, as the shaders' wbm_dyn_near
 float s_sun_matrix[16];        // matSunViewProj as last set for the scene
@@ -393,7 +397,7 @@ uint64_t s_dyn_frame;          // the frame the map was last drawn in
 id<MTLTexture> s_dyn_map, s_dyn_depth;
 id<MTLSamplerState> s_dyn_sampler;
 struct {
-    uint64_t frames, casters, scenery, overlays, late;
+    uint64_t frames, casters, scenery, overlays, late, far_foliage;
 } s_dyn_stats;
 // Screen-space contact shadows (WBM_CONTACT_SHADOWS=1), computed in the same
 // pass as ambient occlusion. They need the sun: its direction and colour as
@@ -3564,6 +3568,10 @@ void record_caster(NSUInteger count, MTLIndexType index_type, id<MTLBuffer> indi
     }
     if (!late && !c.alpha) s_prepass_solid.insert(mesh);
     c.mesh = mesh;
+    if (!late && c.alpha && c.bones < 0 && s_dyn_foliage_range > 0 && c.wvp[15] > s_dyn_foliage_range) { // w of its origin: how far ahead it is
+        c.scenery = true; // not for the sun's map; a torch's still takes it
+        s_dyn_stats.far_foliage++;
+    }
     if (!late && (s_motion_blur || s_temporal) && s_velocity_draws.size() < 1500) { // kept apart: the shadow map takes its own away when it is drawn
         VelocityDraw v{c, -1, {c.wvp[12], c.wvp[13], c.wvp[14], c.wvp[15]}};
         if (c.bones >= 0) {
@@ -5355,6 +5363,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
     if (const char *v = getenv("WBM_DYN_RANGE")) s_dyn_range = std::max(5.0f, (float)atof(v));
     if (const char *v = getenv("WBM_DYN_BIAS")) s_dyn_bias_m = (float)atof(v);
     if (const char *v = getenv("WBM_DYN_NEAR")) s_dyn_near_range = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_DYN_FOLIAGE")) s_dyn_foliage_range = std::max(0.0f, (float)atof(v));
     const char *amb_env = getenv("WBM_SKY_AMBIENT");
     s_sky_ambient = s_shader_options.sky_ambient = amb_env && atoi(amb_env) != 0; // off unless set
     if (const char *v = getenv("WBM_SKY_AMBIENT_STRENGTH")) s_sky_ambient_strength = std::min(1.0f, std::max(0.0f, (float)atof(v)));
@@ -5560,6 +5569,9 @@ void mtl_dump_stats(FILE *f)
                 (unsigned long long)s_dyn_stats.frames, (double)s_dyn_stats.casters / (double)s_dyn_stats.frames,
                 (double)s_dyn_stats.scenery / (double)s_dyn_stats.frames, (double)s_dyn_stats.late / (double)s_dyn_stats.frames,
                 (unsigned long long)s_dyn_stats.overlays, s_overlays.size());
+    if (s_dyn_stats.far_foliage)
+        fprintf(f, "%.0f cut-out casters per frame left to the engine's map, being more than %.0f m off (WBM_DYN_FOLIAGE)\n", (double)s_dyn_stats.far_foliage / (double)s_dyn_stats.frames,
+                s_dyn_foliage_range);
 }
 
 void mtl_set_vsync(bool on)

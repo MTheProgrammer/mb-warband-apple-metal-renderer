@@ -43,6 +43,8 @@ struct PreviewModel {
     // measured from its top left), so that a ball can show one material of a texture that holds many.
     float window[4] = {0, 0, 1, 1};
     bool windowed = false;
+    bool grounded = false; // `up` is where its lowest point goes, not its middle (a plant standing on the ground)
+    float lowest = 0;      // its lowest point, in its own space
 };
 
 struct Preview {
@@ -241,11 +243,37 @@ void preview_sphere(BrfMesh *mesh, const float *window)
         }
 }
 
+// A flat square of ground 80 m across, its texture repeated every 5 m (mesh name @plane).
+void preview_plane(BrfMesh *mesh)
+{
+    const int cells = 16;
+    const float half = 40.0f;
+    mesh->skinned = false;
+    mesh->vertices.clear(), mesh->indices.clear();
+    for (int j = 0; j <= cells; j++)
+        for (int i = 0; i <= cells; i++) {
+            BrfVertex x = {};
+            x.position[0] = -half + 2.0f * half * (float)i / cells, x.position[1] = -half + 2.0f * half * (float)j / cells;
+            x.normal[2] = 1, x.tangent[0] = 1, x.handedness = 1;
+            x.uv[0] = (float)i, x.uv[1] = (float)j;
+            for (int k = 0; k < 4; k++) x.colour[k] = 255;
+            mesh->vertices.push_back(x);
+        }
+    for (int j = 0; j < cells; j++)
+        for (int i = 0; i < cells; i++) {
+            uint32_t a = (uint32_t)(j * (cells + 1) + i), b = a + 1, c = a + (uint32_t)cells + 1, d = c + 1;
+            mesh->indices.insert(mesh->indices.end(), {a, b, c, b, d, c});
+        }
+}
+
 bool preview_add_part(const std::string &mesh_name, float *lo, float *hi)
 {
     Preview &pv = s_preview;
     BrfMesh mesh;
-    if (mesh_name == "@sphere") {
+    if (mesh_name == "@plane") {
+        if (pv.m.material.empty()) return complain("preview: a plane has no material of its own: name one"), false;
+        preview_plane(&mesh);
+    } else if (mesh_name == "@sphere") {
         if (pv.m.material.empty()) return complain("preview: a sphere has no material of its own: name one"), false;
         preview_sphere(&mesh, pv.m.windowed ? pv.m.window : nullptr);
     } else if (!pv.library.load_mesh(mesh_name, &mesh) || mesh.vertices.empty() || mesh.indices.empty()) {
@@ -352,13 +380,14 @@ bool preview_load(const std::string &mesh_name, int lod)
         float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
         // The model and its further parts (name.1 ... and name.lod1.1 ...; some models are parts only).
         bool any = false;
-        if (base == "@sphere") any = preview_add_part(base, lo, hi);
+        if (base == "@sphere" || base == "@plane") any = preview_add_part(base, lo, hi);
         else
             for (const std::string &part : pv.library.parts_of(base, lod)) any = preview_add_part(part, lo, hi) || any;
         if (!any) return false;
         float extent = 0;
         for (int k = 0; k < 3; k++) pv.m.centre[k] = (lo[k] + hi[k]) * 0.5f, extent += (hi[k] - lo[k]) * (hi[k] - lo[k]);
         pv.m.radius = std::max(0.05f, sqrtf(extent) * 0.5f);
+        pv.m.lowest = lo[2];
         pv.m.name = base;
         pv.active = true;
         return true;
@@ -381,11 +410,14 @@ bool preview_load_gallery(const std::string &path, std::string *problem)
     int number = 0;
     while (fgets(line, sizeof line, f)) {
         number++;
-        char mesh[256], material[256], action[256] = "", turning[256] = "0";
+        char mesh[256], material[256], action[256] = "", turning[256] = "0", up[64];
         double at[3], turn = 0, held = -1, tilt[2] = {0, 0};
         char *hash = strchr(line, '#');
         if (hash) *hash = 0;
-        int got = sscanf(line, "%255s %255s %lf %lf %lf %255s %255s %lf", mesh, material, &at[0], &at[1], &at[2], turning, action, &held);
+        // An up written as _h stands the model on the ground at h: its lowest point there, not its middle.
+        int got = sscanf(line, "%255s %255s %lf %63s %lf %255s %255s %lf", mesh, material, &at[0], up, &at[2], turning, action, &held);
+        bool grounded = got >= 4 && up[0] == '_';
+        if (got >= 4) at[1] = atof(up + (grounded ? 1 : 0));
         sscanf(turning, "%lf,%lf,%lf", &turn, &tilt[0], &tilt[1]); // turn about the upright[,tilt about the model's x[,about its y]]
         if (got <= 0) continue;
         if (got < 5) {
@@ -409,7 +441,7 @@ bool preview_load_gallery(const std::string &path, std::string *problem)
             continue;
         }
         for (int k = 0; k < 3; k++) pv.m.at[k] = at[k];
-        pv.m.turn = turn, pv.m.tilt[0] = tilt[0], pv.m.tilt[1] = tilt[1];
+        pv.m.turn = turn, pv.m.tilt[0] = tilt[0], pv.m.tilt[1] = tilt[1], pv.m.grounded = grounded;
         pv.gallery.push_back(std::move(pv.m));
     }
     fclose(f);
@@ -557,6 +589,7 @@ void preview_draw_one(bool prepass)
         const double right[3] = {forward[1], -forward[0], 0};
         double place[3];
         for (int k = 0; k < 3; k++) place[k] = target[k] + right[k] * pv.m.at[0] + forward[k] * pv.m.at[2] + (k == 2 ? pv.m.at[1] : 0.0);
+        if (pv.m.grounded) place[2] += pv.m.centre[2] - pv.m.lowest;
         double facing = atan2(forward[1], forward[0]) + pv.m.turn * M_PI / 180.0, c = cos(facing), sn = sin(facing);
         const double spin[16] = {c, sn, 0, 0, -sn, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
         double to_middle[16], moved[16], spun[16], tilted[16], about_x[16], about_y[16];
