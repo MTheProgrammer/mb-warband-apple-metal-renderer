@@ -1,5 +1,16 @@
-// FXAA, MetalFX upscaling (spatial and temporal) and sharpening.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// FXAA, MetalFX upscaling (spatial and temporal) and sharpening (see upscale.h).
+
+#include "upscale.h"
+#include "shared.h"
+
+#import <MetalFX/MetalFX.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <map>
+
+namespace wbm __attribute__((visibility("hidden"))) {
 
 // ---- anti-aliasing after the fact ---------------------------------------------------------
 //
@@ -161,7 +172,7 @@ void apply_fxaa()
 // it (see the binding of textures in prepare_draw). Everything before that
 // pass, the engine's own effects and the shim's, works on the smaller picture,
 // which is where the time is saved.
-id<MTLFXSpatialScaler> s_scaler API_AVAILABLE(macos(13.0));
+WBM_HIDDEN id<MTLFXSpatialScaler> s_scaler API_AVAILABLE(macos(13.0));
 id<MTLTexture> s_upscaled;
 uint64_t s_upscale_frames;
 
@@ -192,8 +203,7 @@ id<MTLTexture> apply_upscale()
     s_scaler.colorTexture = scene;
     s_scaler.outputTexture = s_upscaled;
     [s_scaler encodeToCommandBuffer:command_buffer()];
-    for (auto &entry : s_textures)
-        if (entry.second.mtl == scene) entry.second.upscaled = s_upscaled, entry.second.upscaled_frame = s_frame_serial;
+    note_upscaled(scene, s_upscaled);
     s_upscale_frames++;
     return s_upscaled;
 }
@@ -209,7 +219,7 @@ id<MTLTexture> apply_upscale()
 //
 // The history is dropped whenever this frame does not follow from the last:
 // no scene in the frame before, a cut to another view, another size.
-id<MTLFXTemporalScaler> s_temporal_scaler API_AVAILABLE(macos(13.0));
+WBM_HIDDEN id<MTLFXTemporalScaler> s_temporal_scaler API_AVAILABLE(macos(13.0));
 id<MTLTexture> s_motion_texture;
 id<MTLRenderPipelineState> s_motion_pipeline;
 uint64_t s_temporal_frames, s_temporal_resets, s_temporal_last_frame = ~0ull;
@@ -332,8 +342,7 @@ id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
             [shown endEncoding];
         }
     }
-    for (auto &entry : s_textures)
-        if (entry.second.mtl == scene) entry.second.upscaled = s_upscaled, entry.second.upscaled_frame = s_frame_serial;
+    note_upscaled(scene, s_upscaled);
     s_temporal_last_frame = s_frame_serial;
     s_temporal_frames++;
     if (reset) s_temporal_resets++;
@@ -424,3 +433,5 @@ void apply_sharpen(id<MTLTexture> picture)
     [blit endEncoding];
     s_sharpen_frames++;
 }
+
+} // namespace wbm

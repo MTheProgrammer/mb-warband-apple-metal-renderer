@@ -1,5 +1,5 @@
 // Capturing a frame, and playing it back. Included by metal_backend.mm, inside
-// its anonymous namespace.
+// namespace wbm.
 //
 // A capture file holds everything the renderer has been given up to the start
 // of one frame (buffers, textures, programs, framebuffers, OpenGL state),

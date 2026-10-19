@@ -1,5 +1,5 @@
 // Frame capture and playback, and the previewer's calls.
-// Included by metal_backend.mm, after its anonymous namespace.
+// Included by metal_backend.mm, after namespace wbm.
 
 // ---- frame capture and playback (see frame_capture.inc) -------------------------------------------
 

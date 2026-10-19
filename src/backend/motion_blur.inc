@@ -1,5 +1,5 @@
 // Motion blur, and the movement of the scene for it and for temporal upscaling.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- motion blur ------------------------------------------------------------------------
 //
@@ -218,12 +218,6 @@ fragment float4 motion_show(VertexOut in [[stage_in]], texture2d<float> motion [
 }
 )";
 
-struct BlurParams { // must match Params in k_blur_source
-    float reproject[16];
-    float inverse_w[4];
-    float size[2];
-    float reversed, exposure, near_start, near_end, max_length, has_objects, has_swayed, spare[3];
-};
 id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, NSUInteger h);
 
 id<MTLLibrary> s_blur_library;

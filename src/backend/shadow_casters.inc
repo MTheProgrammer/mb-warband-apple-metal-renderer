@@ -1,5 +1,5 @@
 // The per-frame shadow map: what casts, and the casters' and torches' shaders.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- the per-frame shadow map -------------------------------------------------------------
 //

@@ -1,5 +1,5 @@
 // Foliage weights for wind, the eyes' gaze and the frame-rate limit.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // Foliage that the engine hands over in batches, many plants in one buffer and
 // already placed in the world, carries nothing that says how high above its

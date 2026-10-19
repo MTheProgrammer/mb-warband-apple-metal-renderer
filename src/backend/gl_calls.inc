@@ -1,5 +1,5 @@
 // OpenGL calls: clears, viewport, fixed-function state, queries, buffers and vertex arrays.
-// Included by metal_backend.mm, after its anonymous namespace.
+// Included by metal_backend.mm, after namespace wbm.
 
 // ---- clears, viewport, fixed-function state ------------------------------------------------------
 

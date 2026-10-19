@@ -1,5 +1,5 @@
 // Ambient occlusion, contact shadows, light shafts and bounce light.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- ambient occlusion ---------------------------------------------------------------
 

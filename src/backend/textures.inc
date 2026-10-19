@@ -1,5 +1,5 @@
 // Texture formats, storage and samplers.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- textures and samplers ---------------------------------------------------------------
 

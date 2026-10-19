@@ -1,5 +1,5 @@
 // Strands of hair: horses' manes and tails, and people's loose hair.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // Strands. Where a coat's hair map marks long hair, roots are scattered over
 // the mesh's triangles, as many as their area asks for, and for each root a

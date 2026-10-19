@@ -1,5 +1,5 @@
 // Preparing a draw: pipeline, uniforms, textures and buffers.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // This frame's clip space to the last one's (OpenGL's, column by column), once this
 // frame's camera has been seen; until then, and after a gap, as if nothing had moved.

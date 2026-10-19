@@ -1,5 +1,5 @@
 // The library's objects (textures, buffers, programs, pipelines) and the device and frame state.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 enum {
     MAX_ATTRIBS = 16,

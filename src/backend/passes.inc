@@ -1,5 +1,5 @@
 // Command buffers, render targets and passes; uniform storage.
-// Included by metal_backend.mm, inside its anonymous namespace.
+// Included by metal_backend.mm, inside namespace wbm.
 
 // ---- command buffer and passes -----------------------------------------------------
 
