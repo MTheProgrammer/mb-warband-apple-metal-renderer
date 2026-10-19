@@ -64,6 +64,7 @@ struct Texture {
     bool replaced = false; // holds a texture pack's image instead of the game's (see texture_packs.inc)
     float hair_colour[4] = {0, 0, 0, 0}; // the long hair's own colour, as painted (0 to 1); w 1 when a hair map came with one
     id<MTLTexture> hair;   // a pack's hair map for this texture (<name>_hair), see k_fur_function in shader_xlate.cpp
+    id<MTLTexture> sheen;  // a pack's sheen map (<name>_sheen, glTF's KHR_materials_sheen): colour, and roughness in alpha
     id<MTLTexture> pbr;    // a pack's metalness and roughness map for this texture, see k_xl_pbr_sampler
     id<MTLTexture> depth;  // a pack's map of the surface's heights (<name>_depth), for parallax
     // How the game asked for level 0, kept so that a frame capture can ask again (see frame_capture.inc).
@@ -128,6 +129,7 @@ struct UniformLocation {
     bool is_sky = false;                              // the wbm_sky sampler, which gets the sky atlas
     bool is_hair_map = false;                         // the wbm_hair_map sampler, which gets the bound texture's hair map
     bool is_fur_map = false;                          // the wbm_fur_map sampler, which gets the same map
+    bool is_sheen_map = false;                        // the wbm_sheen_map sampler, which gets the bound texture's sheen map
     bool is_depth_map = false;                        // the wbm_depth_map sampler, which gets the bound texture's map of heights
     bool is_pbr_map = false;                          // the wbm_pbr_map sampler, which gets the bound texture's metalness map
     bool is_scene_copy = false;                       // the wbm_scene sampler, which gets the scene as it was before water was drawn
@@ -183,6 +185,7 @@ struct Program {
     int wind_offset = -1;          // vertex stage, see k_xl_wind_uniform
     int hair_colour_offset = -1; // fragment stage, the same
     int horse_eye_offset = -1; // fragment stage, the same
+    int sheen_offset = -1;     // fragment stage: wbm_sheen, see k_fur_function
     int shell_offset[2] = {-1, -1}; // per stage: wbm_shell, see k_fur_function
     int drift_offset = -1;          // vertex stage: wbm_drift, see drift_of
     int fur_offset = -1;      // fragment stage, see k_fur_function in shader_xlate.cpp
@@ -526,6 +529,8 @@ float s_fur_length = 0.012f, s_fur_range = 9.0f, s_fur_density = 1400.0f; // WBM
 float s_shell_now[4];  // the shaders' wbm_shell for the draw being prepared
 uint64_t s_shell_draws;
 float s_fur_strength; // WBM_FUR: the coat of horses, 0 for none
+float s_fur_anisotropy = 0.8f; // WBM_FUR_ANISOTROPY: glTF's anisotropyStrength, times the hair map's blue (see k_fur_function)
+float s_fur_sheen = 1.0f;      // WBM_FUR_SHEEN: the sheen map's strength
 float s_gaze_strength = 1.0f; // WBM_EYES_MOVE: how far the eyes wander; 0 keeps them still
 float s_skin_backlight = 0.6f; // WBM_SSS_BACKLIGHT: sunlight through thin skin; 0 for none
 // The game's texture files, keyed by content: filled once at start, read-only afterwards.
@@ -1205,7 +1210,7 @@ void link_program(GLuint program_id, Program &p)
     p.locations.clear();
     p.location_by_name.clear();
     p.yflip_offset = p.jitter_offset = p.hash_frame_offset = p.reproject_offset = p.wind_before_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
-    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
+    p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.sheen_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
     s_last_key_program = 0; // the pipeline remembered from the previous draw may be this program's
@@ -1261,6 +1266,7 @@ void link_program(GLuint program_id, Program &p)
                 p.locations.back().is_scene_copy = name == "wbm_scene";
                 p.locations.back().is_pbr_map = name == k_xl_pbr_sampler;
                 p.locations.back().is_depth_map = name == "wbm_depth_map";
+                p.locations.back().is_sheen_map = name == "wbm_sheen_map";
                 p.locations.back().is_fur_map = name == "wbm_fur_map";
                 p.locations.back().is_hair_map = name == "wbm_hair_map";
                 p.locations.back().is_sun_matrix = name == "matSunViewProj";
@@ -1293,6 +1299,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
             else if (u.name == "wbm_fur") p.fur_offset = u.offset;
             else if (u.name == "wbm_horse_eye") p.horse_eye_offset = u.offset;
+            else if (u.name == "wbm_sheen") p.sheen_offset = u.offset;
             else if (u.name == "wbm_hair_colour") p.hair_colour_offset = u.offset;
             else if (u.name == "wbm_shell") p.shell_offset[s] = u.offset;
             else if (u.name == "wbm_drift" && s == 0) p.drift_offset = u.offset;
@@ -4667,6 +4674,14 @@ bool prepare_draw()
                 p->uniform_dirty[1] = true;
             }
         }
+        if (p->sheen_offset >= 0) {
+            // The glTF materials' way: a highlight stretched along the hair and a sheen, where the pack has both maps.
+            const float sheen[4] = {diffuse && diffuse->sheen && diffuse->hair && diffuse->pbr ? 1.0f : 0.0f, s_fur_anisotropy, s_fur_sheen, 0};
+            if (memcmp(p->uniform_data[1].data() + p->sheen_offset, sheen, 16)) {
+                memcpy(p->uniform_data[1].data() + p->sheen_offset, sheen, 16);
+                p->uniform_dirty[1] = true;
+            }
+        }
         if (memcmp(p->uniform_data[1].data() + p->fur_offset, fur, 16)) {
             memcpy(p->uniform_data[1].data() + p->fur_offset, fur, 16);
             p->uniform_dirty[1] = true;
@@ -4888,6 +4903,9 @@ bool prepare_draw()
                 if (s_dyn_sampler) sampler = s_dyn_sampler;
             } else if (l.is_hair_map) {
                 texture = diffuse && diffuse->hair ? diffuse->hair : s_white;
+                sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
+            } else if (l.is_sheen_map) {
+                texture = diffuse && diffuse->sheen ? diffuse->sheen : s_white;
                 sampler = diffuse && diffuse->mtl ? sampler_for(*diffuse) : s_samplers.begin()->second;
             } else if (l.is_depth_map) {
                 texture = diffuse && diffuse->depth ? diffuse->depth : s_white;
@@ -5366,6 +5384,8 @@ void mtl_attach_window(void *nswindow, int width, int height)
     s_shader_options.skin_scattering = sss_env && atoi(sss_env) != 0; // off unless set
     s_shader_options.eyes = getenv("WBM_EYES") && atoi(getenv("WBM_EYES")) != 0; // off unless set
     if (const char *v = getenv("WBM_FUR")) s_fur_strength = std::max(0.0f, (float)atof(v));
+    if (const char *v = getenv("WBM_FUR_ANISOTROPY")) s_fur_anisotropy = std::min(1.0f, std::max(0.0f, (float)atof(v)));
+    if (const char *v = getenv("WBM_FUR_SHEEN")) s_fur_sheen = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_FUR_SHELLS")) s_fur_shells = std::min(24, std::max(0, atoi(v)));
     if (const char *v = getenv("WBM_HAIR_LENGTH")) s_hair_length = std::max(0.0f, (float)atof(v));
     if (const char *v = getenv("WBM_HAIR_STRANDS")) s_hair_strands = atoi(v) != 0;
