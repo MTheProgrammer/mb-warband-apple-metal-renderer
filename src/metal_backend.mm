@@ -764,9 +764,26 @@ void gen_ids(GLuint &counter, GLsizei n, GLuint *out)
 
 // ---- command buffer and passes -----------------------------------------------------
 
+// The time the GPU spends on each command buffer, added up (for the summary: how heavy a frame is for the
+// GPU, which wall-clock time over a run cannot say on a machine doing other things).
+std::atomic<double> s_gpu_seconds{0};
+std::atomic<uint64_t> s_gpu_buffers{0};
+id<MTLCommandBuffer> timed(id<MTLCommandBuffer> cmd)
+{
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      double t = done.GPUEndTime - done.GPUStartTime;
+      if (t > 0 && t < 1) {
+          double was = s_gpu_seconds.load();
+          while (!s_gpu_seconds.compare_exchange_weak(was, was + t)) {}
+          s_gpu_buffers++;
+      }
+    }];
+    return cmd;
+}
+
 id<MTLCommandBuffer> command_buffer()
 {
-    if (!s_cmd) s_cmd = [s_queue commandBuffer];
+    if (!s_cmd) s_cmd = timed([s_queue commandBuffer]);
     return s_cmd;
 }
 
@@ -3638,6 +3655,11 @@ id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, N
     };
     std::vector<Pair> pairs;
     size_t bytes = 0;
+    // Last frame's objects by mesh: in a forest there are a thousand and more of each, and comparing every one
+    // with every other took longer than drawing them.
+    std::unordered_multimap<uint64_t, PastObject *> past_by_mesh;
+    past_by_mesh.reserve(s_past_objects.size());
+    for (PastObject &o : s_past_objects) past_by_mesh.emplace(o.mesh, &o);
     const size_t static_size = 256, skinned_size = 4352; // 128 and 4224 bytes, rounded up to the offset alignment
     for (const VelocityDraw &v : s_velocity_draws) {
         const float *m = v.c.wvp, *at = v.origin;
@@ -3650,8 +3672,10 @@ id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, N
         // upscaling a wrong movement drags the picture with it. Nor from far off, for the same reason.
         PastObject *best = nullptr;
         double nearest = 0.25;
-        for (PastObject &o : s_past_objects) {
-            if (o.mesh != v.c.mesh || o.origin[3] < 1e-3f || (o.bones >= 0) != (v.bones >= 0)) continue;
+        auto same = past_by_mesh.equal_range(v.c.mesh);
+        for (auto it = same.first; it != same.second; ++it) {
+            PastObject &o = *it->second;
+            if (o.origin[3] < 1e-3f || (o.bones >= 0) != (v.bones >= 0)) continue;
             double d = hypot(o.origin[0] / o.origin[3] - expected[0] / expected[3], o.origin[1] / o.origin[3] - expected[1] / expected[3]) + fabs(log(o.origin[3] / expected[3])) * 3.0;
             if (d < nearest) nearest = d, best = &o;
         }
@@ -4215,7 +4239,7 @@ void render_torch_shadows(const std::vector<CasterDraw> &casters, const std::vec
     torches.depth[2] = s_torch_self;
 
     id<MTLTexture> map = torch_map(true);
-    id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
+    id<MTLCommandBuffer> cmd = timed([s_queue commandBuffer]);
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     d.depthAttachment.texture = map;
     d.depthAttachment.loadAction = MTLLoadActionClear;
@@ -4433,7 +4457,7 @@ void render_dynamic_shadows(Program &p)
     id<MTLBuffer> uniforms = [s_device newBufferWithLength:total options:MTLResourceStorageModeShared];
     uint8_t *base = (uint8_t *)uniforms.contents;
 
-    id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
+    id<MTLCommandBuffer> cmd = timed([s_queue commandBuffer]);
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     d.colorAttachments[0].texture = s_dyn_map;
     d.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -4991,7 +5015,7 @@ void capture_sky(MTLPrimitiveType primitive, NSUInteger count, MTLIndexType inde
         {{1, 0, 0}, {0, 0, 1}}, {{-1, 0, 0}, {0, 0, 1}}, {{0, 1, 0}, {0, 0, 1}},
         {{0, -1, 0}, {0, 0, 1}}, {{0, 0, 1}, {0, 1, 0}}, {{0, 0, -1}, {0, 1, 0}}};
 
-    id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
+    id<MTLCommandBuffer> cmd = timed([s_queue commandBuffer]);
     for (int f = 0; f < 6; f++) {
         const double *fw = faces[f][0], *up = faces[f][1];
         double right[3] = {fw[1] * up[2] - fw[2] * up[1], fw[2] * up[0] - fw[0] * up[2], fw[0] * up[1] - fw[1] * up[0]};
@@ -5507,6 +5531,8 @@ const char *mtl_device_name()
 
 void mtl_dump_stats(FILE *f)
 {
+    if (s_gpu_buffers && s_frame_serial)
+        fprintf(f, "\nGPU time: %.2f ms a frame on average, over %llu frames\n", s_gpu_seconds.load() * 1000.0 / (double)s_frame_serial, (unsigned long long)s_frame_serial);
     fprintf(f, "\n== Metal shaders ==\n%d programs linked, %d from the disk cache, %.0f ms translating\n", s_shader_stats.links,
             s_shader_stats.cache_hits, s_shader_stats.translate_ms);
     fprintf(f, "%d distinct shaders compiled by Metal in the background, %.0f ms spent waiting for them at draws\n",
