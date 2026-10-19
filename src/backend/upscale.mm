@@ -224,6 +224,102 @@ id<MTLTexture> s_motion_texture;
 id<MTLRenderPipelineState> s_motion_pipeline;
 uint64_t s_temporal_frames, s_temporal_resets, s_temporal_last_frame = ~0ull;
 
+bool s_reactive;
+float s_reactive_cap = 0.9f;
+id<MTLTexture> s_scene_reactive;          // at the scene's size, R8
+uint64_t s_scene_reactive_frame = ~0ull;  // the frame it was last cleared in
+bool s_scaler_reactive;                   // the scaler was made to take it
+uint64_t s_reactive_frames;
+
+bool reactive_texture_for(id<MTLTexture> color)
+{
+    if (!s_scene_reactive || s_scene_reactive.width != color.width || s_scene_reactive.height != color.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:color.width height:color.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_scene_reactive = [s_device newTextureWithDescriptor:td];
+        s_scene_reactive_frame = ~0ull;
+    }
+    return s_scene_reactive != nil;
+}
+
+bool attach_reactive_mask(MTLRenderPassDescriptor *d, id<MTLTexture> color)
+{
+    if (!reactive_texture_for(color)) return false;
+    d.colorAttachments[2].texture = s_scene_reactive;
+    d.colorAttachments[2].loadAction = s_scene_reactive_frame == s_frame_serial ? MTLLoadActionLoad : MTLLoadActionClear;
+    d.colorAttachments[2].storeAction = MTLStoreActionStore;
+    d.colorAttachments[2].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    s_scene_reactive_frame = s_frame_serial;
+    return true;
+}
+
+// The mask for this frame's scene: the one its passes drew, or, when none of them did (or at another
+// size), one cleared to nothing, since a scaler made to take a mask must be given one.
+id<MTLTexture> reactive_mask_for(id<MTLTexture> scene)
+{
+    if (s_scene_reactive && s_scene_reactive_frame == s_frame_serial && s_scene_reactive.width == scene.width && s_scene_reactive.height == scene.height)
+        return s_scene_reactive;
+    if (!reactive_texture_for(scene)) return nil;
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = s_scene_reactive;
+    d.colorAttachments[0].loadAction = MTLLoadActionClear;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    [[command_buffer() renderCommandEncoderWithDescriptor:d] endEncoding];
+    s_scene_reactive_frame = ~0ull; // not drawn by this frame's scene
+    return s_scene_reactive;
+}
+
+// WBM_DEBUG_REACTIVE: the mask in red over the scene, dimmed.
+const char k_reactive_show_source[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexOut { float4 position [[position]]; float2 uv; };
+vertex VertexOut reactive_vertex(uint id [[vertex_id]])
+{
+    float2 p = float2((id << 1) & 2, id & 2);
+    VertexOut out;
+    out.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = float2(p.x, 1.0 - p.y);
+    return out;
+}
+fragment float4 reactive_show(VertexOut in [[stage_in]], texture2d<float> scene [[texture(0)]], texture2d<float> mask [[texture(1)]])
+{
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float m = mask.sample(s, in.uv).r;
+    return float4(mix(scene.sample(s, in.uv).rgb * 0.35, float3(1.0, 0.1, 0.1), m), 1.0);
+}
+)";
+
+void show_reactive_mask(id<MTLTexture> scene, id<MTLTexture> mask, id<MTLTexture> out)
+{
+    static id<MTLRenderPipelineState> pipeline;
+    if (!pipeline) {
+        NSError *error = nil;
+        id<MTLLibrary> lib = [s_device newLibraryWithSource:@(k_reactive_show_source) options:nil error:&error];
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"reactive_vertex"];
+        pd.fragmentFunction = [lib newFunctionWithName:@"reactive_show"];
+        pd.colorAttachments[0].pixelFormat = out.pixelFormat;
+        if (lib) pipeline = [s_device newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!pipeline) {
+            complain("WBM_DEBUG_REACTIVE: %s", error.localizedDescription.UTF8String);
+            return;
+        }
+    }
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = out;
+    d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> pass = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    [pass setRenderPipelineState:pipeline];
+    [pass setFragmentTexture:scene atIndex:0];
+    [pass setFragmentTexture:mask atIndex:1];
+    [pass drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pass endEncoding];
+}
+
 id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
 {
     id<MTLTexture> scene = s_last.color, depth = s_last.depth;
@@ -240,6 +336,14 @@ id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
         d.depthTextureFormat = depth.pixelFormat;
         d.motionTextureFormat = MTLPixelFormatRG16Float;
         d.autoExposureEnabled = YES; // the scene's colours are as shown, and nothing here knows the exposure the engine will choose
+        s_scaler_reactive = false;
+        if (@available(macOS 14.4, *)) {
+            if (s_reactive) {
+                d.reactiveMaskTextureEnabled = YES;
+                d.reactiveMaskTextureFormat = MTLPixelFormatR8Unorm;
+                s_scaler_reactive = true;
+            }
+        }
         s_temporal_scaler = [d newTemporalScalerWithDevice:s_device];
         if (!s_temporal_scaler) {
             complain("WBM_UPSCALE_MODE=temporal: MetalFX would not make a scaler from %lux%lu to %lux%lu; the spatial one is used", (unsigned long)scene.width, (unsigned long)scene.height,
@@ -317,6 +421,11 @@ id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
     s_temporal_scaler.jitterOffsetY = (float)s_jitter_sign * s_jitter[1];
     s_temporal_scaler.depthReversed = s_reverse_depth;
     s_temporal_scaler.reset = reset;
+    id<MTLTexture> mask = s_scaler_reactive ? reactive_mask_for(scene) : nil;
+    if (@available(macOS 14.4, *)) {
+        if (s_scaler_reactive) s_temporal_scaler.reactiveMaskTexture = mask;
+    }
+    if (mask && s_scene_reactive_frame == s_frame_serial) s_reactive_frames++;
     [s_temporal_scaler encodeToCommandBuffer:command_buffer()];
     static const bool show = getenv("WBM_DEBUG_MOTION") != nullptr;
     if (show) {
@@ -342,6 +451,8 @@ id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
             [shown endEncoding];
         }
     }
+    static const bool show_mask = getenv("WBM_DEBUG_REACTIVE") != nullptr;
+    if (show_mask && mask) show_reactive_mask(scene, mask, s_upscaled);
     note_upscaled(scene, s_upscaled);
     s_temporal_last_frame = s_frame_serial;
     s_temporal_frames++;

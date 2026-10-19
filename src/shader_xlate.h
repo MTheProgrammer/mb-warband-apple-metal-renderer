@@ -131,6 +131,15 @@ struct XlOptions {
     // (xy, in clip space), and its distance (z). Adds the vertex uniforms
     // wbm_reproject and wbm_wind_before. For temporal upscaling.
     bool motion_vectors = false;
+    // For temporal upscaling's reactive mask: every fragment shader also writes,
+    // into a third colour target (location 2), how much of what it draws the
+    // scaler should take from this frame alone: its alpha, or reactive_water
+    // for water. Whether a draw marks the mask at all is the pipeline's choice
+    // (see PipelineKey::reactive): blended draws that leave depth alone do.
+    // Adds the uniform wbm_reactive: x 1 when the draw's blending adds (then
+    // brightness counts too), y the most a pixel may be marked.
+    bool reactive_mask = false;
+    float reactive_water = 0.5f;
     // Shadows from the engine's point lights: shaders that are lit by them look
     // their surface up in a cube of depths per light, which the backend draws.
     // Adds the sampler and uniforms described at k_xl_torch_sampler.

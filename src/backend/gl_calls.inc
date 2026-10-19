@@ -90,6 +90,7 @@ void mtl_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum)
     if (!id || size <= 0) return;
     @autoreleasepool {
         Buffer &b = s_buffers[id];
+        b.filled_frame = s_frame_serial;
         b.mtl = data ? [s_device newBufferWithBytes:data length:(NSUInteger)size options:MTLResourceStorageModeShared]
                      : [s_device newBufferWithLength:(NSUInteger)size options:MTLResourceStorageModeShared];
     }
