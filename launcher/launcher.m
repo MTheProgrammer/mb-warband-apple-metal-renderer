@@ -31,6 +31,18 @@ typedef struct {
 } Option;
 
 static const Option k_options[] = {
+    // The game's own settings, as its launcher (MBWLauncher.app) offers them: the name is "_" and the key in rgl_config.txt
+    // (see game_value), the first value is the game's default, and the presets leave them alone. Its anti-aliasing is left
+    // out: under Metal the multisampling below takes its place.
+    {"Video", "_display", "Resolution", "The size the game draws at. Below the screen's own, the picture is enlarged to fill the screen.", kChoice, "", "", "", NULL, 0, 0, 0},
+    {"Video", "_start_windowed", "Start in a window", "Otherwise the game fills the screen.", kToggle, "0", "", "", NULL, 0, 0, 0},
+    {"Video", "_force_vsync", "Vertical sync", "Each frame waits for the display, so the picture does not tear.", kToggle, "1", "", "", NULL, 0, 0, 0},
+    {"Video", "_max_framerate", "Frame rate limit", "Fewer frames means a cooler, quieter machine.", kChoice, "60", "", "",
+     "30=30|60=60|90=90|120=120|144=144|240=240|1000=None", 0, 0, 0},
+    {"Video", "_texture_detail", "Texture detail", "Lower loads smaller textures, for graphics cards with little memory.", kSlider, "100", "", "", NULL, 0, 100, 5},
+    {"Video", "_shadowmap_quality", "Shadow detail", "The resolution of the game's shadow map of the scenery.", kChoice, "2", "", "",
+     "0=Low|1=Medium|2=High|3=Ultra high", 0, 0, 0},
+
     {"Shadows and light", "WBM_SHADOWS", "Shadow edges", "How the edges of the game's shadows are filtered.", kChoice, "2", "1", "0",
      "0=As the game has them|1=Soft|2=Soft, wider with distance", 0, 0, 0},
     {"Shadows and light", "WBM_DYNAMIC_SHADOWS", "Shadows from characters", "People, horses and gear cast shadows on everything, hair included.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
@@ -50,24 +62,23 @@ static const Option k_options[] = {
     {"Materials and colour", "WBM_TRILINEAR", "Smooth texture detail", "Textures blend from sharp to coarse with distance instead of switching at a visible line.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Materials and colour", "WBM_TONEMAP", "Filmic tone map", "Bright areas roll off smoothly instead of clipping.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Materials and colour", "WBM_HDR", "HDR output", "Highlights go above white on displays that can show it.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    {"Materials and colour", "WBM_PARALLAX", "Depth in stone", "Stones stand out from their joints on walls and buildings nearby, by this many metres. 0 for none.", kSlider, "0.05", "0", "0", NULL, 0, 0.12, 0.01},
+    {"Materials and colour", "WBM_WATER", "Water", "Glitter from the sun, paler shallows and foam at the shore.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    {"Materials and colour", "WBM_WATER_REFLECTIONS", "Reflections in water", "Water mirrors banks, trees and people, and bends the view of its bed. Costs most where water fills the screen.", kToggle, "1", "0", "0", NULL, 0, 0, 0},
 
     {"People", "WBM_SSS", "Skin", "Light scatters in skin: soft at the edge of a shadow, glowing through ears.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"People", "WBM_EYES", "Eyes", "A highlight and a reflection in the eyes, which also move a little.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"People", "WBM_PEOPLE_HAIR", "Hair strands", "Loose strands over the hair and beards of people nearby.", kToggle, "1", "0", "0", NULL, 0, 0, 0},
 
-    {"Horses", "WBM_FUR", "Coat", "A soft, velvety coat. Needs a texture pack with coat maps.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
-    {"Horses", "WBM_FUR_SHELLS", "Fur layers", "Layers of short fur on horses nearby; more is finer and slower. 0 for none.", kSlider, "12", "6", "0", NULL, 0, 24, 1},
-    {"Horses", "WBM_HAIR_STRANDS", "Mane and tail as strands", "Strands that hang, swing and stream behind. Needs a texture pack with hair maps.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    // Horses' coat, fur layers and mane and tail strands (WBM_FUR, WBM_FUR_SHELLS, WBM_HAIR_STRANDS) need a texture pack's
+    // coat and hair maps, which the release does not bring: they are left out of the window.
 
-    {"Materials and colour", "WBM_PARALLAX", "Depth in stone", "Stones stand out from their joints on walls and buildings nearby, by this many metres. 0 for none.", kSlider, "0.05", "0", "0", NULL, 0, 0.12, 0.01},
-    {"Materials and colour", "WBM_WATER", "Water", "Glitter from the sun, paler shallows and foam at the shore.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
-
-    {"Materials and colour", "WBM_WATER_REFLECTIONS", "Reflections in water", "Water mirrors banks, trees and people, and bends the view of its bed. Costs most where water fills the screen.", kToggle, "1", "0", "0", NULL, 0, 0, 0},
     {"Trees and grass", "WBM_WIND", "Wind", "How much trees, bushes and grass sway. 0 for none.", kSlider, "1", "1", "0", NULL, 0, 2, 0.1},
     {"Trees and grass", "WBM_FOLIAGE", "Light through leaves", "Sunlight coming through leaves seen from their far side.", kSlider, "0.6", "0.6", "0", NULL, 0, 1, 0.1},
 
     {"Picture", "WBM_MSAA", "Multisampling", "Smooths edges as they are drawn. The costliest setting.", kChoice, "1", "1", "4", "1=Off|2=2x|4=4x", 0, 0, 0},
     {"Picture", "WBM_FXAA", "Edge smoothing", "Smooths edges after the scene is drawn. Cheap.", kToggle, "1", "1", "0", NULL, 0, 0, 0},
+    {"Picture", "WBM_ALPHA_HASH", "Soft edges on leaves and hair", "Cut-out edges are smoothed over several frames. Only with temporal enlarging (Speed).", kToggle, "1", "1", "0", NULL, 0, 0, 0},
     {"Picture", "WBM_MOTION_BLUR", "Motion blur", "Blur from the camera's movement, and of things that move: swords, legs, horses.", kToggle, "0", "0", "0", NULL, 0, 0, 0},
     {"Picture", "WBM_SHARPEN", "Sharpening", "0 for none. About 0.3 is plenty together with upscaling.", kSlider, "0", "0.3", "0", NULL, 0, 1, 0.05},
 
@@ -77,11 +88,19 @@ static const Option k_options[] = {
 
     {"Speed", "WBM_UPSCALE", "Draw smaller and enlarge", "The scene is drawn smaller and enlarged by MetalFX; the interface stays sharp.", kChoice, "", "0.67", "",
      "=Off|0.8=80% of the size|0.67=67% of the size|0.5=Half the size", 0, 0, 0},
-    {"Speed", "WBM_MAX_FPS", "Frame rate limit", "Fewer frames means a cooler, quieter machine.", kChoice, "", "", "", "=The game's own|120=120|90=90|60=60|30=30", 0, 0, 0},
-    {"Speed", "WBM_MENU_FPS", "Limit in menus", "The same for menus and loading screens.", kChoice, "", "60", "", "=The game's own|60=60|30=30", 0, 0, 0},
+    {"Speed", "WBM_UPSCALE_MODE", "Enlarge with", "Temporal builds the picture from several frames: nearer the full-size picture, and smooths edges itself, for a few milliseconds more.", kChoice, "", "", "",
+     "=Spatial|temporal=Temporal", 0, 0, 0},
+    {"Speed", "WBM_MENU_FPS", "Frame rate in menus", "A lower limit for menus and loading screens than the one under Video.", kChoice, "", "60", "", "=The game's own|60=60|30=30", 0, 0, 0},
 
-    // Not one of the library's variables (the name begins with "_"): a line of the game's own rgl_config.txt, and no part of the presets.
-    {"Game", "_edit_mode", "Edit mode", "The game's own scene editor and free camera: Ctrl+E in a scene.", kToggle, "1", "", "", NULL, 0, 0, 0},
+    {"Game", "_language", "Language", "The game's text.", kChoice, "en", "", "", NULL, 0, 0, 0},
+    {"Game", "_enable_blood", "Blood", "Blood on hits and on the ground.", kToggle, "1", "", "", NULL, 0, 0, 0},
+    {"Game", "_cheat_mode", "Cheats", "The game's cheat keys, such as Ctrl+T to see the whole map.", kToggle, "0", "", "", NULL, 0, 0, 0},
+    {"Game", "_enable_version_check", "Version check", "The game looks for a newer version when it starts.", kToggle, "1", "", "", NULL, 0, 0, 0},
+    {"Game", "_enable_edit_mode", "Edit mode", "The game's own scene editor and free camera: Ctrl+E in a scene.", kToggle, "0", "", "", NULL, 0, 0, 0},
+
+    {"Sound", "_disable_sound", "Sound", "All of the game's sounds.", kToggle, "1", "", "", NULL, 0, 0, 0},
+    {"Sound", "_disable_music", "Music", "The game's music.", kToggle, "1", "", "", NULL, 0, 0, 0},
+    {"Sound", "_disable_frequency_variation", "Pitch variation", "Repeated sounds vary a little in pitch.", kToggle, "1", "", "", NULL, 0, 0, 0},
 };
 static const int k_option_count = sizeof k_options / sizeof k_options[0];
 static NSString *const k_presets[] = {@"Everything on", @"Everything but hair", @"Faster", @"As the game looks"};
@@ -96,42 +115,141 @@ static NSString *module_file(void) { return [NSHomeDirectory() stringByAppending
 static NSString *binary_in(NSString *game) { return [game stringByAppendingPathComponent:@"Mount and Blade.app/Contents/MacOS/Mount and Blade"]; }
 static BOOL is_game(NSString *game) { return game.length && [[NSFileManager defaultManager] isExecutableFileAtPath:binary_in(game)]; }
 
-// "Everything but hair" is "Everything on" without the fur layers and the strands, which cost the most of all.
+// "Everything but hair" is "Everything on" without people's hair strands, which cost the most of all.
 static BOOL is_game_setting(const Option *o) { return o->env[0] == '_'; }
-static NSString *game_config(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/MBWarband/rgl_config.txt"]; }
+static NSString *game_folder(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/MBWarband"]; }
+static NSString *game_config(void) { return [game_folder() stringByAppendingPathComponent:@"rgl_config.txt"]; }
+static NSString *language_file(void) { return [game_folder() stringByAppendingPathComponent:@"language.txt"]; }
+static NSString *trimmed(NSString *s) { return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; }
 
-// A line "key = value" of the game's rgl_config.txt: read (nil when there is none), and rewritten in place.
-static NSString *config_value(NSString *key)
+// The game's rgl_config.txt, "key = value" a line, as a dictionary (empty when the game has not been run yet).
+static NSDictionary<NSString *, NSString *> *read_config(void)
 {
+    NSMutableDictionary *config = [NSMutableDictionary dictionary];
     NSString *text = [NSString stringWithContentsOfFile:game_config() encoding:NSUTF8StringEncoding error:nil];
     for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
         NSArray<NSString *> *parts = [line componentsSeparatedByString:@"="];
-        if (parts.count == 2 && [[parts[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] isEqualToString:key])
-            return [parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (parts.count == 2 && trimmed(parts[0]).length) config[trimmed(parts[0])] = trimmed(parts[1]);
     }
-    return nil;
+    return config;
 }
 
-static void set_config_value(NSString *key, NSString *value)
+// Rewrites those lines of rgl_config.txt in place, and adds the ones it lacks.
+static void write_config(NSDictionary<NSString *, NSString *> *changes)
 {
-    NSString *text = [NSString stringWithContentsOfFile:game_config() encoding:NSUTF8StringEncoding error:nil];
-    if (!text) return; // the game has not been run yet: it writes the file itself
+    NSString *text = [NSString stringWithContentsOfFile:game_config() encoding:NSUTF8StringEncoding error:nil] ?: @"";
     NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
+    NSMutableSet<NSString *> *left = [NSMutableSet setWithArray:changes.allKeys];
+    BOOL changed = NO;
     for (NSUInteger i = 0; i < lines.count; i++) {
         NSArray<NSString *> *parts = [lines[i] componentsSeparatedByString:@"="];
-        if (parts.count == 2 && [[parts[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] isEqualToString:key]) {
-            if ([[parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] isEqualToString:value]) return;
-            lines[i] = [NSString stringWithFormat:@"%@ = %@", key, value];
-            [[lines componentsJoinedByString:@"\n"] writeToFile:game_config() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            return;
-        }
+        NSString *key = parts.count == 2 ? trimmed(parts[0]) : nil, *value = key ? changes[key] : nil;
+        if (!value) continue;
+        [left removeObject:key];
+        if ([trimmed(parts[1]) isEqualToString:value]) continue;
+        lines[i] = [NSString stringWithFormat:@"%@ = %@", key, value];
+        changed = YES;
     }
+    for (NSString *key in [left.allObjects sortedArrayUsingSelector:@selector(compare:)]) { // a blank line after each, as the game writes it
+        NSUInteger at = lines.count && !lines.lastObject.length ? lines.count - 1 : lines.count;
+        [lines insertObjects:@[[NSString stringWithFormat:@"%@ = %@", key, changes[key]], @""] atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(at, 2)]];
+        changed = YES;
+    }
+    if (!changed) return;
+    [[NSFileManager defaultManager] createDirectoryAtPath:game_folder() withIntermediateDirectories:YES attributes:nil error:nil];
+    [[lines componentsJoinedByString:@"\n"] writeToFile:game_config() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// A game setting as the window shows it, read from the game's files; nil when they do not say. "_display" is
+// display_width and display_height together, "_language" is language.txt, and a "disable_" key is shown the other
+// way round ("Music" on is disable_music = 0).
+static NSString *game_value(const Option *o, NSDictionary<NSString *, NSString *> *config)
+{
+    NSString *key = [S(o->env) substringFromIndex:1];
+    if ([key isEqualToString:@"display"])
+        return config[@"display_width"] && config[@"display_height"] ? [NSString stringWithFormat:@"%@x%@", config[@"display_width"], config[@"display_height"]] : nil;
+    if ([key isEqualToString:@"language"]) {
+        NSString *code = trimmed([NSString stringWithContentsOfFile:language_file() encoding:NSUTF8StringEncoding error:nil] ?: @"");
+        return code.length ? code : nil;
+    }
+    NSString *value = config[key];
+    if (value && [key hasPrefix:@"disable_"]) return value.intValue ? @"0" : @"1";
+    return value;
+}
+
+// The game's files made to say what the window does: the reverse of game_value.
+static void write_game_settings(NSDictionary<NSString *, NSString *> *values)
+{
+    NSMutableDictionary *changes = [NSMutableDictionary dictionary];
+    for (int i = 0; i < k_option_count; i++) {
+        const Option *o = &k_options[i];
+        NSString *key = [S(o->env) substringFromIndex:1], *value = values[S(o->env)];
+        if (!is_game_setting(o) || !value.length) continue;
+        if ([key isEqualToString:@"display"]) {
+            NSArray<NSString *> *size = [value componentsSeparatedByString:@"x"];
+            if (size.count == 2) changes[@"display_width"] = size[0], changes[@"display_height"] = size[1];
+        } else if ([key isEqualToString:@"language"]) {
+            if (![game_value(o, @{}) isEqualToString:value]) [value writeToFile:language_file() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else if ([key hasPrefix:@"disable_"])
+            changes[key] = value.intValue ? @"0" : @"1";
+        else
+            changes[key] = value;
+    }
+    write_config(changes);
+}
+
+// The sizes offered for the game: the main screen's own (in points, as the game counts them), the sizes the screen
+// can be set to and the four the game's launcher lists, all no larger than the screen.
+static NSString *display_choices(void)
+{
+    NSSize screen = NSScreen.mainScreen.frame.size;
+    int sw = (int)screen.width, sh = (int)screen.height;
+    NSMutableOrderedSet<NSValue *> *sizes = [NSMutableOrderedSet orderedSetWithObject:[NSValue valueWithSize:screen]];
+    NSArray *modes = CFBridgingRelease(CGDisplayCopyAllDisplayModes(CGMainDisplayID(), NULL));
+    for (id mode in modes)
+        [sizes addObject:[NSValue valueWithSize:NSMakeSize(CGDisplayModeGetWidth((__bridge CGDisplayModeRef)mode), CGDisplayModeGetHeight((__bridge CGDisplayModeRef)mode))]];
+    for (NSString *s in @[@"1024x768", @"1280x720", @"1600x900", @"1920x1080"]) {
+        NSArray<NSString *> *wh = [s componentsSeparatedByString:@"x"];
+        [sizes addObject:[NSValue valueWithSize:NSMakeSize(wh[0].intValue, wh[1].intValue)]];
+    }
+    NSArray<NSValue *> *sorted = [sizes.array sortedArrayUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
+      NSSize x = a.sizeValue, y = b.sizeValue;
+      return x.width != y.width ? (x.width > y.width ? NSOrderedAscending : NSOrderedDescending) : x.height > y.height ? NSOrderedAscending : x.height < y.height ? NSOrderedDescending : NSOrderedSame;
+    }];
+    NSMutableArray<NSString *> *choices = [NSMutableArray array];
+    for (NSValue *v in sorted) {
+        int w = (int)v.sizeValue.width, h = (int)v.sizeValue.height;
+        if (w < 1024 || w > sw || h > sh) continue;
+        [choices addObject:[NSString stringWithFormat:@"%dx%d=%d × %d%@", w, h, w, h, w == sw && h == sh ? @", the screen's" : @""]];
+    }
+    return [choices componentsJoinedByString:@"|"];
+}
+
+// The game's languages: the folders of its "languages" folder, English among them.
+static NSString *language_choices(NSString *game)
+{
+    NSDictionary *names = @{@"cns" : @"Chinese (simplified)", @"cnt" : @"Chinese (traditional)", @"cz" : @"Čeština", @"da" : @"Dansk", @"de" : @"Deutsch",
+                            @"el" : @"Ελληνικά", @"en" : @"English", @"es" : @"Español", @"fi" : @"Suomi", @"fr" : @"Français", @"hr" : @"Hrvatski",
+                            @"hu" : @"Magyar", @"it" : @"Italiano", @"ja" : @"日本語", @"no" : @"Norsk", @"nl" : @"Nederlands", @"pl" : @"Polski",
+                            @"pt" : @"Português", @"ru" : @"Русский", @"sk" : @"Slovenčina", @"sl" : @"Slovenščina", @"sv" : @"Svenska", @"tr" : @"Türkçe"};
+    NSMutableOrderedSet<NSString *> *codes = [NSMutableOrderedSet orderedSetWithObject:@"en"];
+    NSString *folder = [game stringByAppendingPathComponent:@"languages"];
+    for (NSString *name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:folder error:nil]) {
+        BOOL dir = NO;
+        if (![name hasPrefix:@"."] && [[NSFileManager defaultManager] fileExistsAtPath:[folder stringByAppendingPathComponent:name] isDirectory:&dir] && dir) [codes addObject:name];
+    }
+    NSArray<NSString *> *sorted = [codes.array sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+      return [(names[a] ?: a) localizedCaseInsensitiveCompare:(names[b] ?: b)];
+    }];
+    NSMutableArray<NSString *> *choices = [NSMutableArray array];
+    for (NSString *code in sorted) [choices addObject:[NSString stringWithFormat:@"%@=%@", code, names[code] ?: code]];
+    return [choices componentsJoinedByString:@"|"];
 }
 
 static NSString *preset_value(const Option *o, int preset)
 {
     if (preset == 1) {
-        if (!strcmp(o->env, "WBM_FUR_SHELLS") || !strcmp(o->env, "WBM_HAIR_STRANDS") || !strcmp(o->env, "WBM_PEOPLE_HAIR")) return @"0";
+        if (!strcmp(o->env, "WBM_PEOPLE_HAIR")) return @"0";
         return S(o->everything);
     }
     return S(preset == 0 ? o->everything : preset == 2 ? o->fast : o->plain);
@@ -167,7 +285,13 @@ static NSString *find_game(void)
     NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:settings_path()];
     for (NSString *key in saved)
         if ([saved[key] isKindOfClass:NSString.class]) self.values[key] = saved[key];
-    self.values[@"_edit_mode"] = [config_value(@"enable_edit_mode") isEqualToString:@"1"] ? @"1" : @"0"; // as the game has it now
+    NSDictionary<NSString *, NSString *> *config = read_config(); // the game's own settings: as the game has them now
+    for (int i = 0; i < k_option_count; i++)
+        if (is_game_setting(&k_options[i])) {
+            NSString *value = game_value(&k_options[i], config);
+            if (!value && !strcmp(k_options[i].env, "_display")) value = [NSString stringWithFormat:@"%.0fx%.0f", NSScreen.mainScreen.frame.size.width, NSScreen.mainScreen.frame.size.height];
+            if (value) self.values[S(k_options[i].env)] = value;
+        }
 }
 
 - (void)save
@@ -217,6 +341,11 @@ static NSString *find_game(void)
         } else {
             NSPopUpButton *pop = (NSPopUpButton *)control;
             NSInteger at = [pop indexOfItemWithRepresentedObject:value];
+            if (at < 0 && is_game_setting(o) && value.length) { // a value of the game's that the list lacks, such as a size set by hand
+                [pop addItemWithTitle:[value stringByReplacingOccurrencesOfString:@"x" withString:@" × "]];
+                pop.lastItem.representedObject = value;
+                at = pop.numberOfItems - 1;
+            }
             [pop selectItemAtIndex:at < 0 ? 0 : at];
         }
         control.enabled = getenv(o->env) == NULL; // set from outside: not the window's to change
@@ -249,8 +378,23 @@ static NSString *find_game(void)
 
 - (void)skipChanged:(NSButton *)sender { self.values[@"_skip"] = sender.state == NSControlStateValueOn ? @"1" : @"0"; }
 
+// A choice's items: from the table, or for the resolution and the language, from the screen and the game.
+- (void)fill:(NSPopUpButton *)pop for:(const Option *)o
+{
+    NSString *choices = !strcmp(o->env, "_display") ? display_choices() : !strcmp(o->env, "_language") ? language_choices(self.game) : S(o->choices);
+    [pop removeAllItems];
+    for (NSString *pair in [choices componentsSeparatedByString:@"|"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        [pop addItemWithTitle:[pair substringFromIndex:eq.location + 1]];
+        pop.lastItem.representedObject = [pair substringToIndex:eq.location];
+    }
+}
+
 - (void)fillModules
 {
+    for (int i = 0; i < k_option_count; i++)
+        if (!strcmp(k_options[i].env, "_language") && self.controls[@"_language"]) [self fill:(NSPopUpButton *)self.controls[@"_language"] for:&k_options[i]];
     [self.modules removeAllItems];
     if (!self.game) return;
     NSString *folder = [self.game stringByAppendingPathComponent:@"Modules"];
@@ -305,7 +449,7 @@ static NSString *find_game(void)
         return;
     }
     [self save];
-    set_config_value(@"enable_edit_mode", [self.values[@"_edit_mode"] isEqualToString:@"1"] ? @"1" : @"0");
+    write_game_settings(self.values);
     NSString *module = self.modules.titleOfSelectedItem;
     if (module.length && !getenv("WBM_MODULE")) { // the game reads the module's name from this file
         [[NSFileManager defaultManager] createDirectoryAtPath:module_file().stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
@@ -352,6 +496,10 @@ static NSString *find_game(void)
             heading.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize + 1];
             [rows addArrangedSubview:heading];
             if (rows.arrangedSubviews.count > 1) [rows setCustomSpacing:18 afterView:rows.arrangedSubviews[rows.arrangedSubviews.count - 2]];
+            if (is_game_setting(o)) {
+                [rows setCustomSpacing:2 afterView:heading];
+                [rows addArrangedSubview:[self label:@"The game's own settings: the presets leave them as they are." small:YES]];
+            }
         }
         NSStackView *text = [NSStackView stackViewWithViews:@[[self label:S(o->title) small:NO], [self label:S(o->help) small:YES]]];
         text.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -376,11 +524,7 @@ static NSString *find_game(void)
             side = [NSStackView stackViewWithViews:@[slider, readout]];
         } else {
             NSPopUpButton *pop = [NSPopUpButton new];
-            for (NSString *pair in [S(o->choices) componentsSeparatedByString:@"|"]) {
-                NSRange eq = [pair rangeOfString:@"="];
-                [pop addItemWithTitle:[pair substringFromIndex:eq.location + 1]];
-                pop.lastItem.representedObject = [pair substringToIndex:eq.location];
-            }
+            [self fill:pop for:o];
             control = pop;
             side = pop;
         }
@@ -479,7 +623,12 @@ static NSString *find_game(void)
         NSDictionary<NSString *, NSString *> *env = [self environment];
         for (NSString *name in [env.allKeys sortedArrayUsingSelector:@selector(compare:)]) printf("%s=%s\n", name.UTF8String, env[name].UTF8String);
         printf("game: %s\n", self.game ? self.game.UTF8String : "not found");
-        printf("edit mode: %s\n", [self.values[@"_edit_mode"] isEqualToString:@"1"] ? "on" : "off");
+        for (int i = 0; i < k_option_count; i++)
+            if (is_game_setting(&k_options[i])) { // as it goes into the game's files
+                NSString *value = self.values[S(k_options[i].env)] ?: @"";
+                if (!strncmp(k_options[i].env, "_disable_", 9)) value = value.intValue ? @"0" : @"1";
+                printf("game %s = %s\n", k_options[i].env + 1, value.UTF8String);
+            }
         exit(0);
     }
     NSUInteger snapshot = [args indexOfObject:@"--snapshot"];
