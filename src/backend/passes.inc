@@ -57,6 +57,7 @@ struct Target {
     bool screen = false;
     bool scene = false; // the engine's HDR scene buffer: screen-sized, RGBA16F, with depth
     bool prepass = false; // the engine's depth pre-pass: screen-sized, R16F, with depth
+    bool framegen = false; // the screen, drawn into frame interpolation's texture instead of the drawable
     bool shadow_map = false; // the engine's own shadow map of the scenery: large, square, R32F
     double scale = 1;
     int samples = 1;
@@ -67,12 +68,17 @@ struct Target {
 bool resolve_target(Target &t)
 {
     if (s_fbo == 0) {
-        if (!s_drawable) {
+        // Under frame interpolation, while the game draws scenes (this frame or the last, as below), the
+        // screen is a texture of the shim's own, which is shown at present (see framegen_present). A frame
+        // keeps the screen it started with.
+        id<MTLTexture> own = nil;
+        if (s_framegen && (framegen_in_use() || (!s_drawable && s_scene_frame + 1 >= s_frame_serial))) own = framegen_screen_target(s_layer);
+        if (!own && !s_drawable) {
             if (!s_layer) return false;
             s_drawable = [s_layer nextDrawable];
             if (!s_drawable) return false;
         }
-        t.color = s_drawable.texture;
+        t.color = own ? own : s_drawable.texture;
         // When the engine renders the 3D scene into its own HDR buffer (this frame
         // or the last), all the screen receives is one full-screen image and the
         // UI. Multisampling that gains nothing and costs a full-screen resolve,
@@ -87,6 +93,7 @@ bool resolve_target(Target &t)
         t.ms_color = s_screen_ms;
         t.samples = samples;
         t.screen = true;
+        t.framegen = own != nil;
         t.scale = s_scale;
         return true;
     }
@@ -178,6 +185,7 @@ void start_pass(const Target &t, GLbitfield clear_mask)
         s_scene_motion_frame = s_frame_serial;
     }
     bool with_reactive = with_motion && s_reactive && attach_reactive_mask(d, t.color); // colour attachment 2
+    bool with_ui = t.framegen && !t.ms_color && framegen_attach_ui(d); // colour attachment 3
     if (t.depth) {
         bool clear = (clear_mask & GL_DEPTH_BUFFER_BIT) && s_depth_mask;
         d.depthAttachment.texture = t.depth;
@@ -192,6 +200,8 @@ void start_pass(const Target &t, GLbitfield clear_mask)
     s_pass_screen = t.screen;
     s_pass_motion = with_motion;
     s_pass_reactive = with_reactive;
+    s_pass_ui = with_ui;
+    if (with_ui) [s_pass setBlendColorRed:0 green:0 blue:0 alpha:1]; // the interface's coverage where it replaces the screen (see pipeline_for)
     s_pass_scale = t.scale;
     s_pass_samples = t.samples;
     if (t.scene) s_scene_frame = s_frame_serial;

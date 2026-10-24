@@ -350,6 +350,24 @@ id<MTLRenderPipelineState> pipeline_for(Program &p, const PipelineKey &key)
         d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
         d.colorAttachments[1].writeMask = key.motion == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
     }
+    // The interface, blended as onto the screen, into a texture that starts out empty, whose alpha says how
+    // much of each pixel the interface covers. What replaces the screen's colour covers it whatever its
+    // alpha: its alpha is taken from the blend colour, which start_pass sets to 1 (the engine sets none).
+    if (key.ui) {
+        MTLRenderPipelineColorAttachmentDescriptor *u = d.colorAttachments[3];
+        u.pixelFormat = (MTLPixelFormat)key.color_format;
+        u.writeMask = key.ui == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+        if (key.ui == 2) {
+            bool replaces = !key.blend || key.blend_dst == GL_ZERO;
+            u.blendingEnabled = YES;
+            u.sourceRGBBlendFactor = key.blend ? c.sourceRGBBlendFactor : MTLBlendFactorOne;
+            u.destinationRGBBlendFactor = key.blend ? c.destinationRGBBlendFactor : MTLBlendFactorZero;
+            u.rgbBlendOperation = key.blend ? c.rgbBlendOperation : MTLBlendOperationAdd;
+            u.sourceAlphaBlendFactor = replaces ? MTLBlendFactorBlendAlpha : c.sourceAlphaBlendFactor;
+            u.destinationAlphaBlendFactor = replaces ? MTLBlendFactorZero : c.destinationAlphaBlendFactor;
+            u.alphaBlendOperation = replaces ? MTLBlendOperationAdd : c.alphaBlendOperation;
+        }
+    }
     if (key.reactive) { // the largest share any draw asks for wins
         MTLRenderPipelineColorAttachmentDescriptor *r = d.colorAttachments[2];
         r.pixelFormat = MTLPixelFormatR8Unorm;

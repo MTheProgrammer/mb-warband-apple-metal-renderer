@@ -9,6 +9,7 @@
 #include "shader_xlate.h"
 #include "backend/shared.h"
 #include "backend/upscale.h"
+#include "backend/frame_interpolation.h"
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
@@ -325,6 +326,13 @@ void mtl_attach_window(void *nswindow, int width, int height)
             }
             if (const char *sign = getenv("WBM_DEBUG_JITTER_SIGN")) s_jitter_sign = atoi(sign) < 0 ? -1 : 1;
         }
+        // Frame interpolation, on top of the temporal scaler (see frame_interpolation.h).
+        if (const char *v = getenv("WBM_FRAMEGEN"); v && atoi(v) > 0) {
+            if (!s_temporal) complain("WBM_FRAMEGEN needs WBM_UPSCALE_MODE=temporal; frame interpolation is off");
+            else if (!framegen_supported()) complain("WBM_FRAMEGEN: MetalFX's frame interpolation is not available on this machine (or this build); it is off");
+            else s_framegen = std::min(2, atoi(v));
+            if (s_framegen) s_shader_options.ui_copy = true;
+        }
         if (const char *v = getenv("WBM_SHARPEN")) s_sharpen = std::min(1.0f, std::max(0.0f, (float)atof(v)));
         // Dithered cut-out edges only where the temporal scaler averages the dither away: anywhere else it
         // stands still and only trades stair steps for dots. Off unless set; with multisampling the samples do it.
@@ -348,6 +356,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
         layer.contentsGravity = kCAGravityResize;
         layer.magnificationFilter = kCAFilterLinear;
         layer.minificationFilter = kCAFilterLinear;
+        if (s_framegen) layer.maximumDrawableCount = 3; // two shown a frame, and one being drawn
         NSView *view = window.contentView;
         view.layer = layer; // set before wantsLayer: the view hosts our layer instead of making its own
         view.wantsLayer = YES;
@@ -398,6 +407,9 @@ void mtl_dump_stats(FILE *f)
         std::sort(sites.begin(), sites.end(), [](const auto &a, const auto &b) { return a.second.count > b.second.count; });
         for (const auto &site : sites) fprintf(f, "%10llu %8llu  %s\n", (unsigned long long)site.second.count, (unsigned long long)site.second.first_frame, site.first.c_str());
     }
+    if (s_framegen_frames || s_framegen_resets)
+        fprintf(f, "\nframes made between the game's own by MetalFX (WBM_FRAMEGEN): %llu; history started afresh %llu times\n", (unsigned long long)s_framegen_frames,
+                (unsigned long long)s_framegen_resets);
     if (s_temporal_frames)
         fprintf(f, "\nupscaled by MetalFX's temporal scaler in %llu frames, from %.0f%% of the screen's size each way; history dropped %llu times\n", (unsigned long long)s_temporal_frames,
                 100.0 * s_render_scale / s_scale, (unsigned long long)s_temporal_resets);
@@ -449,8 +461,9 @@ void mtl_present(bool capture, uint32_t frame)
         end_pass();
         if (!s_cmd) return; // the game issued nothing this frame
         id<MTLTexture> copy = nil;
-        if (capture && s_drawable) {
-            id<MTLTexture> src = s_drawable.texture;
+        // Under frame interpolation the frame is in its own screen, not a drawable (see resolve_target).
+        id<MTLTexture> src = s_drawable ? s_drawable.texture : framegen_in_use() ? framegen_screen_target(s_layer) : nil;
+        if (capture && src) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
                                                                                          width:src.width
                                                                                         height:src.height
@@ -497,7 +510,14 @@ void mtl_present(bool capture, uint32_t frame)
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [blit endEncoding];
         }
-        if (s_drawable) [s_cmd presentDrawable:s_drawable];
+        if (!framegen_present(s_cmd, s_layer) && s_drawable) [s_cmd presentDrawable:s_drawable];
+        id<MTLTexture> made = s_framegen == 2 && copy ? framegen_made() : nil;
+        if (made && made.width == copy.width && made.height == copy.height) { // what is being looked at: the frame MetalFX made
+            id<MTLBlitCommandEncoder> blit = [s_cmd blitCommandEncoder];
+            [blit copyFromTexture:made sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(made.width, made.height, 1)
+                        toTexture:copy destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
         [s_cmd commit];
         if (copy) {
             [s_cmd waitUntilCompleted];

@@ -50,6 +50,22 @@ bool prepare_draw()
         bool effect = s_blend && !(s_depth_test && s_depth_mask) && vertices && vertices->filled_frame + 1 >= s_frame_serial;
         key.reactive = (uint8_t)(effect || p->water_offset >= 0 ? 2 : 1);
     }
+    // On the screen, everything but the draw that brings the scene there (which reads it enlarged, see
+    // below) is the engine's interface, and goes into frame interpolation's interface texture too.
+    if (s_pass_ui) {
+        bool reads_scene = false, copy_due = false;
+        for (const UniformLocation &l : p->locations) {
+            if ((l.texture_index[0] < 0 && l.texture_index[1] < 0) || l.unit < 0 || l.unit >= MAX_UNITS) continue;
+            Texture *t = find(s_textures, s_bound_texture[l.unit]);
+            if (t && t->upscaled && t->upscaled_frame == s_frame_serial) reads_scene = true;
+        }
+        key.ui = (uint8_t)(framegen_scene_draw(reads_scene, &copy_due) ? 1 : 2);
+        if (copy_due) { // the scene alone, for MetalFX to move
+            end_pass();
+            framegen_copy_scene(command_buffer());
+            if (!ensure_pass()) return false;
+        }
+    }
     id<MTLRenderPipelineState> pipeline;
     if (s_state_cache && s_last_key_program == s_program && s_last_key == key) {
         pipeline = s_last_pipeline;

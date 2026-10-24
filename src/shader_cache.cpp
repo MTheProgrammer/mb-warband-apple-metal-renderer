@@ -183,6 +183,7 @@ XlProgram xl_translate_cached(const std::string &vs_glsl, const std::string &fs_
     key += std::string("\0wind=", 6) + (options.wind ? "1" : "0");
     key += std::string("\0motion=", 8) + (options.motion_vectors ? "1" : "0");
     key += std::string("\0reactive=", 10) + (options.reactive_mask ? std::to_string(options.reactive_water) : std::string("0"));
+    key += std::string("\0ui=", 4) + (options.ui_copy ? "1" : "0");
     key += std::string("\0eyes=", 6) + (options.eyes ? "1" : "0");
     key += std::string("\0fur=", 5) + (options.fur ? "1" : "0");
     key += std::string("\0hairs=", 7) + (options.hair_strands ? "1" : "0");

@@ -140,6 +140,11 @@ struct XlOptions {
     // brightness counts too), y the most a pixel may be marked.
     bool reactive_mask = false;
     float reactive_water = 0.5f;
+    // For frame interpolation: every fragment shader also writes its colour, as
+    // it is blended, into a fourth colour target (location 3). On the screen
+    // that collects the engine's interface apart from the scene; whether a draw
+    // writes it is the pipeline's choice (see PipelineKey::ui).
+    bool ui_copy = false;
     // Shadows from the engine's point lights: shaders that are lit by them look
     // their surface up in a cube of depths per light, which the backend draws.
     // Adds the sampler and uniforms described at k_xl_torch_sampler.

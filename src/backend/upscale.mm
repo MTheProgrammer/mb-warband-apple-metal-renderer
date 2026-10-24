@@ -1,6 +1,7 @@
 // FXAA, MetalFX upscaling (spatial and temporal) and sharpening (see upscale.h).
 
 #include "upscale.h"
+#include "frame_interpolation.h"
 #include "shared.h"
 
 #import <MetalFX/MetalFX.h>
@@ -454,6 +455,7 @@ id<MTLTexture> apply_temporal_upscale() API_AVAILABLE(macos(13.0))
     static const bool show_mask = getenv("WBM_DEBUG_REACTIVE") != nullptr;
     if (show_mask && mask) show_reactive_mask(scene, mask, s_upscaled);
     note_upscaled(scene, s_upscaled);
+    if (s_framegen) framegen_note_scene(depth, s_motion_texture, reset);
     s_temporal_last_frame = s_frame_serial;
     s_temporal_frames++;
     if (reset) s_temporal_resets++;

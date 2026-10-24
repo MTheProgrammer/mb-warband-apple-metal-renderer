@@ -79,6 +79,7 @@ struct PipelineKey {
     uint8_t samples;
     uint8_t motion; // 0: the pass has no movement target; 1: it has, and this program leaves it alone; 2: and writes it
     uint8_t reactive; // the same for the reactive mask (see upscale.h): 2 when this draw marks it
+    uint8_t ui; // the same for the interface texture of frame interpolation (see frame_interpolation.h): 2 when this draw is part of the interface
     bool operator==(const PipelineKey &o) const { return !memcmp(this, &o, sizeof *this); }
 };
 struct PipelineKeyHash {
@@ -227,6 +228,7 @@ id<MTLTexture> s_scene_motion;
 uint64_t s_scene_motion_frame = ~0ull; // the frame it was last cleared in
 bool s_pass_motion;                    // the pass under way has it attached
 bool s_pass_reactive;                  // and the reactive mask (see upscale.h)
+bool s_pass_ui;                        // the pass onto the screen has frame interpolation's interface texture attached
 float s_sharpen; // WBM_SHARPEN, 0 to 1: see apply_sharpen
 int s_screen_w, s_screen_h; // the size the game believes the screen has
 
