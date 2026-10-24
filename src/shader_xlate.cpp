@@ -661,6 +661,27 @@ vec4 wbm_skin_sun(vec3 to_sun, vec3 normal, float shadow, vec3 back)
     return vec4(wbm_skin_core(mapped, normalize(to_sun).z, shadow) + back, plain);
 }
 
+// A point light's (a torch's) term, for the general shaders: the same scattering as the sun's,
+// with no shadow and nothing coming through. w is the plain cosine, unclamped as the engine has it.
+vec4 wbm_skin_point(vec3 to_light, vec3 normal)
+{
+    float mapped = dot(to_light, normal);
+    if (wbm_skin.x < 0.5 || wbm_skin.w > 0.0) return vec4(mapped);
+    return vec4(wbm_skin_core(mapped, normalize(to_light).z, 1.0), mapped);
+}
+
+// A point light's in the engine's own skin shader, whose wrap, 0.2 (d + 0.9), already reaches round the
+// terminator, farther and more gently than wbm_skin_core's. That is kept as it is, and what gets there only
+// by wrapping turns red, by how the smooth surface faces the light (smooth_: the light's direction in
+// tangent space, z, as interpolated, not normalised). The normal map is left out of both: on a face its
+// two mirrored halves disagree about it, and the angle to it jumps by up to 0.3 down the middle, which
+// any lighting steeper than the engine's shows as a seam.
+vec3 wbm_skin_wrapped(float mapped, float smooth_)
+{
+    float lit = clamp(max(0.2 * (mapped + 0.9), mapped), 0.0, 1.0);
+    return lit * mix(vec3(1.0), vec3(1.2, 0.85, 0.7), smoothstep(0.3, -0.3, smooth_));
+}
+
 // For the engine's own skin shader, which is skin whatever it draws.
 vec4 wbm_skin_lit(float mapped, float smooth_, float shadow, vec3 back)
 {
@@ -1171,6 +1192,12 @@ vec4 wbm_skin_wrap(float facing)
     vec3 lit = clamp((vec3(facing) + wrap) / (1.0 + wrap), 0.0, 1.0) / (1.0 + 0.5 * wrap);
     return vec4(lit, plain);
 }
+
+// A point light's: the same, but not lit through as a leaf is.
+vec4 wbm_skin_wrap_point(float facing)
+{
+    return wbm_skin.w > 0.0 ? vec4(clamp(facing, 0.0, 1.0)) : wbm_skin_wrap(facing);
+}
 )";
 
 bool add_skin_scattering_vertex(std::string &vs)
@@ -1179,6 +1206,9 @@ bool add_skin_scattering_vertex(std::string &vs)
     static const std::regex term(R"(\(\s*clamp \(dot \(([\w.]+), -\(vSunDir\.xyz\)\), 0\.0, 1\.0\)\s*\* (tmpvar_\d+)\))");
     if (vs.find("varying vec4 SunLight;") == std::string::npos || !std::regex_search(vs, term)) return false;
     vs = std::regex_replace(vs, term, "(wbm_skin_wrap(dot($1, -(vSunDir.xyz))) * $2)", std::regex_constants::format_first_only);
+    // The point lights, in the loop over them: clamp(dot(N, normalize(to the light)), 0, 1) * vLightDiffuse[i]
+    static const std::regex point(R"(clamp \(dot \(([\w.]+), normalize\((\w+)\)\), 0\.0, 1\.0\)(\s*\* vLightDiffuse\[))");
+    vs = std::regex_replace(vs, point, "wbm_skin_wrap_point(dot($1, normalize($2)))$3");
     return true;
 }
 
@@ -1655,8 +1685,24 @@ bool add_eye_glint(std::string &fs)
     return true;
 }
 
-// skin: scattering in skin is wanted, and not just the light through leaves that shares the rewrite.
-bool add_skin_scattering(std::string &fs, bool skin)
+// The point light that a shader lights per pixel (the nearest torch; the others are lit per vertex), in the
+// three shapes the engine's shaders have it, where add_skin_sun has found the sun's term: torchlit skin
+// scatters as sunlit skin does (in the engine's own skin shader, more gently: see wbm_skin_wrapped).
+void add_skin_points(std::string &fs)
+{
+    // clamp((dot(L, N) * vLightDiffuse[i]) * L.w, 0, 1), in the shaders that troops' faces are drawn with
+    static const std::regex general(R"(clamp \(\(\s*\(dot \(PointLightDir\.xyz, ([\w.]+)\) \* (vLightDiffuse\[\w+\])\)\s*\* PointLightDir\.w\), 0\.0, 1\.0\))");
+    fs = std::regex_replace(fs, general, "clamp(((wbm_skin_point(PointLightDir.xyz, vec3($1)) * $2) * PointLightDir.w), 0.0, 1.0)");
+    // clamp(dot(L, N), 0, 1) times the light's colour
+    static const std::regex clamped(R"(clamp \(\s*dot \(PointLightDir\.xyz, ([\w.]+)\)\s*, 0\.0, 1\.0\))");
+    fs = std::regex_replace(fs, clamped, "clamp(wbm_skin_point(PointLightDir.xyz, vec3($1)), 0.0, 1.0)");
+    // The engine's skin shader, with its own wrap: (L.w * 0.9) * clamp(max(0.2 * (d + 0.9), d), 0, 1)
+    static const std::regex own(R"(\(PointLightDir\.w \* 0\.9\)(\s*\*\s*)clamp \(\s*max \(\(0\.2 \* \((\w+) \+ 0\.9\)\), \2\)\s*, 0\.0, 1\.0\))");
+    fs = std::regex_replace(fs, own, "(PointLightDir.w * 0.9)$1wbm_skin_wrapped($2, PointLightDir.z)");
+}
+
+// The sun's term. skin: scattering in skin is wanted, and not just the light through leaves that shares the rewrite.
+bool add_skin_sun(std::string &fs, bool skin)
 {
     // The back-light needs the view direction and, for thickness, the per-frame shadow map.
     bool can_back = skin && fs.find("varying vec3 ViewDir;") != std::string::npos && fs.find("wbm_dynamic_shadow(") != std::string::npos;
@@ -1705,6 +1751,13 @@ bool add_skin_scattering(std::string &fs, bool skin)
         return true;
     }
     return false;
+}
+
+bool add_skin_scattering(std::string &fs, bool skin)
+{
+    if (!add_skin_sun(fs, skin)) return false;
+    if (skin) add_skin_points(fs);
+    return true;
 }
 
 // Finds pow(clamp(dot(normalize(V +/- L), N), 0, 1), fMaterialPower) and
