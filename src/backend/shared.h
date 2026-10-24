@@ -65,4 +65,14 @@ id<MTLTexture> render_object_velocities(const double *reproject, NSUInteger w, N
 // Remembers that the scene in `scene` was enlarged into `upscaled` this frame, for the pass onto the screen.
 void note_upscaled(id<MTLTexture> scene, id<MTLTexture> upscaled);
 
+// Ambient occlusion's settings (see mtl_attach_window) and what it reads of the scene.
+extern int s_msaa;
+extern bool s_ao, s_ao_full, s_contact_shadows, s_light_shafts, s_bounce_half;
+extern float s_ao_radius, s_ao_strength, s_contact_strength, s_contact_length, s_shaft_strength, s_bounce_light;
+extern float s_sun_dir[4], s_sun_color[4];
+extern bool s_sun_valid;
+extern bool s_dyn_shadows;
+extern float s_dyn_near[4], s_dyn_near_range;
+extern bool s_previewing, s_preview_keeps_scene;
+
 } // namespace wbm

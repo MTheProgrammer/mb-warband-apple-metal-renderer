@@ -1,5 +1,14 @@
-// Ambient occlusion, contact shadows, light shafts and bounce light.
-// Included by metal_backend.mm, inside namespace wbm.
+// Ambient occlusion, contact shadows, light shafts and bounce light (see ambient_occlusion.h).
+
+#include "ambient_occlusion.h"
+#include "shared.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <map>
+
+namespace wbm __attribute__((visibility("hidden"))) {
 
 // ---- ambient occlusion ---------------------------------------------------------------
 
@@ -572,3 +581,5 @@ void apply_ambient_occlusion()
         onto_scene(s_shaft_apply_pipeline, s_shaft_texture);
     }
 }
+
+} // namespace wbm
