@@ -401,7 +401,9 @@ bool preview_load(const std::string &mesh_name, int lod)
 bool preview_set_action(const std::string &action);
 
 // Reads a gallery: one model a line, "mesh material right up ahead turn [action [pose]]", a material of "-" for the
-// mesh's own, "#" for a remark. Call between frames.
+// mesh's own, "#" for a remark. A line "+mesh material" is a part of the model on the line before (hair for a
+// head): it is placed with it, by that model's middle, so that the two stay where they are to each other, as
+// the game's meshes for one thing share an origin. Call between frames.
 bool preview_load_gallery(const std::string &path, std::string *problem)
 {
     Preview &pv = s_preview;
@@ -424,7 +426,12 @@ bool preview_load_gallery(const std::string &path, std::string *problem)
         if (got >= 4) at[1] = atof(up + (grounded ? 1 : 0));
         sscanf(turning, "%lf,%lf,%lf", &turn, &tilt[0], &tilt[1]); // turn about the upright[,tilt about the model's x[,about its y]]
         if (got <= 0) continue;
-        if (got < 5) {
+        bool part = mesh[0] == '+';
+        if (part && (got < 2 || pv.gallery.empty())) {
+            fclose(f);
+            return *problem = path + ":" + std::to_string(number) + ": a part (+mesh) wants a material and a model on the line before", false;
+        }
+        if (!part && got < 5) {
             fclose(f);
             return *problem = path + ":" + std::to_string(number) + ": wants a mesh, a material and three distances", false;
         }
@@ -435,7 +442,16 @@ bool preview_load_gallery(const std::string &path, std::string *problem)
             *open = 0;
         }
         if (strcmp(material, "-")) pv.m.material = material;
-        bool loaded = preview_load(mesh, 0);
+        bool loaded = preview_load(mesh + (part ? 1 : 0), 0);
+        if (loaded && part) {
+            const PreviewModel &whole = pv.gallery.back();
+            memcpy(pv.m.at, whole.at, sizeof pv.m.at);
+            memcpy(pv.m.tilt, whole.tilt, sizeof pv.m.tilt);
+            memcpy(pv.m.centre, whole.centre, sizeof pv.m.centre);
+            pv.m.turn = whole.turn, pv.m.grounded = whole.grounded, pv.m.lowest = whole.lowest;
+            pv.gallery.push_back(std::move(pv.m));
+            continue;
+        }
         if (loaded && got >= 7) {
             pv.m.held = held;
             if (!preview_set_action(action)) wb_note("preview: %s:%d: no action or animation named %s", path.c_str(), number, action);
