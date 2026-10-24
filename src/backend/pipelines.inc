@@ -9,7 +9,7 @@ void link_program(GLuint program_id, Program &p)
     p.pipelines.clear();
     p.locations.clear();
     p.location_by_name.clear();
-    p.yflip_offset = p.jitter_offset = p.hash_frame_offset = p.reactive_offset = p.reproject_offset = p.wind_before_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
+    p.yflip_offset = p.jitter_offset = p.hash_frame_offset = p.reactive_offset = p.ui_offset = p.reproject_offset = p.wind_before_offset = p.samples_offset = p.water_offset = p.parallax_offset = p.grade_offset = p.headroom_offset = p.limit_offset = p.dyn_window_offset = p.dyn_near_offset = p.dyn_bias_offset = p.torch_offset = p.torch_light_offset = -1;
     p.amb_offset[0] = p.amb_offset[1] = p.material_offset = p.pbr_offset = p.skin_offset[0] = p.skin_offset[1] = p.wind_offset = p.leaf_sun_offset = p.gaze_offset = p.fur_offset = p.hair_colour_offset = p.horse_eye_offset = p.sheen_offset = p.shell_offset[0] = p.shell_offset[1] = p.drift_offset = -1;
     p.u_wvp = p.u_world = p.u_bones = nullptr;
     p.alpha_texture_location = -1;
@@ -95,6 +95,7 @@ void link_program(GLuint program_id, Program &p)
             else if (u.name == "wbm_reproject") p.reproject_offset = u.offset;
             else if (u.name == "wbm_hash_frame") p.hash_frame_offset = u.offset;
             else if (u.name == "wbm_reactive") p.reactive_offset = u.offset;
+            else if (u.name == "wbm_ui") p.ui_offset = u.offset;
             else if (u.name == "wbm_wind_before") p.wind_before_offset = u.offset;
             else if (u.name == "wbm_leaf_sun") p.leaf_sun_offset = u.offset;
             else if (u.name == "wbm_gaze") p.gaze_offset = u.offset;
@@ -232,6 +233,12 @@ MTLVertexFormat vertex_format(const Attrib &a)
     return MTLVertexFormatInvalid;
 }
 
+// The screen multiplied by the draw's colour, and nothing added: how the engine darkens (the edges of text).
+bool blend_multiplies(GLenum src, GLenum dst)
+{
+    return (src == GL_ZERO && dst == GL_SRC_COLOR) || (src == GL_DST_COLOR && dst == GL_ZERO);
+}
+
 MTLBlendFactor blend_factor(GLenum f)
 {
     switch (f) {
@@ -351,21 +358,24 @@ id<MTLRenderPipelineState> pipeline_for(Program &p, const PipelineKey &key)
         d.colorAttachments[1].writeMask = key.motion == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
     }
     // The interface, blended as onto the screen, into a texture that starts out empty, whose alpha says how
-    // much of each pixel the interface covers. What replaces the screen's colour covers it whatever its
-    // alpha: its alpha is taken from the blend colour, which start_pass sets to 1 (the engine sets none).
+    // much of each pixel the interface covers. What multiplies the screen by its colour covers it as far
+    // as it darkens it (its shader writes that as alpha, see XlOptions::ui_copy), laid over what is there.
+    // What replaces the screen's colour covers it whatever its alpha: its alpha is taken from the blend
+    // colour, which start_pass sets to 1 (the engine sets none).
     if (key.ui) {
         MTLRenderPipelineColorAttachmentDescriptor *u = d.colorAttachments[3];
         u.pixelFormat = (MTLPixelFormat)key.color_format;
         u.writeMask = key.ui == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
         if (key.ui == 2) {
-            bool replaces = !key.blend || key.blend_dst == GL_ZERO;
+            bool multiplies = key.blend && blend_multiplies(key.blend_src, key.blend_dst);
+            bool replaces = !multiplies && (!key.blend || key.blend_dst == GL_ZERO);
             u.blendingEnabled = YES;
             u.sourceRGBBlendFactor = key.blend ? c.sourceRGBBlendFactor : MTLBlendFactorOne;
             u.destinationRGBBlendFactor = key.blend ? c.destinationRGBBlendFactor : MTLBlendFactorZero;
             u.rgbBlendOperation = key.blend ? c.rgbBlendOperation : MTLBlendOperationAdd;
-            u.sourceAlphaBlendFactor = replaces ? MTLBlendFactorBlendAlpha : c.sourceAlphaBlendFactor;
-            u.destinationAlphaBlendFactor = replaces ? MTLBlendFactorZero : c.destinationAlphaBlendFactor;
-            u.alphaBlendOperation = replaces ? MTLBlendOperationAdd : c.alphaBlendOperation;
+            u.sourceAlphaBlendFactor = multiplies ? MTLBlendFactorOne : replaces ? MTLBlendFactorBlendAlpha : c.sourceAlphaBlendFactor;
+            u.destinationAlphaBlendFactor = multiplies ? MTLBlendFactorOneMinusSourceAlpha : replaces ? MTLBlendFactorZero : c.destinationAlphaBlendFactor;
+            u.alphaBlendOperation = multiplies || replaces ? MTLBlendOperationAdd : c.alphaBlendOperation;
         }
     }
     if (key.reactive) { // the largest share any draw asks for wins

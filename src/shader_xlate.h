@@ -143,7 +143,8 @@ struct XlOptions {
     // For frame interpolation: every fragment shader also writes its colour, as
     // it is blended, into a fourth colour target (location 3). On the screen
     // that collects the engine's interface apart from the scene; whether a draw
-    // writes it is the pipeline's choice (see PipelineKey::ui).
+    // writes it is the pipeline's choice (see PipelineKey::ui). Adds the uniform
+    // wbm_ui: x 1 when the draw's blending multiplies the screen by its colour.
     bool ui_copy = false;
     // Shadows from the engine's point lights: shaders that are lit by them look
     // their surface up in a cube of depths per light, which the backend draws.

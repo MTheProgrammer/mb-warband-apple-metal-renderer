@@ -2353,7 +2353,7 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
     else out << "layout(location = 0) out vec4 wbm_FragColor;\n";
     if (motion_out) out << "layout(location = 1) out vec4 wbm_Motion;\n";
     if (!vertex && options.reactive_mask) out << "layout(location = 2) out vec4 wbm_Reactive;\nuniform vec4 wbm_reactive;\n";
-    if (!vertex && options.ui_copy) out << "layout(location = 3) out vec4 wbm_Ui;\n";
+    if (!vertex && options.ui_copy) out << "layout(location = 3) out vec4 wbm_Ui;\nuniform vec4 wbm_ui;\n";
     if (needs_sun_matrix) out << "uniform mat4 matSunViewProj;\n";
     if (soft_shadows) out << (options.pcss_shadows ? k_pcss_shadow_function : k_soft_shadow_function);
     if (shadows && options.dynamic_shadows)
@@ -2469,8 +2469,11 @@ std::string modernise(const std::string &source, bool vertex, const std::map<std
             if (end != std::string::npos) s.insert(end, std::string("  wbm_Reactive = vec4(") + (water ? water_share : share) + ");\n");
         }
         if (options.ui_copy) { // last too: the colour as it is blended
+            // Where the draw multiplies the screen by its colour (wbm_ui.x), as the dark edge of text is
+            // drawn, the alpha says how much it darkens: darkened to m is black laid over at 1 - m.
             size_t end = s.rfind('}');
-            if (end != std::string::npos) s.insert(end, "  wbm_Ui = gl_FragColor;\n");
+            if (end != std::string::npos)
+                s.insert(end, "  wbm_Ui = wbm_ui.x > 0.5 ? vec4(gl_FragColor.xyz, 1.0 - dot(clamp(gl_FragColor.xyz, vec3(0.0), vec3(1.0)), vec3(1.0 / 3.0))) : gl_FragColor;\n");
         }
         s = replace_word(s, "gl_FragColor", "wbm_FragColor");
     }

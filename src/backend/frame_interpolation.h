@@ -21,7 +21,8 @@
 namespace wbm __attribute__((visibility("hidden"))) {
 
 extern int s_framegen; // WBM_FRAMEGEN: 0 off, 1 on, 2 the made frames in place of the real ones too (for looking at them)
-extern uint64_t s_framegen_frames, s_framegen_resets;
+extern uint64_t s_framegen_frames, s_framegen_resets, s_framegen_alone;
+void framegen_set_display_rate(int hz); // the display's most frames a second, from the main thread
 
 bool framegen_supported(); // by this machine and this build
 bool framegen_in_use();    // this frame's screen is framegen_screen_target's
@@ -40,7 +41,9 @@ void framegen_copy_scene(id<MTLCommandBuffer> cmd);
 void framegen_note_scene(id<MTLTexture> depth, id<MTLTexture> motion, bool reset);
 // At present, in place of presenting the drawable: shows the made frame, then this one. Returns
 // false when this frame was drawn into the drawable as before, for the caller to present it.
-bool framegen_present(id<MTLCommandBuffer> cmd, CAMetalLayer *layer);
+// `gpu_seconds`: the GPU's time on all command buffers so far, from which a frame's share is taken.
+// While the game keeps up with the display by itself, its frames are shown alone (see the source).
+bool framegen_present(id<MTLCommandBuffer> cmd, CAMetalLayer *layer, double gpu_seconds);
 // The frame framegen_present just made, or nil when it made none (for captures under WBM_FRAMEGEN=2).
 id<MTLTexture> framegen_made();
 

@@ -135,6 +135,7 @@ struct Program {
     int jitter_offset = -1;  // vertex stage, see k_xl_jitter_uniform
     int hash_frame_offset = -1; // fragment stage: wbm_hash_frame (XlOptions::alpha_hash)
     int reactive_offset = -1;   // fragment stage: wbm_reactive (XlOptions::reactive_mask)
+    int ui_offset = -1;         // fragment stage: wbm_ui (XlOptions::ui_copy)
     int reproject_offset = -1, wind_before_offset = -1; // vertex stage: wbm_reproject and wbm_wind_before, of the shaders that write their own movement (XlOptions::motion_vectors)
     int samples_offset = -1; // fragment stage, see k_xl_samples_uniform
     int headroom_offset = -1; // fragment stage, see k_xl_headroom_uniform

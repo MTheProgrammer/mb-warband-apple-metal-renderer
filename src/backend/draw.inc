@@ -376,6 +376,13 @@ bool prepare_draw()
             p->uniform_dirty[1] = true;
         }
     }
+    if (p->ui_offset >= 0) {
+        const float ui[4] = {s_blend && blend_multiplies(s_blend_src, s_blend_dst) ? 1.0f : 0.0f, 0, 0, 0};
+        if (memcmp(p->uniform_data[1].data() + p->ui_offset, ui, 16)) {
+            memcpy(p->uniform_data[1].data() + p->ui_offset, ui, 16);
+            p->uniform_dirty[1] = true;
+        }
+    }
     float wind_before = (float)s_wind_time_before;
     if (p->wind_before_offset >= 0 && memcmp(p->uniform_data[0].data() + p->wind_before_offset, &wind_before, 4)) {
         memcpy(p->uniform_data[0].data() + p->wind_before_offset, &wind_before, 4);

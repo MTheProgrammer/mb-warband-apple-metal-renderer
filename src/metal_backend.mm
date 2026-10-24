@@ -357,6 +357,7 @@ void mtl_attach_window(void *nswindow, int width, int height)
         layer.magnificationFilter = kCAFilterLinear;
         layer.minificationFilter = kCAFilterLinear;
         if (s_framegen) layer.maximumDrawableCount = 3; // two shown a frame, and one being drawn
+        if (@available(macOS 12.0, *)) framegen_set_display_rate((int)window.screen.maximumFramesPerSecond);
         NSView *view = window.contentView;
         view.layer = layer; // set before wantsLayer: the view hosts our layer instead of making its own
         view.wantsLayer = YES;
@@ -407,9 +408,9 @@ void mtl_dump_stats(FILE *f)
         std::sort(sites.begin(), sites.end(), [](const auto &a, const auto &b) { return a.second.count > b.second.count; });
         for (const auto &site : sites) fprintf(f, "%10llu %8llu  %s\n", (unsigned long long)site.second.count, (unsigned long long)site.second.first_frame, site.first.c_str());
     }
-    if (s_framegen_frames || s_framegen_resets)
-        fprintf(f, "\nframes made between the game's own by MetalFX (WBM_FRAMEGEN): %llu; history started afresh %llu times\n", (unsigned long long)s_framegen_frames,
-                (unsigned long long)s_framegen_resets);
+    if (s_framegen_frames || s_framegen_resets || s_framegen_alone)
+        fprintf(f, "\nframes made between the game's own by MetalFX (WBM_FRAMEGEN): %llu; history started afresh %llu times; %llu of the game's shown alone, as it kept up with the display\n",
+                (unsigned long long)s_framegen_frames, (unsigned long long)s_framegen_resets, (unsigned long long)s_framegen_alone);
     if (s_temporal_frames)
         fprintf(f, "\nupscaled by MetalFX's temporal scaler in %llu frames, from %.0f%% of the screen's size each way; history dropped %llu times\n", (unsigned long long)s_temporal_frames,
                 100.0 * s_render_scale / s_scale, (unsigned long long)s_temporal_resets);
@@ -510,7 +511,7 @@ void mtl_present(bool capture, uint32_t frame)
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [blit endEncoding];
         }
-        if (!framegen_present(s_cmd, s_layer) && s_drawable) [s_cmd presentDrawable:s_drawable];
+        if (!framegen_present(s_cmd, s_layer, s_gpu_seconds.load()) && s_drawable) [s_cmd presentDrawable:s_drawable];
         id<MTLTexture> made = s_framegen == 2 && copy ? framegen_made() : nil;
         if (made && made.width == copy.width && made.height == copy.height) { // what is being looked at: the frame MetalFX made
             id<MTLBlitCommandEncoder> blit = [s_cmd blitCommandEncoder];
@@ -562,6 +563,11 @@ void mtl_present(bool capture, uint32_t frame)
         s_torch_seen.clear();
         if (s_dyn_shadows && s_dyn_frame + 2 < s_frame_serial) // the map has gone stale
             s_dyn_window[2] = s_dyn_window[3] = s_dyn_near[2] = s_dyn_near[3] = 0;
+        if (s_framegen && s_frame_serial % 60 == 0) { // the window may have moved to another display
+            dispatch_async(dispatch_get_main_queue(), ^{
+              if (@available(macOS 12.0, *)) framegen_set_display_rate((int)s_window.screen.maximumFramesPerSecond);
+            });
+        }
         if (s_hdr && s_frame_serial % 30 == 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
               CGFloat available = s_window.screen.maximumExtendedDynamicRangeColorComponentValue;
