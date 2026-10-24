@@ -349,8 +349,12 @@ bool framegen_present(id<MTLCommandBuffer> cmd, CAMetalLayer *layer, double gpu_
 
     // Each drawable is taken only when it is needed, so that the two shown never hold up the game more than
     // one would. Shown evenly: each half a frame after the one before, a frame being what the game takes,
-    // and at least two of the display's.
+    // and at least two of the display's. The wait is counted in whole refreshes, rounded down so that the
+    // two never take longer than a frame of the game's, and asked for half a refresh short: asked for
+    // exactly one, presentDrawable:afterMinimumDuration: can wait two, which would hold the game at a third
+    // of the display's rate.
     double half = std::max(s_cost, refresh * 2.0) * 0.5;
+    half = (std::max(1.0, std::floor(half / refresh + 0.25)) - 0.5) * refresh;
     if (made) {
         id<CAMetalDrawable> between = [layer nextDrawable];
         if (between) {
