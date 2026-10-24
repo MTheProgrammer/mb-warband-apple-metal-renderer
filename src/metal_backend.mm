@@ -8,6 +8,7 @@
 #include "material_names.h"
 #include "shader_xlate.h"
 #include "backend/shared.h"
+#include "backend/ambient_occlusion.h"
 #include "backend/upscale.h"
 
 #import <AppKit/AppKit.h>
@@ -50,8 +51,6 @@ namespace wbm __attribute__((visibility("hidden"))) {
 #include "backend/textures.inc"
 
 #include "backend/pipelines.inc"
-
-#include "backend/ambient_occlusion.inc"
 
 #include "backend/camera.inc"
 

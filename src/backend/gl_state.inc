@@ -144,7 +144,6 @@ id<MTLTexture> s_torch_map;
 id<MTLSamplerState> s_torch_sampler;
 bool casting() { return s_dyn_shadows || s_torch_shadows > 0; } // whether what the pre-pass draws is recorded, to cast shadows
 bool s_sun_valid;
-void apply_ambient_occlusion();
 bool s_bounce_half;   // WBM_BOUNCE_HALF: bounce light worked out at half resolution, not a quarter (finer, and more than twice the cost)
 float s_bounce_light; // WBM_BOUNCE_LIGHT: light thrown by lit surfaces on those near them, a strength (1 is plenty); 0 for none
 
