@@ -4,7 +4,8 @@
 # in metres from the stage's camera (ahead and right kept level) and degrees; "-" keeps the mesh's
 # own material, and material[left,top,right,bottom] wraps only that part of its texture round a ball (fractions
 # of the picture from its top left); @sphere is a ball 0.7 m across. The tilts turn the model in its own space
-# first (a head's mesh lies on its side). scripts/replay.sh --gallery reads it.
+# first (a head's mesh lies on its side). A line "+mesh material" is a part of the model on the line before,
+# placed with it (hair on a head). scripts/replay.sh --gallery reads it.
 
 # Front row: balls on the floor, left to right
 @sphere   full_plate[0.50,0.08,0.85,0.28]      -2.45 -1.15 2.7  0   # metal: polished plate
@@ -19,6 +20,7 @@
 # Back row: models, standing on the floor or held up where they would be worn
 full_plate_armor  -             -2.70 -0.62 4.3  90      # plate armour, in its rest pose
 male_head         manface_7     -1.20 -0.15 3.4  -90,90  # a face: skin scattering, eyes
++man_hair_c       -                                        # its hair
 flattop_helmet    -             -0.30 -0.30 3.3  90,-20  # a helmet
 shield_round_a    -              0.55 -0.50 3.7  90,90   # wood and iron
 bush_a01          -              1.55 -1.05 3.9  0       # leaves, lit through
