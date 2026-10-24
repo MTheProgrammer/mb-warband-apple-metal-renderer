@@ -46,6 +46,10 @@ Tested on one machine: MacBook Pro M5, macOS 26.5, game version 1.174 from Steam
 
 The Metal renderer draws the whole game and passes Metal's API validation (`MTL_DEBUG_LAYER=1`) in a 200 vs 200 battle and on the world map. The rest of this document is for developers.
 
+## Tried and set aside
+
+- **MetalFX frame interpolation** (issue #10). The idea was to make a frame between each two of the game's and show both. On the test machine it lowered the frame rate everywhere. In a 200 vs 200 battle capped at 60 fps, it gave 40 in light scenes and about 15 in the fight, against 60 throughout without it. There are two causes. The interpolator costs about 10 ms of GPU time a frame at 3024×1964 on an M5. And showing two drawables per game frame left the game waiting for the screen, with VSync on or off. It is worth another look only together with a presenting thread of its own, and only for a game that runs at about 40–70 fps by itself (with heavier effects on, or on slower Macs), or if MetalFX's interpolator becomes cheaper. The code is on the branch `feature/frame-interpolation`, and the measurements are in the issue.
+
 ## Build
 
 Needs the Xcode Command Line Tools, git and python3. The game does not have to be installed to build, only to run.
